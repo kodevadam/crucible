@@ -18,6 +18,9 @@ import {
   buildPlanPayload,
   CHAT_MAX_ROUNDS,
   CHAT_MAX_CONTEXT_CHARS,
+  CHAT_GPT_MAX_TOKENS,
+  CHAT_CLAUDE_MAX_TOKENS,
+  CHAT_SYNTHESIS_MAX_TOKENS,
 } from "../src/chat.js";
 
 // ── truncateTranscript ────────────────────────────────────────────────────────
@@ -133,4 +136,32 @@ test("CHAT_MAX_ROUNDS is a positive integer", () => {
 test("CHAT_MAX_CONTEXT_CHARS is a positive integer", () => {
   assert.ok(Number.isInteger(CHAT_MAX_CONTEXT_CHARS), "CHAT_MAX_CONTEXT_CHARS must be integer");
   assert.ok(CHAT_MAX_CONTEXT_CHARS > 0,               "CHAT_MAX_CONTEXT_CHARS must be > 0");
+});
+
+// ── Per-turn token budget constants ──────────────────────────────────────────
+
+test("CHAT_GPT_MAX_TOKENS is a positive integer", () => {
+  assert.ok(Number.isInteger(CHAT_GPT_MAX_TOKENS), "must be integer");
+  assert.ok(CHAT_GPT_MAX_TOKENS > 0,               "must be > 0");
+});
+
+test("CHAT_CLAUDE_MAX_TOKENS is a positive integer", () => {
+  assert.ok(Number.isInteger(CHAT_CLAUDE_MAX_TOKENS), "must be integer");
+  assert.ok(CHAT_CLAUDE_MAX_TOKENS > 0,               "must be > 0");
+});
+
+test("CHAT_SYNTHESIS_MAX_TOKENS is a positive integer", () => {
+  assert.ok(Number.isInteger(CHAT_SYNTHESIS_MAX_TOKENS), "must be integer");
+  assert.ok(CHAT_SYNTHESIS_MAX_TOKENS > 0,               "must be > 0");
+});
+
+test("synthesis budget is >= GPT and Claude chat budgets (synthesis needs more room)", () => {
+  assert.ok(
+    CHAT_SYNTHESIS_MAX_TOKENS >= CHAT_GPT_MAX_TOKENS,
+    "synthesis budget should be at least as large as GPT turn budget"
+  );
+  assert.ok(
+    CHAT_SYNTHESIS_MAX_TOKENS >= CHAT_CLAUDE_MAX_TOKENS,
+    "synthesis budget should be at least as large as Claude turn budget"
+  );
 });

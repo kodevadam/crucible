@@ -128,6 +128,16 @@ test("askGPT shim: retries with max_tokens on unsupported_parameter (400)", asyn
   assert.ok(!("max_completion_tokens" in secondCallParams), "retry must NOT use max_completion_tokens");
 });
 
+test("askGPT shim: honours explicit maxTokens override", async () => {
+  let capturedParams;
+  const stubCreate = async (params) => {
+    capturedParams = params;
+    return { choices: [{ message: { content: "ok" } }] };
+  };
+  await askGPTShim([], stubCreate, 3000);
+  assert.equal(capturedParams.max_completion_tokens, 3000, "should forward custom maxTokens");
+});
+
 test("askGPT shim: propagates other errors without retry", async () => {
   let callCount = 0;
   const stubCreate = async () => {

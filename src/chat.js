@@ -18,6 +18,12 @@
 export const CHAT_MAX_ROUNDS        = 3;     // default pair turns per user message
 export const CHAT_MAX_CONTEXT_CHARS = 8000;  // rolling context window size
 
+// Per-turn token budgets — separate from the global debate budgets so that
+// chat sessions can't inadvertently consume the full model context.
+export const CHAT_GPT_MAX_TOKENS       = 3000;  // GPT reply per chat turn
+export const CHAT_CLAUDE_MAX_TOKENS    = 3000;  // Claude reply per chat turn
+export const CHAT_SYNTHESIS_MAX_TOKENS = 4000;  // synthesis + /save summary
+
 // ── Transcript helpers ────────────────────────────────────────────────────────
 
 /**
@@ -231,7 +237,7 @@ async function _pairDialogue(userMsg, cs, state, helpers) {
     ];
     let gptReply;
     try {
-      gptReply = await askGPT(gptMsgs);
+      gptReply = await askGPT(gptMsgs, { maxTokens: CHAT_GPT_MAX_TOKENS });
     } catch (err) {
       crucibleSay(`${yellow("GPT error:")} ${err.message}`);
       break;
@@ -257,7 +263,7 @@ async function _pairDialogue(userMsg, cs, state, helpers) {
     ];
     let claudeReply;
     try {
-      claudeReply = await askClaude(claudeMsgs);
+      claudeReply = await askClaude(claudeMsgs, { maxTokens: CHAT_CLAUDE_MAX_TOKENS });
     } catch (err) {
       crucibleSay(`${yellow("Claude error:")} ${err.message}`);
       break;
@@ -299,7 +305,9 @@ async function _soloDialogue(userMsg, cs, state, helpers) {
 
   let reply;
   try {
-    reply = isClaude ? await askClaude(msgs) : await askGPT(msgs);
+    reply = isClaude
+      ? await askClaude(msgs, { maxTokens: CHAT_CLAUDE_MAX_TOKENS })
+      : await askGPT(msgs,   { maxTokens: CHAT_GPT_MAX_TOKENS });
   } catch (err) {
     crucibleSay(`${yellow(`${agentLabel} error:`)} ${err.message}`);
     return;
@@ -336,7 +344,7 @@ async function _synthesize(cs, state, helpers) {
 
   let synthesis;
   try {
-    synthesis = await askGPT(msgs);
+    synthesis = await askGPT(msgs, { maxTokens: CHAT_SYNTHESIS_MAX_TOKENS });
   } catch (err) {
     crucibleSay(`Synthesis skipped — ${err.message}`);
     return;
@@ -370,7 +378,7 @@ async function _saveSummary(cs, state, helpers) {
     { role: "user", content: formatTranscript(window) },
   ];
   try {
-    const summary    = await askGPT(msgs);
+    const summary    = await askGPT(msgs, { maxTokens: CHAT_SYNTHESIS_MAX_TOKENS });
     const titleMatch = summary.match(/TITLE:\s*(.+)/);
     const title      = (titleMatch ? titleMatch[1].trim() : "Chat session").slice(0, 80);
     const pid        = DB.createProposal(state.sessionId, title, summary);

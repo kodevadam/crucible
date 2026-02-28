@@ -304,18 +304,18 @@ async function getLatestClaudeModel() {
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
-async function askGPT(messages) {
+async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
   try {
     // Prefer max_completion_tokens (required by GPT-5+ / o-series models)
     const res = await getOpenAI().chat.completions.create({
-      model: state.gptModel, messages, max_completion_tokens: GPT_MAX_TOKENS,
+      model: state.gptModel, messages, max_completion_tokens: maxTokens,
     });
     return res.choices[0].message.content;
   } catch (err) {
     // Older models (gpt-4, gpt-4-turbo) reject max_completion_tokens — retry with max_tokens
     if (err?.status === 400 && err?.code === "unsupported_parameter") {
       const res = await getOpenAI().chat.completions.create({
-        model: state.gptModel, messages, max_tokens: GPT_MAX_TOKENS,
+        model: state.gptModel, messages, max_tokens: maxTokens,
       });
       return res.choices[0].message.content;
     }
@@ -323,8 +323,8 @@ async function askGPT(messages) {
   }
 }
 
-async function askClaude(messages) {
-  const res = await getAnthropic().messages.create({ model: state.claudeModel, max_tokens: CLAUDE_MAX_TOKENS, messages });
+async function askClaude(messages, { maxTokens = CLAUDE_MAX_TOKENS } = {}) {
+  const res = await getAnthropic().messages.create({ model: state.claudeModel, max_tokens: maxTokens, messages });
   return res.content[0].text;
 }
 
