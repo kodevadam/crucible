@@ -106,6 +106,19 @@ export function createProvider(type, apiKey) {
 // Keys are resolved from the keychain/env at first use, so the singletons are
 // safe to create before the user has entered their API keys — the key lookup
 // is deferred until the first actual API call.
+//
+// DESIGN NOTE — singleton per provider vs. singleton per (provider, key):
+//   The current design uses one client per provider for the lifetime of the
+//   process.  That works perfectly for the common case (one user, one key
+//   per provider).  If a future feature needs multiple keys in the same
+//   process (e.g. "compare output across org A and org B", or ephemeral
+//   per-request keys), replace the two module-level vars with a Map keyed
+//   on a fingerprint of the API key (e.g. first 8 chars, never the full key):
+//
+//     const _clients = new Map(); // `${provider}:${key.slice(0,8)}` → client
+//
+//   This keeps the lazy-init pattern while supporting multi-key scenarios
+//   without breaking any existing call sites.
 
 let _openai    = null;
 let _anthropic = null;

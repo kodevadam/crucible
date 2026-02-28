@@ -138,32 +138,64 @@ function warnFallback(provider, fallback, envVar) {
   );
 }
 
+/**
+ * Emit a single debug line to stderr when CRUCIBLE_DEBUG=1.
+ * Shows model name, key source type (never the key value), model-list cache
+ * age, and how the model was chosen.  Safe to call on every hot path because
+ * the guard is a cheap env-var check.
+ *
+ * @param {"openai"|"anthropic"} provider
+ * @param {string} model      - resolved model ID
+ * @param {string} via        - "env-pin" | "api-detected" | "fallback"
+ * @param {string} cacheKey   - key used in _modelCache ("openai"|"anthropic")
+ */
+function debugLine(provider, model, via, cacheKey) {
+  if (!process.env.CRUCIBLE_DEBUG) return;
+  const service  = provider === "openai" ? SERVICE_OPENAI : SERVICE_ANTHROPIC;
+  const keySrc   = getKeySource(service);
+  const hit      = _modelCache.get(cacheKey);
+  const cacheAge = hit ? (Date.now() - hit.ts < 2000 ? "fresh" : `${Math.round((Date.now() - hit.ts) / 1000)}s ago`) : "not cached";
+  process.stderr.write(
+    `[crucible:debug] ${provider.padEnd(9)}  model=${model}  key=${keySrc}  list=${cacheAge}  via=${via}\n`
+  );
+}
+
 async function getLatestGPTModel() {
-  if (process.env.OPENAI_MODEL) return process.env.OPENAI_MODEL;
+  if (process.env.OPENAI_MODEL) {
+    debugLine("openai", process.env.OPENAI_MODEL, "env-pin", "openai");
+    return process.env.OPENAI_MODEL;
+  }
   try {
     const models = await cachedModels("openai", () =>
       getOpenAI().models.list().then(r => r.data));
     const best = selectBestGPTModel(models);
-    if (best) return best;
+    if (best) { debugLine("openai", best, "api-detected", "openai"); return best; }
     warnFallback("OpenAI", OPENAI_FALLBACK, "OPENAI_MODEL");
+    debugLine("openai", OPENAI_FALLBACK, "fallback", "openai");
     return OPENAI_FALLBACK;
   } catch {
     warnFallback("OpenAI", OPENAI_FALLBACK, "OPENAI_MODEL");
+    debugLine("openai", OPENAI_FALLBACK, "fallback", "openai");
     return OPENAI_FALLBACK;
   }
 }
 
 async function getLatestClaudeModel() {
-  if (process.env.CLAUDE_MODEL) return process.env.CLAUDE_MODEL;
+  if (process.env.CLAUDE_MODEL) {
+    debugLine("anthropic", process.env.CLAUDE_MODEL, "env-pin", "anthropic");
+    return process.env.CLAUDE_MODEL;
+  }
   try {
     const models = await cachedModels("anthropic", () =>
       getAnthropic().models.list().then(r => r.data));
     const best = selectBestClaudeModel(models);
-    if (best) return best;
+    if (best) { debugLine("anthropic", best, "api-detected", "anthropic"); return best; }
     warnFallback("Anthropic", CLAUDE_FALLBACK, "CLAUDE_MODEL");
+    debugLine("anthropic", CLAUDE_FALLBACK, "fallback", "anthropic");
     return CLAUDE_FALLBACK;
   } catch {
     warnFallback("Anthropic", CLAUDE_FALLBACK, "CLAUDE_MODEL");
+    debugLine("anthropic", CLAUDE_FALLBACK, "fallback", "anthropic");
     return CLAUDE_FALLBACK;
   }
 }
