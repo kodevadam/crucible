@@ -13,8 +13,23 @@ import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { join, extname, relative }             from "path";
 import Anthropic                               from "@anthropic-ai/sdk";
 import * as DB                                 from "./db.js";
+import { retrieveKey, SERVICE_ANTHROPIC }      from "./keys.js";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Lazy Anthropic client
+let _anthropic = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
+    _anthropic = new Anthropic({ apiKey: key });
+  }
+  return _anthropic;
+}
+
+// Token/size budget constants
+const MAX_SNAPSHOT_FILES   = 200;   // Max source files included in raw snapshot
+const MAX_FILE_BYTES       = 200_000; // Max bytes read per file
+const MAX_SNAPSHOT_CHARS   = 6_000; // Max aggregate chars for context injection
+const DIVERGENCE_THRESHOLD = 50;    // Warn when >N unprocessed commits
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
 
@@ -118,14 +133,14 @@ function readKeyFiles(repoPath) {
     }
   }
 
-  // Top-level source files (up to 5, up to 1500 chars each)
+  // Top-level source files (up to MAX_SNAPSHOT_FILES, up to MAX_FILE_BYTES each)
   let srcCount = 0;
   function scanSrc(dir, depth = 0) {
-    if (depth > 2 || srcCount >= 5) return;
+    if (depth > 2 || srcCount >= MAX_SNAPSHOT_FILES) return;
     let entries;
     try { entries = readdirSync(dir); } catch { return; }
     for (const f of entries.sort()) {
-      if (srcCount >= 5) break;
+      if (srcCount >= MAX_SNAPSHOT_FILES) break;
       if (IGNORE_DIRS.has(f)) continue;
       const full = join(dir, f);
       let stat;
@@ -136,7 +151,9 @@ function readKeyFiles(repoPath) {
       const rel = relative(repoPath, full);
       if (entryPoints.includes(rel)) continue;
       try {
-        const content = readFileSync(full, "utf8").slice(0, 1500);
+        // Cap individual file size
+        const maxChars = Math.min(1500, MAX_FILE_BYTES);
+        const content = readFileSync(full, "utf8").slice(0, maxChars);
         parts.push(`=== ${rel} ===\n${content}`);
         srcCount++;
       } catch { /* skip */ }
@@ -175,7 +192,7 @@ function countSourceFiles(repoPath) {
 // ── Claude calls ──────────────────────────────────────────────────────────────
 
 async function askClaude(prompt, maxTokens = 2000) {
-  const res = await anthropic.messages.create({
+  const res = await getAnthropic().messages.create({
     model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
@@ -184,7 +201,11 @@ async function askClaude(prompt, maxTokens = 2000) {
 }
 
 async function synthesiseUnderstanding(repoPath, rawSnapshot) {
-  const prompt = `You are analysing a software repository to build a persistent understanding of it. 
+  // Cap snapshot to avoid huge token bills; MAX_SNAPSHOT_CHARS*2 gives headroom
+  // for the prompt itself while staying within model context limits.
+  const snapshotForPrompt = rawSnapshot.slice(0, Math.max(12000, MAX_SNAPSHOT_CHARS * 2));
+
+  const prompt = `You are analysing a software repository to build a persistent understanding of it.
 Based on the snapshot below, produce a structured understanding covering:
 
 1. **Purpose** — what this project does and who it's for
@@ -200,7 +221,7 @@ Keep it dense and factual — this will be used as context for future planning s
 
 Repository: ${repoPath}
 
-${rawSnapshot.slice(0, 12000)}`;
+${snapshotForPrompt}`;
 
   return askClaude(prompt, 2500);
 }
@@ -352,6 +373,15 @@ export async function analyseRepo(repoPath, repoUrl, { claudeModel, onStatus } =
     c => !DB.hasCommit(repoPath, c.hash)
   );
 
+  // Warn if the repo has diverged significantly from the indexed state
+  if (newCommits.length > DIVERGENCE_THRESHOLD) {
+    status(
+      `⚠️  ${newCommits.length} unprocessed commits since last index ` +
+      `(threshold: ${DIVERGENCE_THRESHOLD}). Understanding may be stale. ` +
+      `Run: crucible repo refresh`
+    );
+  }
+
   if (!newCommits.length) {
     status("No unprocessed commits — using cached understanding.");
     DB.saveRepoKnowledge(repoPath, { lastCommitHash: currentHead, lastCommitDate: headDate });
@@ -460,4 +490,13 @@ export function getChangeLog(repoPath, limit = 50) {
     ...r,
     filesChanged: r.files_changed ? JSON.parse(r.files_changed) : [],
   }));
+}
+
+/**
+ * clearRepoKnowledge(repoPath)
+ * Delete all cached understanding for a repo, forcing a full re-analysis on
+ * the next analyseRepo() call.
+ */
+export function clearRepoKnowledge(repoPath) {
+  DB.deleteRepoKnowledge(repoPath);
 }

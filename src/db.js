@@ -120,6 +120,7 @@ const stmts = {
   getRepoChanges:      db.prepare(`SELECT * FROM repo_changes WHERE repo_path=? ORDER BY commit_date DESC LIMIT ?`),
   countRepoChanges:    db.prepare(`SELECT COUNT(*) as n FROM repo_changes WHERE repo_path=?`),
   hasCommit:           db.prepare(`SELECT id FROM repo_changes WHERE repo_path=? AND commit_hash=?`),
+  deleteRepoKnowledge: db.prepare(`DELETE FROM repo_knowledge WHERE repo_path=?`),
 };
 
 export function createSession({ project, repoPath, repoUrl, gptModel, claudeModel } = {}) {
@@ -196,5 +197,8 @@ export function getRepoChanges(repoPath, limit=50) {
 }
 export function countRepoChanges(repoPath) {
   return stmts.countRepoChanges.get(repoPath)?.n || 0;
+}
+export function deleteRepoKnowledge(repoPath) {
+  stmts.deleteRepoKnowledge.run(repoPath);
 }
 export function getDB() { return db; }
