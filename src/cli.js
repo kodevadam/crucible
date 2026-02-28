@@ -304,12 +304,26 @@ async function getLatestClaudeModel() {
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
+// ── Token ceiling warning ─────────────────────────────────────────────────────
+
+function _warnTokenCeiling(label, used, budget) {
+  if (!process.env.CRUCIBLE_DEBUG) return;
+  if (used == null || !budget) return;
+  const pct = Math.round((used / budget) * 100);
+  if (pct >= 90) {
+    process.stderr.write(
+      `[crucible:debug] ${label} reply used ${used}/${budget} tokens (${pct}%) — approaching ceiling\n`
+    );
+  }
+}
+
 async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
   try {
     // Prefer max_completion_tokens (required by GPT-5+ / o-series models)
     const res = await getOpenAI().chat.completions.create({
       model: state.gptModel, messages, max_completion_tokens: maxTokens,
     });
+    _warnTokenCeiling("GPT", res.usage?.completion_tokens, maxTokens);
     return res.choices[0].message.content;
   } catch (err) {
     // Older models (gpt-4, gpt-4-turbo) reject max_completion_tokens — retry with max_tokens
@@ -317,6 +331,7 @@ async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
       const res = await getOpenAI().chat.completions.create({
         model: state.gptModel, messages, max_tokens: maxTokens,
       });
+      _warnTokenCeiling("GPT", res.usage?.completion_tokens, maxTokens);
       return res.choices[0].message.content;
     }
     throw err;
@@ -325,6 +340,7 @@ async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
 
 async function askClaude(messages, { maxTokens = CLAUDE_MAX_TOKENS } = {}) {
   const res = await getAnthropic().messages.create({ model: state.claudeModel, max_tokens: maxTokens, messages });
+  _warnTokenCeiling("Claude", res.usage?.output_tokens, maxTokens);
   return res.content[0].text;
 }
 

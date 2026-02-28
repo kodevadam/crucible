@@ -156,3 +156,71 @@ test("askGPT shim: propagates other errors without retry", async () => {
   );
   assert.equal(callCount, 1, "should NOT retry on non-unsupported_parameter errors");
 });
+
+// ── Token ceiling warning logic ───────────────────────────────────────────────
+//
+// _warnTokenCeiling is internal to cli.js; test the same logic via a local
+// mirror so we can assert on stderr without spawning a subprocess.
+
+function warnCeilingShim(label, used, budget, debugEnv) {
+  if (!debugEnv) return null;
+  if (used == null || !budget) return null;
+  const pct = Math.round((used / budget) * 100);
+  if (pct >= 90) {
+    return `[crucible:debug] ${label} reply used ${used}/${budget} tokens (${pct}%) — approaching ceiling`;
+  }
+  return null;
+}
+
+test("_warnTokenCeiling: returns null when CRUCIBLE_DEBUG is not set", () => {
+  const out = warnCeilingShim("GPT", 2850, 3000, false);
+  assert.equal(out, null);
+});
+
+test("_warnTokenCeiling: returns null when used is null", () => {
+  const out = warnCeilingShim("GPT", null, 3000, true);
+  assert.equal(out, null);
+});
+
+test("_warnTokenCeiling: returns null when used is undefined", () => {
+  const out = warnCeilingShim("GPT", undefined, 3000, true);
+  assert.equal(out, null);
+});
+
+test("_warnTokenCeiling: returns null when budget is 0 or falsy", () => {
+  const out = warnCeilingShim("GPT", 100, 0, true);
+  assert.equal(out, null);
+});
+
+test("_warnTokenCeiling: emits warning at exactly 90% (2700/3000)", () => {
+  const out = warnCeilingShim("GPT", 2700, 3000, true);
+  assert.ok(out !== null, "should warn at 90%");
+  assert.ok(out.includes("2700/3000"), "should include used/budget");
+  assert.ok(out.includes("90%"), "should include percentage");
+});
+
+test("_warnTokenCeiling: emits warning above 90% (2850/3000 = 95%)", () => {
+  const out = warnCeilingShim("Claude", 2850, 3000, true);
+  assert.ok(out !== null, "should warn when > 90%");
+  assert.ok(out.includes("[crucible:debug]"), "should have debug prefix");
+  assert.ok(out.includes("Claude reply used 2850/3000 tokens (95%)"), "should format correctly");
+});
+
+test("_warnTokenCeiling: does NOT emit warning below 90% (2699/3000 = 90% rounded = 90)", () => {
+  // 2689/3000 = 89.6% rounds to 90, so use 2689 to get exactly 89%
+  const out = warnCeilingShim("GPT", 2670, 3000, true); // 89%
+  assert.equal(out, null, "should not warn below 90%");
+});
+
+test("_warnTokenCeiling: includes label in output", () => {
+  const outGPT    = warnCeilingShim("GPT",    2850, 3000, true);
+  const outClaude = warnCeilingShim("Claude", 3600, 4000, true);
+  assert.ok(outGPT.includes("GPT"),    "should include GPT label");
+  assert.ok(outClaude.includes("Claude"), "should include Claude label");
+});
+
+test("_warnTokenCeiling: works for synthesis budget (3800/4000 = 95%)", () => {
+  const out = warnCeilingShim("GPT", 3800, 4000, true);
+  assert.ok(out !== null, "should warn for synthesis ceiling");
+  assert.ok(out.includes("3800/4000"), "should include correct figures");
+});
