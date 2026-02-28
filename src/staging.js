@@ -11,27 +11,17 @@
  *  6. Commit via the existing approval-gate flow in cli.js
  */
 
-import Anthropic                                       from "@anthropic-ai/sdk";
 import { existsSync, readFileSync, writeFileSync,
          mkdirSync }                                   from "fs";
 import { join, dirname, relative, extname }            from "path";
 import * as DB                                         from "./db.js";
 import { validateStagingPath, gitq }                   from "./safety.js";
-import { retrieveKey, SERVICE_ANTHROPIC }              from "./keys.js";
+import { getAnthropic }                                from "./providers.js";
+import { CLAUDE_FALLBACK }                             from "./models.js";
 
-// Lazy Anthropic client — key may come from keychain rather than env var
-let _anthropic = null;
-function getAnthropic() {
-  if (!_anthropic) {
-    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
-    _anthropic = new Anthropic({ apiKey: key });
-  }
-  return _anthropic;
-}
-
-async function askClaude(messages, maxTokens = 3000) {
+async function askClaude(messages, maxTokens = 3000, model = process.env.CLAUDE_MODEL || CLAUDE_FALLBACK) {
   const res = await getAnthropic().messages.create({
-    model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
+    model,
     max_tokens: maxTokens,
     messages,
   });
@@ -95,7 +85,8 @@ function getStagedFiles(proposalId) {
 
 // ── Step 1: Infer affected files from plan ────────────────────────────────────
 
-export async function inferAffectedFiles(plan, repoPath, repoUnderstanding) {
+export async function inferAffectedFiles(plan, repoPath, repoUnderstanding, claudeModel) {
+  const model = claudeModel || process.env.CLAUDE_MODEL || CLAUDE_FALLBACK;
   const contextSection = repoUnderstanding
     ? `\nRepo understanding:\n${repoUnderstanding.slice(0, 3000)}\n`
     : "";
@@ -122,7 +113,7 @@ Rules:
 
 Respond with ONLY the JSON array, no markdown fences, no explanation.`;
 
-  const raw = await askClaude([{ role: "user", content: prompt }], 1000);
+  const raw = await askClaude([{ role: "user", content: prompt }], 1000, model);
 
   try {
     // Strip any accidental fences
@@ -147,7 +138,8 @@ Respond with ONLY the JSON array, no markdown fences, no explanation.`;
 
 // ── Step 2: Generate file content ─────────────────────────────────────────────
 
-export async function generateFileContent(filePath, action, note, plan, repoPath, repoUnderstanding, existingContent) {
+export async function generateFileContent(filePath, action, note, plan, repoPath, repoUnderstanding, existingContent, claudeModel) {
+  const model = claudeModel || process.env.CLAUDE_MODEL || CLAUDE_FALLBACK;
   const hasExisting = !!existingContent;
   const ext = extname(filePath);
 
@@ -175,7 +167,7 @@ Rules:
 - Write production-quality code — proper error handling, consistent style with the existing codebase.
 - Do not add placeholder comments like "// TODO: implement this".`;
 
-  return askClaude([{ role: "user", content: prompt }], 4000);
+  return askClaude([{ role: "user", content: prompt }], 4000, model);
 }
 
 // ── Step 3: Interactive review per file ───────────────────────────────────────
@@ -211,7 +203,9 @@ export async function runStagingFlow({
   plan,
   repoUnderstanding,
   onStatus,
+  claudeModel,
 }) {
+  const model = claudeModel || process.env.CLAUDE_MODEL || CLAUDE_FALLBACK;
   ensureStagedFilesTable();
 
   const say    = onStatus || (m => console.log(`  ${m}`));
@@ -220,7 +214,7 @@ export async function runStagingFlow({
   // ── Infer files ─────────────────────────────────────────────────────────────
 
   say("Analysing plan to identify affected files...");
-  let affectedFiles = await inferAffectedFiles(plan, repoPath, repoUnderstanding);
+  let affectedFiles = await inferAffectedFiles(plan, repoPath, repoUnderstanding, model);
 
   if (!affectedFiles.length) {
     say("Claude couldn't identify specific files — you can add them manually.");
@@ -325,7 +319,7 @@ export async function runStagingFlow({
     // Generate content
     say(`Generating content for ${f.path}...`);
     let proposed = await generateFileContent(
-      f.path, f.action, f.note, plan, repoPath, repoUnderstanding, original
+      f.path, f.action, f.note, plan, repoPath, repoUnderstanding, original, model
     );
 
     // Review loop for this file
@@ -382,7 +376,7 @@ export async function runStagingFlow({
         proposed = await generateFileContent(
           f.path, f.action,
           `${f.note}. Additional instruction: ${extra}`,
-          plan, repoPath, repoUnderstanding, original
+          plan, repoPath, repoUnderstanding, original, model
         );
       }
 

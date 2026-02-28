@@ -12,8 +12,6 @@
  *   crucible help
  */
 
-import OpenAI    from "openai";
-import Anthropic from "@anthropic-ai/sdk";
 import { spawnSync }            from "child_process";
 import { createInterface }      from "readline";
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
@@ -25,26 +23,8 @@ import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC 
 import { validateBranchName, gitq, gitExec, ghExec, ghq } from "./safety.js";
 import { selectBestGPTModel, selectBestClaudeModel,
          OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
+import { getOpenAI, getAnthropic }                        from "./providers.js";
 
-// Keys retrieved from secure store (keychain or file), with env var fallback
-let _openai    = null;
-let _anthropic = null;
-
-function getOpenAI() {
-  if (!_openai) {
-    const key = retrieveKey(SERVICE_OPENAI) || "";
-    _openai = new OpenAI({ apiKey: key });
-  }
-  return _openai;
-}
-
-function getAnthropic() {
-  if (!_anthropic) {
-    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
-    _anthropic = new Anthropic({ apiKey: key });
-  }
-  return _anthropic;
-}
 
 const MAX_ROUNDS         = parseInt(process.env.MAX_ROUNDS || "10");
 const CONVERGENCE_PHRASE = "I AGREE WITH THIS PLAN";
@@ -159,6 +139,7 @@ function warnFallback(provider, fallback, envVar) {
 }
 
 async function getLatestGPTModel() {
+  if (process.env.OPENAI_MODEL) return process.env.OPENAI_MODEL;
   try {
     const models = await cachedModels("openai", () =>
       getOpenAI().models.list().then(r => r.data));
@@ -173,6 +154,7 @@ async function getLatestGPTModel() {
 }
 
 async function getLatestClaudeModel() {
+  if (process.env.CLAUDE_MODEL) return process.env.CLAUDE_MODEL;
   try {
     const models = await cachedModels("anthropic", () =>
       getAnthropic().models.list().then(r => r.data));
@@ -811,6 +793,7 @@ async function offerStagingAndCommit(task, finalPlan, round) {
       plan:             finalPlan,
       repoUnderstanding: state.repoContext,
       onStatus:         msg => systemMsg(msg),
+      claudeModel:      state.claudeModel,
     });
     if (r.staged.length) await commitStagedFiles(task, r.staged, round);
   } else {
@@ -1163,7 +1146,7 @@ async function interactiveSession() {
         if (rewrites.length) {
           await commitStagedFiles(p.title, rewrites, p.rounds||0);
         } else if (p.final_plan) {
-          const r = await runStagingFlow({ proposalId: p.id, repoPath: state.repoPath, plan: p.final_plan, repoUnderstanding: state.repoContext, onStatus: msg => systemMsg(msg) });
+          const r = await runStagingFlow({ proposalId: p.id, repoPath: state.repoPath, plan: p.final_plan, repoUnderstanding: state.repoContext, onStatus: msg => systemMsg(msg), claudeModel: state.claudeModel });
           if (r.staged.length) await commitStagedFiles(p.title, r.staged, p.rounds||0);
         }
       }
@@ -1338,6 +1321,7 @@ switch (cmd) {
           plan,
           repoUnderstanding: state.repoContext,
           onStatus: msg => systemMsg(msg),
+          claudeModel: state.claudeModel,
         }).then(async r => {
           if (r.staged.length) await commitStagedFiles(p.title, r.staged, p.rounds || 0);
         });

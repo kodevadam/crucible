@@ -18,6 +18,7 @@
 
 import OpenAI    from "openai";
 import Anthropic from "@anthropic-ai/sdk";
+import { retrieveKey, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
 
 // ── OpenAI ────────────────────────────────────────────────────────────────────
 
@@ -95,4 +96,28 @@ export function createProvider(type, apiKey) {
     case "anthropic": return new AnthropicProvider(apiKey);
     default:          throw new Error(`Unknown provider type: ${JSON.stringify(type)}`);
   }
+}
+
+// ── Shared lazy singletons ────────────────────────────────────────────────────
+//
+// All modules that talk to LLM APIs (cli.js, staging.js, repo.js) were each
+// maintaining their own copy of this boilerplate.  Import these instead.
+//
+// Keys are resolved from the keychain/env at first use, so the singletons are
+// safe to create before the user has entered their API keys — the key lookup
+// is deferred until the first actual API call.
+
+let _openai    = null;
+let _anthropic = null;
+
+/** Shared lazy OpenAI SDK client. */
+export function getOpenAI() {
+  if (!_openai) _openai = new OpenAI({ apiKey: retrieveKey(SERVICE_OPENAI) || "" });
+  return _openai;
+}
+
+/** Shared lazy Anthropic SDK client. */
+export function getAnthropic() {
+  if (!_anthropic) _anthropic = new Anthropic({ apiKey: retrieveKey(SERVICE_ANTHROPIC) || "" });
+  return _anthropic;
 }
