@@ -20,7 +20,7 @@ import * as DB   from "./db.js";
 import { analyseRepo, getRepoSummary, getChangeLog, clearRepoKnowledge } from "./repo.js";
 import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers } from "./staging.js";
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
-import { validateBranchName, gitq, gitExec, ghExec, ghq } from "./safety.js";
+import { validateBranchName, gitq, gitExec, ghExec, ghq, shortHash } from "./safety.js";
 import { selectBestGPTModel, selectBestClaudeModel,
          OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
 import { getOpenAI, getAnthropic }                        from "./providers.js";
@@ -28,6 +28,50 @@ import { getOpenAI, getAnthropic }                        from "./providers.js";
 
 const MAX_ROUNDS         = parseInt(process.env.MAX_ROUNDS || "10");
 const CONVERGENCE_PHRASE = "I AGREE WITH THIS PLAN";
+
+// ── Reproducibility helpers ────────────────────────────────────────────────────
+
+/**
+ * Compute a short hash of the key system prompt templates used in this build.
+ * When any prompt changes, the hash changes — making it trivial to answer
+ * "was the session run with the same prompts as this one?"
+ *
+ * Only the structural parts of the prompts are hashed (not the per-run
+ * variable substitutions like model names or repo paths).
+ */
+function computePromptHash() {
+  const prompts = [
+    // Debate system prompts (structural template)
+    `You are {model}, collaborating with {other} to produce the best possible technical plan. ` +
+    `Critically evaluate the other model's proposal each round. Push back where needed. Be specific. ` +
+    `When you genuinely believe the plan is solid, include "${CONVERGENCE_PHRASE}" in your response.`,
+    // Refinement critique prompt (structural template)
+    `You are a senior technical architect reviewing a rough project proposal. ` +
+    `Your job is to critique it honestly and thoroughly before planning begins.`,
+  ];
+  return shortHash(prompts.join("\n---\n"));
+}
+
+/**
+ * Build a JSON-serialisable config snapshot for the current session.
+ * Records everything that could affect reproducibility: model IDs, provider
+ * selection, env-override flags, and the prompt version hash.
+ */
+function buildConfigSnapshot(gptModel, claudeModel) {
+  return {
+    gpt_model:       gptModel,
+    claude_model:    claudeModel,
+    provider_gpt:    "openai",
+    provider_claude: "anthropic",
+    prompt_hash:     computePromptHash(),
+    max_rounds:      MAX_ROUNDS,
+    paranoid_env:    process.env.CRUCIBLE_PARANOID_ENV === "1",
+    model_pins: {
+      gpt:    !!process.env.OPENAI_MODEL,
+      claude: !!process.env.CLAUDE_MODEL,
+    },
+  };
+}
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
@@ -1124,8 +1168,17 @@ async function interactiveSession() {
   console.log(`  ${bold("Claude:")} ${blue(claudeModel)}`);
   console.log("");
 
-  // Start session in DB
-  state.sessionId = DB.createSession({ gptModel, claudeModel });
+  // Start session in DB, recording model IDs, providers, and a prompt hash
+  // so every session is fully reproducible (answerable later: "why did it do that?")
+  const _snap = buildConfigSnapshot(gptModel, claudeModel);
+  state.sessionId = DB.createSession({
+    gptModel,
+    claudeModel,
+    providerGpt:    "openai",
+    providerClaude: "anthropic",
+    promptHash:     _snap.prompt_hash,
+    configSnapshot: _snap,
+  });
 
   // Project name
   crucibleSay("What project are we working on?");
@@ -1271,9 +1324,14 @@ switch (cmd) {
     const [gm, cm] = await Promise.all([getLatestGPTModel(), getLatestClaudeModel()]);
     process.stdout.write("\r          \r");
     state.gptModel = gm; state.claudeModel = cm;
-    state.sessionId  = DB.createSession({ gptModel: gm, claudeModel: cm, project: arg.slice(0,60) });
-    state.proposalId = DB.createProposal(state.sessionId, arg.slice(0,60), null);
     if (!arg) { console.error(red('\n  Usage: crucible plan "task"\n')); done(); process.exit(1); }
+    const _planSnap = buildConfigSnapshot(gm, cm);
+    state.sessionId  = DB.createSession({
+      gptModel: gm, claudeModel: cm, project: arg.slice(0,60),
+      providerGpt: "openai", providerClaude: "anthropic",
+      promptHash: _planSnap.prompt_hash, configSnapshot: _planSnap,
+    });
+    state.proposalId = DB.createProposal(state.sessionId, arg.slice(0,60), null);
     // Clarification phase then debate
     const claudeMsgsClarify = [{ role:"user", content:`You are opening a technical planning session. Ask 3–5 focused clarifying questions about the task. Number them. Do not start planning yet.\n\nTask: ${arg}` }];
     process.stdout.write(dim("  Claude thinking..."));
@@ -1307,7 +1365,12 @@ switch (cmd) {
     const [gm, cm] = await Promise.all([getLatestGPTModel(), getLatestClaudeModel()]);
     process.stdout.write("\r          \r");
     state.gptModel = gm; state.claudeModel = cm;
-    state.sessionId  = DB.createSession({ gptModel: gm, claudeModel: cm });
+    const _debateSnap = buildConfigSnapshot(gm, cm);
+    state.sessionId  = DB.createSession({
+      gptModel: gm, claudeModel: cm,
+      providerGpt: "openai", providerClaude: "anthropic",
+      promptHash: _debateSnap.prompt_hash, configSnapshot: _debateSnap,
+    });
     state.proposalId = DB.createProposal(state.sessionId, arg.slice(0,60), null);
     const result = await runDebate(`Task: ${arg}`);
     if (result.done) {

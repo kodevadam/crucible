@@ -19,14 +19,18 @@ db.exec(`
   PRAGMA journal_mode = WAL;
 
   CREATE TABLE IF NOT EXISTS sessions (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-    ended_at     TEXT,
-    project      TEXT,
-    repo_path    TEXT,
-    repo_url     TEXT,
-    gpt_model    TEXT,
-    claude_model TEXT
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    ended_at        TEXT,
+    project         TEXT,
+    repo_path       TEXT,
+    repo_url        TEXT,
+    gpt_model       TEXT,
+    claude_model    TEXT,
+    provider_gpt    TEXT,
+    provider_claude TEXT,
+    prompt_hash     TEXT,
+    config_snapshot TEXT
   );
 
   CREATE TABLE IF NOT EXISTS proposals (
@@ -94,9 +98,24 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_repo_changes_path ON repo_changes(repo_path);
 `);
 
+// ── Schema migrations — idempotent ALTER TABLE additions ──────────────────────
+// Each migration is attempted individually so a partially-upgraded database
+// continues to work. "duplicate column" errors are silently swallowed;
+// any other error is re-thrown.
+for (const col of [
+  "ALTER TABLE sessions ADD COLUMN provider_gpt    TEXT",
+  "ALTER TABLE sessions ADD COLUMN provider_claude TEXT",
+  "ALTER TABLE sessions ADD COLUMN prompt_hash     TEXT",
+  "ALTER TABLE sessions ADD COLUMN config_snapshot TEXT",
+]) {
+  try { db.exec(col); } catch (e) {
+    if (!e.message.includes("duplicate column")) throw e;
+  }
+}
+
 const stmts = {
-  createSession:       db.prepare(`INSERT INTO sessions (project, repo_path, repo_url, gpt_model, claude_model) VALUES (?, ?, ?, ?, ?)`),
-  updateSession:       db.prepare(`UPDATE sessions SET project=?, repo_path=?, repo_url=?, gpt_model=?, claude_model=?, ended_at=datetime('now') WHERE id=?`),
+  createSession:       db.prepare(`INSERT INTO sessions (project, repo_path, repo_url, gpt_model, claude_model, provider_gpt, provider_claude, prompt_hash, config_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+  updateSession:       db.prepare(`UPDATE sessions SET project=?, repo_path=?, repo_url=?, gpt_model=?, claude_model=?, provider_gpt=?, provider_claude=?, prompt_hash=?, config_snapshot=?, ended_at=datetime('now') WHERE id=?`),
   endSession:          db.prepare(`UPDATE sessions SET ended_at=datetime('now') WHERE id=?`),
   getSession:          db.prepare(`SELECT * FROM sessions WHERE id=?`),
   listSessions:        db.prepare(`SELECT * FROM sessions ORDER BY started_at DESC LIMIT 20`),
@@ -123,12 +142,30 @@ const stmts = {
   deleteRepoKnowledge: db.prepare(`DELETE FROM repo_knowledge WHERE repo_path=?`),
 };
 
-export function createSession({ project, repoPath, repoUrl, gptModel, claudeModel } = {}) {
-  return stmts.createSession.run(project||null, repoPath||null, repoUrl||null, gptModel||null, claudeModel||null).lastInsertRowid;
+export function createSession({ project, repoPath, repoUrl, gptModel, claudeModel,
+                                providerGpt, providerClaude, promptHash, configSnapshot } = {}) {
+  return stmts.createSession.run(
+    project||null, repoPath||null, repoUrl||null, gptModel||null, claudeModel||null,
+    providerGpt||null, providerClaude||null, promptHash||null,
+    configSnapshot ? JSON.stringify(configSnapshot) : null
+  ).lastInsertRowid;
 }
 export function updateSession(id, fields) {
   const s = stmts.getSession.get(id);
-  stmts.updateSession.run(fields.project??s.project, fields.repoPath??s.repo_path, fields.repoUrl??s.repo_url, fields.gptModel??s.gpt_model, fields.claudeModel??s.claude_model, id);
+  stmts.updateSession.run(
+    fields.project        ?? s.project,
+    fields.repoPath       ?? s.repo_path,
+    fields.repoUrl        ?? s.repo_url,
+    fields.gptModel       ?? s.gpt_model,
+    fields.claudeModel    ?? s.claude_model,
+    fields.providerGpt    ?? s.provider_gpt,
+    fields.providerClaude ?? s.provider_claude,
+    fields.promptHash     ?? s.prompt_hash,
+    fields.configSnapshot !== undefined
+      ? JSON.stringify(fields.configSnapshot)
+      : s.config_snapshot,
+    id
+  );
 }
 export function endSession(id)  { stmts.endSession.run(id); }
 export function listSessions()  { return stmts.listSessions.all(); }

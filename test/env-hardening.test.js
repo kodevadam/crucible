@@ -15,8 +15,8 @@ import { readFileSync } from "fs";
 import { join }  from "path";
 import { spawnSync } from "child_process";
 
-import { safeEnv, validateStagingPath } from "../src/safety.js";
-import { redactKeys }                   from "../src/keys.js";
+import { safeEnv, validateStagingPath, shortHash } from "../src/safety.js";
+import { redactKeys }                              from "../src/keys.js";
 
 const SRC_SAFETY = readFileSync(new URL("../src/safety.js", import.meta.url).pathname, "utf8");
 
@@ -254,4 +254,145 @@ test("redactKeys: null text returns null unchanged", () => {
 
 test("redactKeys: undefined text returns undefined unchanged", () => {
   assert.equal(redactKeys(undefined, ["sk-test-undef12345"]), undefined);
+});
+
+// ── shortHash ─────────────────────────────────────────────────────────────────
+
+test("shortHash: returns 12-char hex string", () => {
+  const h = shortHash("hello world");
+  assert.equal(typeof h, "string");
+  assert.equal(h.length, 12);
+  assert.ok(/^[0-9a-f]{12}$/.test(h), `expected 12 lowercase hex chars, got: ${h}`);
+});
+
+test("shortHash: same input → same output (deterministic)", () => {
+  assert.equal(shortHash("crucible-prompt-v1"), shortHash("crucible-prompt-v1"));
+});
+
+test("shortHash: different inputs → different hashes", () => {
+  assert.notEqual(shortHash("prompt v1"), shortHash("prompt v2"));
+});
+
+test("shortHash: handles empty string without throwing", () => {
+  const h = shortHash("");
+  assert.equal(h.length, 12);
+});
+
+test("shortHash: handles null/undefined without throwing", () => {
+  assert.equal(shortHash(null).length, 12);
+  assert.equal(shortHash(undefined).length, 12);
+});
+
+// ── Paranoid env mode (CRUCIBLE_PARANOID_ENV=1) ────────────────────────────────
+
+function withParanoidEnv(fn) {
+  const saved = process.env.CRUCIBLE_PARANOID_ENV;
+  process.env.CRUCIBLE_PARANOID_ENV = "1";
+  try { fn(); } finally {
+    if (saved !== undefined) process.env.CRUCIBLE_PARANOID_ENV = saved;
+    else delete process.env.CRUCIBLE_PARANOID_ENV;
+  }
+}
+
+test("paranoid mode: PATH is forwarded", () => {
+  withParanoidEnv(() => {
+    const env = safeEnv();
+    assert.ok("PATH" in env, "PATH must be in paranoid env");
+  });
+});
+
+test("paranoid mode: HOME is forwarded", () => {
+  withParanoidEnv(() => {
+    const env = safeEnv();
+    assert.ok("HOME" in env, "HOME must be in paranoid env");
+  });
+});
+
+test("paranoid mode: OPENAI_API_KEY is not forwarded", () => {
+  const saved = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "sk-paranoid-test-key-12345";
+  try {
+    withParanoidEnv(() => {
+      const env = safeEnv();
+      assert.ok(!("OPENAI_API_KEY" in env), "OPENAI_API_KEY must be absent in paranoid env");
+    });
+  } finally {
+    if (saved !== undefined) process.env.OPENAI_API_KEY = saved;
+    else delete process.env.OPENAI_API_KEY;
+  }
+});
+
+test("paranoid mode: ANTHROPIC_API_KEY is not forwarded", () => {
+  const saved = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "sk-ant-paranoid-test-12345";
+  try {
+    withParanoidEnv(() => {
+      const env = safeEnv();
+      assert.ok(!("ANTHROPIC_API_KEY" in env), "ANTHROPIC_API_KEY must be absent in paranoid env");
+    });
+  } finally {
+    if (saved !== undefined) process.env.ANTHROPIC_API_KEY = saved;
+    else delete process.env.ANTHROPIC_API_KEY;
+  }
+});
+
+test("paranoid mode: GH_TOKEN is forwarded (gh CLI needs it)", () => {
+  const saved = process.env.GH_TOKEN;
+  process.env.GH_TOKEN = "ghp_paranoid_test_token_12345";
+  try {
+    withParanoidEnv(() => {
+      const env = safeEnv();
+      assert.ok("GH_TOKEN" in env, "GH_TOKEN must be forwarded in paranoid env");
+    });
+  } finally {
+    if (saved !== undefined) process.env.GH_TOKEN = saved;
+    else delete process.env.GH_TOKEN;
+  }
+});
+
+test("paranoid mode: GIT_* prefix vars are forwarded", () => {
+  const saved = process.env.GIT_AUTHOR_NAME;
+  process.env.GIT_AUTHOR_NAME = "Test Author";
+  try {
+    withParanoidEnv(() => {
+      const env = safeEnv();
+      assert.ok("GIT_AUTHOR_NAME" in env, "GIT_* vars must be forwarded in paranoid env");
+    });
+  } finally {
+    if (saved !== undefined) process.env.GIT_AUTHOR_NAME = saved;
+    else delete process.env.GIT_AUTHOR_NAME;
+  }
+});
+
+test("paranoid mode: arbitrary unknown var is NOT forwarded", () => {
+  process.env._CRUCIBLE_TEST_UNKNOWN_VAR_XYZ = "secret";
+  try {
+    withParanoidEnv(() => {
+      const env = safeEnv();
+      assert.ok(
+        !("_CRUCIBLE_TEST_UNKNOWN_VAR_XYZ" in env),
+        "Unknown vars must be dropped in paranoid env"
+      );
+    });
+  } finally {
+    delete process.env._CRUCIBLE_TEST_UNKNOWN_VAR_XYZ;
+  }
+});
+
+test("paranoid mode: CRUCIBLE_EXTRA_ENV allows opt-in of additional vars", () => {
+  const savedExtra = process.env.CRUCIBLE_EXTRA_ENV;
+  const savedFoo   = process.env.MY_CUSTOM_VAR_FOR_TEST;
+  process.env.MY_CUSTOM_VAR_FOR_TEST = "my-value";
+  process.env.CRUCIBLE_EXTRA_ENV     = "MY_CUSTOM_VAR_FOR_TEST";
+  try {
+    withParanoidEnv(() => {
+      const env = safeEnv();
+      assert.ok("MY_CUSTOM_VAR_FOR_TEST" in env, "CRUCIBLE_EXTRA_ENV opt-in must be respected");
+    });
+  } finally {
+    if (savedExtra !== undefined) process.env.CRUCIBLE_EXTRA_ENV = savedExtra;
+    else delete process.env.CRUCIBLE_EXTRA_ENV;
+    if (savedFoo !== undefined) process.env.MY_CUSTOM_VAR_FOR_TEST = savedFoo;
+    else delete process.env.MY_CUSTOM_VAR_FOR_TEST;
+  }
 });

@@ -11,6 +11,7 @@
 
 import { resolve, normalize, isAbsolute, sep } from "path";
 import { spawnSync }                            from "child_process";
+import { createHash }                           from "crypto";
 
 // ── Child-process environment sanitisation ────────────────────────────────────
 
@@ -57,15 +58,104 @@ const STRIP_FROM_CHILD_ENV = new Set([
   "_CRUCIBLE_ANTHROPIC_KEY",
 ]);
 
+// ── Paranoid env mode (CRUCIBLE_PARANOID_ENV=1) ───────────────────────────────
+
 /**
- * Return a copy of process.env with known API keys stripped.
- * Pass this as `{ env: safeEnv() }` to every spawnSync call so provider
- * credentials cannot leak into child process environments.
+ * Exact-match allowlist for paranoid mode.
+ * These are the only env vars forwarded to child processes when
+ * CRUCIBLE_PARANOID_ENV=1. Everything not covered by this set or the
+ * prefix allowlist below is silently dropped (and its name is logged to
+ * stderr so users can diagnose breakage).
+ */
+const PARANOID_EXACT_ALLOW = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "COLORTERM",
+  "LANG", "LANGUAGE", "TZ",
+  // GitHub CLI auth
+  "GH_TOKEN", "GITHUB_TOKEN",
+  // Corporate proxies (non-secret; required in many environments)
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+  "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+  // Linux keychain / D-Bus (needed by libsecret / gnome-keyring)
+  "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+]);
+
+/**
+ * Prefix allowlist for paranoid mode.
+ * Any var whose name starts with one of these prefixes is forwarded.
+ */
+const PARANOID_PREFIX_ALLOW = [
+  "LC_",       // locale categories (LC_ALL, LC_CTYPE, …)
+  "GIT_",      // git internals (GIT_AUTHOR_NAME, GIT_SSH_COMMAND, …)
+  "SSH_",      // SSH agent (SSH_AUTH_SOCK, SSH_AGENT_PID)
+  "GPG_",      // GPG agent (GPG_AGENT_INFO)
+  "CRUCIBLE_", // first-party overrides
+];
+
+/**
+ * Build a minimal environment for child processes using a default-deny
+ * allowlist. Only variables in PARANOID_EXACT_ALLOW or matching a
+ * PARANOID_PREFIX_ALLOW prefix are forwarded.
+ *
+ * Dropped variable *names* (never values) are written to stderr once so
+ * users can add explicit CRUCIBLE_EXTRA_ENV overrides if something breaks.
+ *
+ * Additional vars can be opt-in via CRUCIBLE_EXTRA_ENV (comma-separated
+ * list of names), e.g.:  CRUCIBLE_EXTRA_ENV=SSH_AGENT_PID,KUBECONFIG
+ */
+function paranoidEnv() {
+  const extra = new Set(
+    (process.env.CRUCIBLE_EXTRA_ENV || "").split(",").map(s => s.trim()).filter(Boolean)
+  );
+
+  const allowed = {};
+  const dropped = [];
+
+  for (const [k, v] of Object.entries(process.env)) {
+    const permitted =
+      PARANOID_EXACT_ALLOW.has(k) ||
+      PARANOID_PREFIX_ALLOW.some(pfx => k.startsWith(pfx)) ||
+      extra.has(k);
+
+    if (permitted) {
+      allowed[k] = v;
+    } else {
+      dropped.push(k);
+    }
+  }
+
+  if (dropped.length > 0) {
+    process.stderr.write(
+      `[crucible] paranoid-env: dropped ${dropped.length} var(s) from child env: ` +
+      dropped.join(", ") + "\n"
+    );
+  }
+
+  return allowed;
+}
+
+/**
+ * Return a copy of process.env suitable for child processes.
+ *
+ * Normal mode: strip known AI provider credentials (blacklist).
+ * Paranoid mode (CRUCIBLE_PARANOID_ENV=1): default-deny allowlist —
+ *   only PATH, HOME, GIT_*, SSH_*, GH_TOKEN, CRUCIBLE_*, etc. are kept.
+ *   Dropped variable names are logged to stderr.
  */
 export function safeEnv() {
+  if (process.env.CRUCIBLE_PARANOID_ENV === "1") return paranoidEnv();
   const env = { ...process.env };
   for (const k of STRIP_FROM_CHILD_ENV) delete env[k];
   return env;
+}
+
+/**
+ * Compute a short, stable hash of an arbitrary string (prompt text, config
+ * blob, etc.) for reproducibility bookkeeping.  Returns the first 12 hex
+ * chars of the SHA-256 digest — long enough to be collision-resistant at
+ * human scale, short enough to store cheaply.
+ */
+export function shortHash(text) {
+  return createHash("sha256").update(text ?? "").digest("hex").slice(0, 12);
 }
 
 // ── Path validation ───────────────────────────────────────────────────────────
