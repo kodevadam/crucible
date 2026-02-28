@@ -109,6 +109,18 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(session_id);
+
+  CREATE TABLE IF NOT EXISTS phase_summaries (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id       INTEGER NOT NULL REFERENCES proposals(id),
+    created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+    phase             TEXT    NOT NULL,
+    round             INTEGER,
+    summary           TEXT    NOT NULL,
+    structured_output TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_phase_summaries_proposal ON phase_summaries(proposal_id);
 `);
 
 // ── Schema migrations — idempotent ALTER TABLE additions ──────────────────────
@@ -155,6 +167,8 @@ const stmts = {
   deleteRepoKnowledge: db.prepare(`DELETE FROM repo_knowledge WHERE repo_path=?`),
   addChatTurn:         db.prepare(`INSERT INTO chat_turns (session_id, turn_num, speaker, content, model, provider) VALUES (?, ?, ?, ?, ?, ?)`),
   getChatTurns:        db.prepare(`SELECT * FROM chat_turns WHERE session_id=? ORDER BY turn_num ASC`),
+  addPhaseSummary:     db.prepare(`INSERT INTO phase_summaries (proposal_id, phase, round, summary, structured_output) VALUES (?, ?, ?, ?, ?)`),
+  getPhaseSummaries:   db.prepare(`SELECT * FROM phase_summaries WHERE proposal_id=? ORDER BY created_at ASC`),
 };
 
 export function createSession({ project, repoPath, repoUrl, gptModel, claudeModel,
@@ -259,4 +273,13 @@ export function logChatTurn(sessionId, { turnNum, speaker, content, model, provi
 }
 export function getChatTurns(sessionId) {
   return stmts.getChatTurns.all(sessionId);
+}
+export function logPhaseSummary(proposalId, phase, round, summary, structuredOutput = null) {
+  stmts.addPhaseSummary.run(
+    proposalId, phase, round||null, summary,
+    structuredOutput ? JSON.stringify(structuredOutput) : null
+  );
+}
+export function getPhaseSummaries(proposalId) {
+  return stmts.getPhaseSummaries.all(proposalId);
 }
