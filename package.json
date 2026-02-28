@@ -1,0 +1,28 @@
+{
+  "name": "crucible",
+  "version": "1.0.0",
+  "description": "AI-powered planning sessions — Claude and GPT debate your proposals and converge on a plan",
+  "type": "module",
+  "bin": {
+    "crucible": "./src/cli.js"
+  },
+  "files": [
+    "src/"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.0.0",
+    "openai": "^4.0.0",
+    "zod": "^3.0.0"
+  },
+  "keywords": ["ai", "claude", "gpt", "planning", "debate", "mcp", "cli"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/crucible.git"
+  }
+}
