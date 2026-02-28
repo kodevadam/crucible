@@ -2241,6 +2241,138 @@ function cmdKeysStatus() {
   done();
 }
 
+// ── doctor ────────────────────────────────────────────────────────────────────
+
+/**
+ * crucible doctor
+ *
+ * Checks the runtime environment and reports security posture:
+ *   • Whether Crucible appears to be running inside a container or sandbox
+ *   • Whether paranoid-env mode is active
+ *   • Whether the API key store is configured
+ *
+ * The sandbox check is heuristic-based — it looks for common container
+ * signals (/.dockerenv, cgroup v1/v2 names, CONTAINER env var) and for
+ * known process-isolation tools (firejail, bubblewrap).  A "not sandboxed"
+ * result is advisory only: it means no known isolation was detected, not that
+ * isolation is definitely absent.
+ *
+ * For genuine isolation, consider running Crucible inside:
+ *   • Docker / Podman  (docker run --rm -it crucible)
+ *   • systemd-nspawn   (minimal container, no daemon needed)
+ *   • firejail         (firejail --noprofile crucible)
+ *   • bubblewrap/bwrap (custom policy)
+ */
+function cmdDoctor() {
+  const ok  = (msg) => console.log(`    ${green("✔")}  ${msg}`);
+  const warn = (msg) => console.log(`    ${yellow("⚠")}  ${msg}`);
+  const info = (msg) => console.log(`    ${dim("·")}  ${msg}`);
+
+  console.log(`\n  ${bold(cyan("crucible doctor"))} — environment security check\n`);
+
+  // ── 1. Sandbox / container detection ──────────────────────────────────────
+  console.log(`  ${bold("Sandbox isolation:")}`);
+
+  let sandboxed   = false;
+  let sandboxNote = "";
+
+  // Docker / Podman — creates this sentinel file inside the container
+  if (existsSync("/.dockerenv")) {
+    sandboxed   = true;
+    sandboxNote = "Docker/Podman container (/.dockerenv present)";
+  }
+
+  // Systemd-nspawn or generic container — sets $container in the environment
+  if (!sandboxed && process.env.container) {
+    sandboxed   = true;
+    sandboxNote = `container env var: ${process.env.container}`;
+  }
+
+  // cgroup v1: Docker/LXC entries include "docker" or "kubepods" in the path
+  if (!sandboxed) {
+    try {
+      const cgroup = readFileSync("/proc/1/cgroup", "utf8");
+      if (/docker|kubepods|lxc|containerd/i.test(cgroup)) {
+        sandboxed   = true;
+        sandboxNote = "cgroup hierarchy indicates container runtime";
+      }
+    } catch { /* /proc not available — ignore */ }
+  }
+
+  // cgroup v2: unified hierarchy — check /proc/self/cgroup
+  if (!sandboxed) {
+    try {
+      const cg2 = readFileSync("/proc/self/cgroup", "utf8");
+      if (/docker|kubepods|lxc|containerd/i.test(cg2)) {
+        sandboxed   = true;
+        sandboxNote = "cgroup v2 hierarchy indicates container runtime";
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Firejail — sets $FIREJAIL_NAME or creates /run/firejail.pid
+  if (!sandboxed && (process.env.FIREJAIL_NAME || existsSync("/run/firejail.pid"))) {
+    sandboxed   = true;
+    sandboxNote = "firejail sandbox";
+  }
+
+  // Bubblewrap sets a private /proc with a distinct namespace id (heuristic)
+  if (!sandboxed && process.env.BWRAP_INSTANCE) {
+    sandboxed   = true;
+    sandboxNote = "bubblewrap (bwrap) sandbox";
+  }
+
+  // CRUCIBLE_SANDBOX=1 — explicit opt-in acknowledgement by the operator
+  if (!sandboxed && process.env.CRUCIBLE_SANDBOX === "1") {
+    sandboxed   = true;
+    sandboxNote = "CRUCIBLE_SANDBOX=1 (operator-declared)";
+  }
+
+  if (sandboxed) {
+    ok(`Running inside a sandbox: ${sandboxNote}`);
+  } else {
+    warn("No sandbox detected — child processes (git, gh) can read local files and reach the network.");
+    info("For stronger isolation consider: Docker/Podman, firejail, bubblewrap, or systemd-nspawn.");
+    info("Set CRUCIBLE_SANDBOX=1 to suppress this warning once you have configured external isolation.");
+  }
+
+  // ── 2. Paranoid env mode ───────────────────────────────────────────────────
+  console.log(`\n  ${bold("Environment hardening:")}`);
+  const penv = process.env.CRUCIBLE_PARANOID_ENV;
+  if (penv === "1") {
+    ok("CRUCIBLE_PARANOID_ENV=1  (enforce: strict allowlist applied to child envs)");
+  } else if (penv === "warn") {
+    warn("CRUCIBLE_PARANOID_ENV=warn  (audit mode — nothing is dropped yet; set =1 to enforce)");
+  } else {
+    warn("CRUCIBLE_PARANOID_ENV not set  (blacklist mode: only known provider keys are stripped)");
+    info("Set CRUCIBLE_PARANOID_ENV=1 for a strict allowlist on all child process environments.");
+  }
+
+  // ── 3. Git hook suppression ────────────────────────────────────────────────
+  console.log(`\n  ${bold("Git hook suppression:")}`);
+  ok("core.hooksPath=/dev/null applied to all Crucible git calls (hooks never fire)");
+
+  // ── 4. API key storage ─────────────────────────────────────────────────────
+  console.log(`\n  ${bold("API key storage:")}`);
+  const oaiSrc = getKeySource(SERVICE_OPENAI);
+  const antSrc = getKeySource(SERVICE_ANTHROPIC);
+
+  const srcLabel = (src) =>
+    src === "keychain"     ? green("keychain (secure)")
+    : src === "file"       ? yellow("config file (~/.config/crucible/keys/)")
+    : src === "env"        ? yellow("env var (legacy; consider: crucible keys set)")
+    : src === "cache"      ? green("in-process cache")
+    : src === "session-only" ? cyan("session-only (ephemeral)")
+    : src === "not-set"    ? red("not set")
+    : dim(src);
+
+  console.log(`    ${bold("OpenAI:   ")} ${srcLabel(oaiSrc)}`);
+  console.log(`    ${bold("Anthropic:")} ${srcLabel(antSrc)}`);
+
+  console.log();
+  done();
+}
+
 // ── help ──────────────────────────────────────────────────────────────────────
 
 function cmdHelp() {
@@ -2257,6 +2389,7 @@ function cmdHelp() {
     ${bold("crucible repo refresh")}      force-rebuild repo understanding for cwd
     ${bold("crucible keys status")}       show where API keys are stored ${dim("(no values)")}
     ${bold("crucible models")}            show auto-detected model versions
+    ${bold("crucible doctor")}            check security posture of runtime environment
     ${bold("crucible help")}              show this help
 
   ${bold("Interactive session menu:")}
@@ -2449,6 +2582,7 @@ switch (cmd) {
     if (rest[0] === "status") { cmdKeysStatus(); break; }
     console.error(red(`\n  Usage: crucible keys status\n`)); process.exit(1);
   }
+  case "doctor":   cmdDoctor(); break;
   case "history":  await cmdHistory(); break;
   case "models":   await cmdModels(); break;
   case "help": case "--help": case "-h": cmdHelp(); break;
