@@ -43,12 +43,22 @@ export class OpenAIProvider {
     } catch (err) {
       // Older models (gpt-4, gpt-4-turbo) reject max_completion_tokens — retry
       if (err?.status === 400 && err?.code === "unsupported_parameter") {
-        const res = await this.client.chat.completions.create({
-          model, messages, max_tokens: maxTokens,
-        });
-        return res.choices[0].message.content;
+        try {
+          const res = await this.client.chat.completions.create({
+            model, messages, max_tokens: maxTokens,
+          });
+          return res.choices[0].message.content;
+        } catch (retryErr) {
+          const norm = normalizeApiError(retryErr, { provider: "openai", model });
+          const enhanced = new Error(formatApiError(norm));
+          enhanced.crucibleApiError = norm;
+          throw enhanced;
+        }
       }
-      throw err;
+      const norm = normalizeApiError(err, { provider: "openai", model });
+      const enhanced = new Error(formatApiError(norm));
+      enhanced.crucibleApiError = norm;
+      throw enhanced;
     }
   }
 
@@ -76,10 +86,17 @@ export class AnthropicProvider {
    * @returns {Promise<string>}
    */
   async chat(messages, { model, maxTokens = 2000, system } = {}) {
-    const params = { model, max_tokens: maxTokens, messages };
-    if (system) params.system = system;
-    const res = await this.client.messages.create(params);
-    return res.content[0].text;
+    try {
+      const params = { model, max_tokens: maxTokens, messages };
+      if (system) params.system = system;
+      const res = await this.client.messages.create(params);
+      return res.content[0].text;
+    } catch (err) {
+      const norm = normalizeApiError(err, { provider: "anthropic", model });
+      const enhanced = new Error(formatApiError(norm));
+      enhanced.crucibleApiError = norm;
+      throw enhanced;
+    }
   }
 
   /**
@@ -90,6 +107,84 @@ export class AnthropicProvider {
     const { data } = await this.client.models.list();
     return data.map(m => ({ id: m.id, created: m.created_at }));
   }
+}
+
+// ── API error normaliser ──────────────────────────────────────────────────────
+
+/**
+ * Normalise a provider API error into a structured diagnostic object.
+ *
+ * Fields returned:
+ *   provider   — "openai" | "anthropic" | "unknown"
+ *   model      — model id string, or "unknown"
+ *   requestId  — provider request-id header (best-effort), or null
+ *   status     — HTTP status code, or null
+ *   code       — provider error code string, or null
+ *   retryable  — true if a simple retry is likely to succeed
+ *   message    — human-readable error string
+ *   suggestion — one-line actionable hint for the user
+ *
+ * Used by callers to print a consistent failure block regardless of which SDK
+ * threw.  Never throws itself.
+ */
+export function normalizeApiError(err, { provider = "unknown", model = "unknown" } = {}) {
+  const status    = err?.status ?? err?.statusCode ?? null;
+  const code      = err?.code ?? err?.error?.code ?? null;
+  const requestId =
+    err?.headers?.["x-request-id"] ??
+    err?.request_id ??
+    err?.error?.internal?.request_id ??
+    null;
+
+  const retryable =
+    status === 429 ||
+    (status != null && status >= 500 && status < 600) ||
+    /timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND/i.test(err?.message ?? "");
+
+  let suggestion = "Check your API key and account quota.";
+  if (status === 401 || status === 403)
+    suggestion = "Invalid or missing API key — run: crucible keys status";
+  else if (status === 429)
+    suggestion = "Rate-limited — wait and retry, or reduce request rate / max tokens.";
+  else if (status === 400 && code === "unsupported_parameter")
+    suggestion = "Parameter unsupported by this model — try pinning to a different model version.";
+  else if (status === 400)
+    suggestion = "Bad request — check model name and token limits.";
+  else if (status != null && status >= 500)
+    suggestion = "Provider server error — retry shortly; check provider status page.";
+  else if (status == null)
+    suggestion = "Network or timeout error — check connectivity and retry.";
+
+  return {
+    provider, model, requestId,
+    status, code,
+    retryable,
+    message:    err?.message ?? String(err),
+    suggestion,
+  };
+}
+
+/**
+ * Format a normalised API error as a human-readable block for console output.
+ *
+ * Example output:
+ *   ✗ API error — openai / gpt-4o
+ *     Status:     429  (retryable)
+ *     Request ID: req-abc123
+ *     Message:    Rate limit exceeded.
+ *     Suggestion: Rate-limited — wait and retry, or reduce request rate / max tokens.
+ */
+export function formatApiError({ provider, model, requestId, status, retryable, message, suggestion }) {
+  const lines = [
+    `✗ API error — ${provider} / ${model}`,
+    `  Status:     ${status ?? "n/a"}  (${retryable ? "retryable" : "not retryable"})`,
+  ];
+  if (requestId) lines.push(`  Request ID: ${requestId}`);
+  lines.push(
+    `  Message:    ${message}`,
+    `  Suggestion: ${suggestion}`,
+  );
+  return lines.join("\n");
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────

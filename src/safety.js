@@ -301,6 +301,25 @@ export function validateBranchName(name) {
 
 // ── Safe git execution ────────────────────────────────────────────────────────
 
+// ── Git hook suppression ──────────────────────────────────────────────────────
+//
+// Any repository Crucible operates on may contain attacker-controlled content,
+// including .git/hooks/*.  Even though we use spawnSync with shell:false (no
+// shell injection), git itself will still execute hook scripts on operations
+// like commit, checkout, merge, and post-receive unless we tell it not to.
+//
+// We unconditionally pass -c core.hooksPath=/dev/null to every git invocation
+// so that hooks in the repo can never fire during Crucible's own git calls.
+// /dev/null is a directory on no system, so git treats it as "no hooks dir"
+// and silently skips hook execution — the right behaviour on Linux, macOS, and
+// WSL.  On bare Windows (cmd/PowerShell without WSL) this path doesn't exist
+// either, so hooks are also skipped; the rare case where this might differ
+// is documented in the security caveat in README.
+//
+// SCOPE: this suppresses hooks in Crucible's own git calls only.  The user's
+// own git operations in a terminal are unaffected.
+const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
+
 /**
  * Run a git command with an explicit args array.
  * Output is captured and returned as a trimmed string.
@@ -308,9 +327,10 @@ export function validateBranchName(name) {
  *
  * Equivalent to the old shq(`git -C "..." <args>`) pattern but without
  * shell interpolation.  safeEnv() ensures API keys are not forwarded.
+ * core.hooksPath=/dev/null prevents hook execution in untrusted repos.
  */
 export function gitq(repoPath, args) {
-  const r = spawnSync("git", ["-C", repoPath, ...args], {
+  const r = spawnSync("git", ["-C", repoPath, ...NO_HOOKS, ...args], {
     encoding: "utf8",
     stdio:    ["ignore", "pipe", "pipe"],
     shell:    false,
@@ -325,9 +345,10 @@ export function gitq(repoPath, args) {
  *
  * Equivalent to the old sh(`git -C "..." <args>`) pattern but without
  * shell interpolation.  safeEnv() ensures API keys are not forwarded.
+ * core.hooksPath=/dev/null prevents hook execution in untrusted repos.
  */
 export function gitExec(repoPath, args) {
-  const r = spawnSync("git", ["-C", repoPath, ...args], {
+  const r = spawnSync("git", ["-C", repoPath, ...NO_HOOKS, ...args], {
     stdio:  "inherit",
     shell:  false,
     env:    safeEnv(),
