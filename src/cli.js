@@ -25,6 +25,8 @@ import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
 import { validateBranchName, gitq, gitExec, ghExec, ghq, shortHash,
          normalizeGitHubRepoInput, isSafeDeletionTarget }             from "./safety.js";
+import { getGhAuthStatus, runGhAuthLogin, runGhAuthLogout,
+         listUserRepos, listOrgRepos, searchRepos }                   from "./github.js";
 import { runChatSession }                                             from "./chat.js";
 import { selectBestGPTModel, selectBestClaudeModel,
          OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
@@ -383,19 +385,141 @@ function dirNonEmpty(p) {
   try { return readdirSync(p).length > 0; } catch { return false; }
 }
 
+// ── GitHub repo browser ───────────────────────────────────────────────────────
+
+const GITHUB_PAGE_SIZE = 20;
+
+/**
+ * Interactive GitHub repo picker.
+ *
+ * Fetches the authenticated user's repos (or search results) and presents
+ * them in a numbered list.  Supports paging, search, and browsing another
+ * user/org's repos.
+ *
+ * Returns the selected { nameWithOwner, name, isPrivate } object, or null
+ * if the user cancels.
+ */
+async function browseGitHubRepos() {
+  let repos       = [];
+  let page        = 0;
+  let searchQuery = null;
+  let orgHandle   = null;   // non-null when browsing another user/org
+  let fetched     = false;
+
+  while (true) {
+    // ── Fetch (or re-fetch after filter change) ─────────────────────────────
+    if (!fetched) {
+      process.stdout.write(dim("  Fetching repos..."));
+      if (searchQuery) {
+        repos = searchRepos(searchQuery, { limit: 30 });
+      } else if (orgHandle) {
+        repos = listOrgRepos(orgHandle, { limit: 100 });
+      } else {
+        repos = listUserRepos({ limit: 100 });
+      }
+      process.stdout.write("\r                      \r");
+      fetched = true;
+      page    = 0;
+    }
+
+    // ── Render page ─────────────────────────────────────────────────────────
+    const totalPages = Math.max(1, Math.ceil(repos.length / GITHUB_PAGE_SIZE));
+    const start      = page * GITHUB_PAGE_SIZE;
+    const slice      = repos.slice(start, start + GITHUB_PAGE_SIZE);
+
+    console.log("");
+    let header = bold(cyan("  GitHub Repos"));
+    if (searchQuery) header += dim(`  search: "${searchQuery}"`);
+    else if (orgHandle) header += dim(`  org/user: ${orgHandle}`);
+    header += dim(`  (${repos.length} repos, page ${page + 1}/${totalPages})`);
+    console.log(header);
+    console.log(hr());
+
+    if (!slice.length) {
+      console.log(dim("  (no repos found)"));
+    } else {
+      slice.forEach((repo, i) => {
+        const n    = String(start + i + 1).padStart(2);
+        const lock = repo.isPrivate ? dim(" ⚿") : "";
+        const desc = repo.description
+          ? dim("  " + repo.description.slice(0, 55))
+          : "";
+        console.log(`  ${cyan(n)}  ${repo.nameWithOwner}${lock}${desc}`);
+      });
+    }
+
+    console.log("");
+    const hints = [
+      page > 0                            ? `${cyan("p")} prev`        : null,
+      start + GITHUB_PAGE_SIZE < repos.length ? `${cyan("n")} next`   : null,
+      `${cyan("s")} search`,
+      `${cyan("o")} other user/org`,
+      searchQuery || orgHandle ? `${cyan("r")} reset` : null,
+      `${cyan("0")} cancel`,
+    ].filter(Boolean).join("   ");
+    console.log("  " + hints);
+    console.log("");
+
+    const ans = (await ask("  Enter # to select:")).trim().toLowerCase();
+
+    if (ans === "0" || ans === "q" || ans === "") return null;
+
+    if (ans === "n") {
+      if (start + GITHUB_PAGE_SIZE < repos.length) page++;
+      continue;
+    }
+    if (ans === "p") {
+      if (page > 0) page--;
+      continue;
+    }
+    if (ans === "s") {
+      const q = (await ask("  Search query:")).trim();
+      if (q) { searchQuery = q; orgHandle = null; fetched = false; }
+      continue;
+    }
+    if (ans === "o") {
+      const h = (await ask("  GitHub username or org:")).trim();
+      if (h) { orgHandle = h; searchQuery = null; fetched = false; }
+      continue;
+    }
+    if (ans === "r") {
+      searchQuery = null; orgHandle = null; fetched = false;
+      continue;
+    }
+
+    const n = parseInt(ans, 10);
+    if (!isNaN(n) && n >= 1 && n <= repos.length) {
+      return repos[n - 1];
+    }
+    crucibleSay(`Enter a number (1–${repos.length}), or a command.`);
+  }
+}
+
 async function setupRepo() {
   console.log("");
   crucibleSay("Let's get the repo set up.");
+
+  // Check GitHub auth status once so we can tailor the menu
+  const ghAuth = getGhAuthStatus();
+
   console.log("");
   console.log(`  ${cyan("1")}  Use a local repo (give me a path)`);
-  console.log(`  ${cyan("2")}  Clone a GitHub repo`);
+  if (ghAuth.installed && ghAuth.authed) {
+    console.log(`  ${cyan("2")}  Browse & clone from GitHub ${dim("(" + ghAuth.username + ")")}`);
+  } else {
+    console.log(`  ${cyan("2")}  Clone a GitHub repo ${dim("(enter URL)")}`);
+  }
   console.log(`  ${cyan("3")}  Create a new GitHub repo`);
   console.log(`  ${cyan("4")}  Skip — no repo for this session`);
+  if (!ghAuth.installed || !ghAuth.authed) {
+    console.log(`  ${cyan("5")}  Connect GitHub account`);
+  }
   console.log("");
 
   const choice = (await ask("  ›")).trim();
 
   if (choice === "1") {
+    // ── Local path ────────────────────────────────────────────────────────────
     const p = await ask("  Path to repo:", { defaultVal: process.cwd() });
     const resolved = resolve(p);
     if (!inGitRepo(resolved)) {
@@ -408,11 +532,24 @@ async function setupRepo() {
   }
 
   else if (choice === "2") {
+    // ── Clone / browse GitHub repos ───────────────────────────────────────────
     if (!ghInstalled()) { crucibleSay("GitHub CLI not found — run setup-crucible-git.sh first."); return; }
-    const rawUrl = await ask("  GitHub repo URL or owner/name:");
-    if (!rawUrl.trim()) return;
-    const normalized = normalizeGitHubRepoInput(rawUrl);
-    const repoName   = normalized.split("/").pop() || "repo";
+
+    let normalized;
+
+    if (ghAuth.authed) {
+      // Browse the user's repos via numbered list
+      const selected = await browseGitHubRepos();
+      if (!selected) { crucibleSay("Cancelled."); return; }
+      normalized = selected.nameWithOwner;
+    } else {
+      // Fall back to manual URL / owner/repo entry
+      const rawUrl = await ask("  GitHub repo URL or owner/name:");
+      if (!rawUrl.trim()) return;
+      normalized = normalizeGitHubRepoInput(rawUrl);
+    }
+
+    const repoName    = normalized.split("/").pop() || "repo";
     const defaultDest = join(homedir(), ".crucible", "repos", repoName);
     let dest = (await ask("  Clone to:", { defaultVal: defaultDest })).trim() || defaultDest;
 
@@ -428,7 +565,6 @@ async function setupRepo() {
         if (!existsSync(join(dest, ".git"))) {
           crucibleSay(`${yellow("No .git/ directory found at")} ${yellow(dest)}.`);
           crucibleSay("This may not be a git repository — proceed with caution.");
-          // fall through and let inGitRepo be the final authority
         }
         if (!inGitRepo(dest)) {
           crucibleSay(`${red("That path isn't a git repo.")} Pick another option.`);
@@ -481,6 +617,7 @@ async function setupRepo() {
   }
 
   else if (choice === "3") {
+    // ── Create new GitHub repo ────────────────────────────────────────────────
     if (!ghInstalled()) { crucibleSay("GitHub CLI not found — run setup-crucible-git.sh first."); return; }
     const name    = await ask("  New repo name:");
     const desc    = await ask("  Description (optional):");
@@ -493,6 +630,26 @@ async function setupRepo() {
     state.repoUrl  = ghq(["repo", "view", name.trim(), "--json", "url", "-q", ".url"]);
     DB.logAction(null, state.sessionId, "create_repo", `Created repo: ${name.trim()}`, { name: name.trim(), url: state.repoUrl });
     crucibleSay(`Repo created: ${yellow(state.repoUrl)}`);
+  }
+
+  else if (choice === "5") {
+    // ── Connect GitHub account ────────────────────────────────────────────────
+    if (!ghInstalled()) {
+      crucibleSay("GitHub CLI (gh) is not installed.");
+      crucibleSay(`Install it from ${dim("https://cli.github.com")} then re-run setup-crucible-git.sh.`);
+      return;
+    }
+    crucibleSay("Starting GitHub login via gh CLI...");
+    const ok = runGhAuthLogin();
+    if (ok) {
+      const status = getGhAuthStatus();
+      crucibleSay(status.authed
+        ? `${green("Connected!")} Signed in as ${bold(status.username || "unknown")}`
+        : red("Login may not have completed — try again."));
+    } else {
+      crucibleSay(red("GitHub login failed or was cancelled."));
+    }
+    return setupRepo(); // show menu again with updated auth state
   }
 
   else {
@@ -1224,21 +1381,38 @@ async function cmdGit() {
 
   let running = true;
   while (running) {
-    const branch = currentBranch(repoPath);
+    const branch    = currentBranch(repoPath);
+    const ghAuth    = getGhAuthStatus();
+    const authLabel = ghAuth.authed
+      ? green(`${ghAuth.username || "connected"}`)
+      : dim("not connected");
+
     console.log(""); console.log(hr());
     const repoRemote = gitq(repoPath, ["remote", "get-url", "origin"]) || "(no remote)";
-    console.log(`  ${dim("repo:")} ${repoRemote}   ${dim("branch:")} ${yellow(branch)}`);
+    console.log(`  ${dim("repo:")} ${repoRemote}   ${dim("branch:")} ${yellow(branch)}   ${dim("github:")} ${authLabel}`);
     console.log(hr());
 
-    const items = ["Switch branch","Create new branch","Pull latest","Push current branch","Clone a repo","View open PRs","Create pull request","Squash & merge a PR","Merge current branch to main"];
+    const items = [
+      "Switch branch",
+      "Create new branch",
+      "Pull latest",
+      "Push current branch",
+      "Clone a repo",
+      "View open PRs",
+      "Create pull request",
+      "Squash & merge a PR",
+      "Merge current branch to main",
+      ghAuth.authed ? "Browse my GitHub repos" : "Connect GitHub account",
+    ];
     console.log(bold(cyan("\n  Git\n")));
-    items.forEach((o,i) => console.log(`  ${bold(cyan(String(i+1)))}  ${o}`));
+    items.forEach((o, i) => console.log(`  ${bold(cyan(String(i + 1)))}  ${o}`));
     console.log(`  ${bold(cyan("0"))}  Exit`); console.log("");
     const choice = parseInt((await ask("  ›")).trim());
     if (!choice || choice === 0) { running = false; break; }
 
     switch (choice - 1) {
       case 0: {
+        // Switch branch
         const branches = gitq(repoPath, ["branch", "-a", "--format=%(refname:short)"])
           .split("\n").filter(b=>b&&b!==branch).map(b=>b.replace(/^origin\//,"")).filter((b,i,a)=>a.indexOf(b)===i);
         if (!branches.length) { console.log(yellow("\n  No other branches.\n")); break; }
@@ -1252,6 +1426,7 @@ async function cmdGit() {
         break;
       }
       case 1: {
+        // Create new branch
         const nameRaw = await ask("  New branch name:");
         if (nameRaw.trim()) {
           let safeName;
@@ -1265,13 +1440,32 @@ async function cmdGit() {
       }
       case 2: gitExec(repoPath, ["pull"]); console.log(green("\n  ✔ Pulled\n")); break;
       case 3: {
+        // Push
         const remote = gitq(repoPath, ["remote"]) || "origin";
         gitExec(repoPath, ["push", "-u", remote, currentBranch(repoPath)]);
         DB.logAction(state.proposalId, state.sessionId, "push", `Pushed ${currentBranch(repoPath)}`, {});
         console.log(green("\n  ✔ Pushed\n")); break;
       }
       case 4: {
-        const url = await ask("  Repo URL:");
+        // Clone — offer browser if authed, else prompt URL
+        if (ghAuth.authed) {
+          console.log(`  ${cyan("1")}  Browse & pick from my GitHub repos`);
+          console.log(`  ${cyan("2")}  Enter URL / owner/name manually`);
+          console.log("");
+          const cloneMode = (await ask("  ›")).trim();
+          if (cloneMode === "1") {
+            const selected = await browseGitHubRepos();
+            if (!selected) { crucibleSay("Cancelled."); break; }
+            try {
+              ghExec(["repo", "clone", selected.nameWithOwner]);
+              console.log(green("\n  ✔ Cloned\n"));
+            } catch (err) {
+              crucibleSay(`${red("Clone failed:")} ${err.message}`);
+            }
+            break;
+          }
+        }
+        const url = await ask("  Repo URL or owner/name:");
         if (url.trim()) {
           try {
             ghExec(["repo", "clone", normalizeGitHubRepoInput(url)]);
@@ -1284,6 +1478,7 @@ async function cmdGit() {
       }
       case 5: console.log(""); ghExec(["pr", "list"]); console.log(""); break;
       case 6: {
+        // Create PR
         const title = await ask("  PR title:");
         const body  = await ask("  Description:");
         const base  = await ask("  Base branch:", { defaultVal:"main" });
@@ -1295,6 +1490,7 @@ async function cmdGit() {
         break;
       }
       case 7: {
+        // Squash-merge PR
         const prs = ghq(["pr", "list", "--json", "number,title,headRefName",
           "--template", "{{range .}}{{.number}}|{{.title}}|{{.headRefName}}\n{{end}}"
         ]).split("\n").filter(Boolean);
@@ -1310,6 +1506,44 @@ async function cmdGit() {
         break;
       }
       case 8: await offerMergeToMain(); break;
+      case 9: {
+        // Browse my GitHub repos / Connect GitHub account
+        if (ghAuth.authed) {
+          // Browse repos
+          const selected = await browseGitHubRepos();
+          if (selected) {
+            console.log("");
+            console.log(`  ${cyan("1")}  Clone ${selected.nameWithOwner}`);
+            console.log(`  ${cyan("2")}  Just copy the name (for manual use)`);
+            console.log(`  ${cyan("0")}  Cancel`);
+            console.log("");
+            const repoAction = (await ask("  ›")).trim();
+            if (repoAction === "1") {
+              try {
+                ghExec(["repo", "clone", selected.nameWithOwner]);
+                console.log(green(`\n  ✔ Cloned ${selected.nameWithOwner}\n`));
+              } catch (err) {
+                crucibleSay(`${red("Clone failed:")} ${err.message}`);
+              }
+            } else if (repoAction === "2") {
+              console.log(`\n  ${bold(selected.nameWithOwner)}\n`);
+            }
+          }
+        } else {
+          // Connect GitHub account
+          crucibleSay("Starting GitHub login via gh CLI...");
+          const ok = runGhAuthLogin();
+          if (ok) {
+            const status = getGhAuthStatus();
+            crucibleSay(status.authed
+              ? `${green("Connected!")} Signed in as ${bold(status.username || "unknown")}`
+              : red("Login may not have completed — run 'gh auth login' manually."));
+          } else {
+            crucibleSay(red("GitHub login failed or was cancelled."));
+          }
+        }
+        break;
+      }
     }
   }
   done();
