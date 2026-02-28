@@ -23,6 +23,8 @@ import { analyseRepo, getRepoSummary, getChangeLog, clearRepoKnowledge } from ".
 import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers } from "./staging.js";
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
 import { validateBranchName, gitq, gitExec, ghExec, ghq } from "./safety.js";
+import { selectBestGPTModel, selectBestClaudeModel,
+         OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
 
 // Keys retrieved from secure store (keychain or file), with env var fallback
 let _openai    = null;
@@ -46,8 +48,6 @@ function getAnthropic() {
 
 const MAX_ROUNDS         = parseInt(process.env.MAX_ROUNDS || "10");
 const CONVERGENCE_PHRASE = "I AGREE WITH THIS PLAN";
-const EXCLUDE  = /transcribe|search|realtime|audio|vision|preview|tts|whisper|dall-e|instruct|embed|codex/i;
-const PRIORITY = [/^gpt-5/, /^gpt-4\.5/, /^gpt-4o/, /^gpt-4/];
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
@@ -137,27 +137,53 @@ function ghInstalled()   {
 
 // ── Model detection ───────────────────────────────────────────────────────────
 
+// In-memory cache so repeated calls within a session (models command, new
+// session, resume, etc.) hit the network only once per 60 seconds.
+const MODEL_CACHE_TTL = 60_000;
+const _modelCache = new Map();
+
+async function cachedModels(key, fetcher) {
+  const now = Date.now();
+  const hit = _modelCache.get(key);
+  if (hit && now - hit.ts < MODEL_CACHE_TTL) return hit.data;
+  const data = await fetcher();
+  _modelCache.set(key, { data, ts: now });
+  return data;
+}
+
+function warnFallback(provider, fallback, envVar) {
+  console.error(
+    `  [crucible] Could not list ${provider} models — falling back to ${fallback}.` +
+    ` Set ${envVar} to pin a specific model.`
+  );
+}
+
 async function getLatestGPTModel() {
   try {
-    const { data: models } = await getOpenAI().models.list();
-    for (const pat of PRIORITY) {
-      const tier = models
-        .filter(m => pat.test(m.id) && !EXCLUDE.test(m.id))
-        .sort((a, b) => b.created - a.created);
-      if (tier.length) return tier[0].id;
-    }
-    return "gpt-4o";
-  } catch { return "gpt-4o"; }
+    const models = await cachedModels("openai", () =>
+      getOpenAI().models.list().then(r => r.data));
+    const best = selectBestGPTModel(models);
+    if (best) return best;
+    warnFallback("OpenAI", OPENAI_FALLBACK, "OPENAI_MODEL");
+    return OPENAI_FALLBACK;
+  } catch {
+    warnFallback("OpenAI", OPENAI_FALLBACK, "OPENAI_MODEL");
+    return OPENAI_FALLBACK;
+  }
 }
 
 async function getLatestClaudeModel() {
   try {
-    const { data: models } = await getAnthropic().models.list();
-    const sonnet = models
-      .filter(m => m.id.includes("sonnet"))
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    return sonnet[0]?.id || "claude-sonnet-4-6";
-  } catch { return "claude-sonnet-4-6"; }
+    const models = await cachedModels("anthropic", () =>
+      getAnthropic().models.list().then(r => r.data));
+    const best = selectBestClaudeModel(models);
+    if (best) return best;
+    warnFallback("Anthropic", CLAUDE_FALLBACK, "CLAUDE_MODEL");
+    return CLAUDE_FALLBACK;
+  } catch {
+    warnFallback("Anthropic", CLAUDE_FALLBACK, "CLAUDE_MODEL");
+    return CLAUDE_FALLBACK;
+  }
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
