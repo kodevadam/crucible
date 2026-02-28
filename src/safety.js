@@ -20,6 +20,17 @@ import { spawnSync }                            from "child_process";
  * no legitimate use in git/gh and would represent a key-leakage surface if
  * passed through.
  *
+ * DESIGN NOTE — blacklist vs. whitelist:
+ *   A stricter alternative would be to whitelist only the env vars that
+ *   git/gh actually need (PATH, HOME, GIT_*, GH_TOKEN, …) and drop
+ *   everything else.  That approach has near-zero leakage surface but
+ *   breaks third-party git helpers, SSH agents, locale settings, and
+ *   anything else that tunnels through the environment.  The current
+ *   blacklist is the pragmatic middle ground: low breakage risk, covers
+ *   all known AI provider credentials.  If a "paranoid mode" is ever
+ *   added (CRUCIBLE_PARANOID_ENV=1), switching to a whitelist there would
+ *   be a clean opt-in without disturbing normal operation.
+ *
  * NOTE: GitHub tokens (GH_TOKEN, GITHUB_TOKEN) are intentionally NOT listed
  * here — the gh CLI legitimately needs them.
  */
