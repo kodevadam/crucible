@@ -35,11 +35,11 @@ const CONVERGENCE_PHRASE = "I AGREE WITH THIS PLAN";
 
 // Token budgets used in API calls — included in the hash so that a change to
 // any budget value produces a different hash and is detectable post-hoc.
-const GPT_MAX_TOKENS    = 2000;
-const CLAUDE_MAX_TOKENS = 2000;
+// INFER_MAX_TOKENS and GENERATE_MAX_TOKENS are imported from staging.js above
+// (single source of truth; redeclaring them here would be a duplicate identifier).
+const GPT_MAX_TOKENS     = 2000;
+const CLAUDE_MAX_TOKENS  = 2000;
 const SUMMARY_MAX_TOKENS = 500;
-const INFER_MAX_TOKENS  = 1000;
-const GENERATE_MAX_TOKENS = 4000;
 
 /**
  * Compute a short hash of every prompt template and token budget used in this
