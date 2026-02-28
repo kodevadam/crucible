@@ -396,7 +396,7 @@ async function setupRepo() {
     if (!rawUrl.trim()) return;
     const normalized = normalizeGitHubRepoInput(rawUrl);
     const repoName   = normalized.split("/").pop() || "repo";
-    const defaultDest = join(homedir(), "repos", repoName);
+    const defaultDest = join(homedir(), ".crucible", "repos", repoName);
     let dest = (await ask("  Clone to:", { defaultVal: defaultDest })).trim() || defaultDest;
 
     // Handle existing non-empty destination
