@@ -131,8 +131,9 @@ function computePromptHash() {
     // ── Structured pipeline phase prompts ──────────────────────────────────
     `You are {model} in the DRAFT phase of a structured planning pipeline. Produce a structured plan in JSON. No reasoning commentary — output only JSON.`,
     `You are {model} in the CRITIQUE phase. Be rigorous — find real gaps and risks.`,
-    `You are the SYNTHESIS stage of a structured planning pipeline. You receive compressed summaries and final plans — NOT raw debate transcripts.`,
+    `You are the SYNTHESIS stage of a structured planning pipeline. You are Claude and you own this decision. You receive compressed summaries and final plans — NOT raw debate transcripts.`,
     PLAN_SCHEMA_PROMPT,
+    CRITIQUE_SCHEMA_PROMPT,
 
     // ── Token budgets ──────────────────────────────────────────────────────
     // All max_tokens values in one place: changing any budget changes the hash.
@@ -1106,10 +1107,9 @@ async function runDraftPhase(taskContext) {
 const CRITIQUE_SCHEMA_PROMPT = `Output a JSON object with EXACTLY these keys:
 {
   "critique": {
-    "gaps": ["missing requirement or unclear scope"],
-    "risks": ["technical risk or concern"],
-    "overreach": ["scope creep or unnecessary complexity"],
-    "missing_constraints": ["constraint that must be made explicit"]
+    "blocking": ["issue that MUST be resolved before execution — will cause failure if not addressed"],
+    "important": ["significant concern that materially affects quality or risk"],
+    "minor": ["small improvement suggestion"]
   },
   "revised_plan": {
     "objective": "...",
@@ -1119,7 +1119,7 @@ const CRITIQUE_SCHEMA_PROMPT = `Output a JSON object with EXACTLY these keys:
   },
   "converged": false
 }
-Set "converged": true only if you genuinely agree with the other model's plan.
+Set "converged": true only if you genuinely agree with the other model's plan and have no blocking issues.
 Output ONLY valid JSON. No markdown fences, no preamble.`;
 
 async function runCritiquePhase(draftResult, taskContext) {
@@ -1160,10 +1160,9 @@ async function runCritiquePhase(draftResult, taskContext) {
     console.log(""); console.log(bold(yellow(`  ▶ GPT (${state.gptModel}) — Critique`))); console.log("");
     if (gptCritique?.critique) {
       const c = gptCritique.critique;
-      if (c.gaps?.length)                { console.log(dim("    Gaps:"));                c.gaps.forEach(g => console.log(`      • ${g}`)); }
-      if (c.risks?.length)               { console.log(dim("    Risks:"));               c.risks.forEach(r => console.log(`      • ${r}`)); }
-      if (c.overreach?.length)           { console.log(dim("    Overreach:"));           c.overreach.forEach(o => console.log(`      • ${o}`)); }
-      if (c.missing_constraints?.length) { console.log(dim("    Missing constraints:")); c.missing_constraints.forEach(m => console.log(`      • ${m}`)); }
+      if (c.blocking?.length)  { console.log(red("    Blocking:"));    c.blocking.forEach(i => console.log(`      • ${i}`)); }
+      if (c.important?.length) { console.log(yellow("    Important:")); c.important.forEach(i => console.log(`      • ${i}`)); }
+      if (c.minor?.length)     { console.log(dim("    Minor:"));        c.minor.forEach(i => console.log(`      • ${i}`)); }
       if (gptCritique.revised_plan) {
         console.log(""); console.log(dim("    Revised plan:"));
         formatPlanForDisplay(gptCritique.revised_plan).split("\n").forEach(l => console.log(`      ${l}`));
@@ -1190,10 +1189,9 @@ async function runCritiquePhase(draftResult, taskContext) {
     console.log(""); console.log(bold(blue(`  ▶ Claude (${state.claudeModel}) — Critique`))); console.log("");
     if (claudeCritique?.critique) {
       const c = claudeCritique.critique;
-      if (c.gaps?.length)                { console.log(dim("    Gaps:"));                c.gaps.forEach(g => console.log(`      • ${g}`)); }
-      if (c.risks?.length)               { console.log(dim("    Risks:"));               c.risks.forEach(r => console.log(`      • ${r}`)); }
-      if (c.overreach?.length)           { console.log(dim("    Overreach:"));           c.overreach.forEach(o => console.log(`      • ${o}`)); }
-      if (c.missing_constraints?.length) { console.log(dim("    Missing constraints:")); c.missing_constraints.forEach(m => console.log(`      • ${m}`)); }
+      if (c.blocking?.length)  { console.log(red("    Blocking:"));    c.blocking.forEach(i => console.log(`      • ${i}`)); }
+      if (c.important?.length) { console.log(yellow("    Important:")); c.important.forEach(i => console.log(`      • ${i}`)); }
+      if (c.minor?.length)     { console.log(dim("    Minor:"));        c.minor.forEach(i => console.log(`      • ${i}`)); }
       if (claudeCritique.revised_plan) {
         console.log(""); console.log(dim("    Revised plan:"));
         formatPlanForDisplay(claudeCritique.revised_plan).split("\n").forEach(l => console.log(`      ${l}`));
@@ -1393,6 +1391,42 @@ async function synthesise(gptMsgs) {
   return plan;
 }
 
+// ── Synthesis convergence validator ───────────────────────────────────────────
+// Pure function — returns an array of violation strings (empty = converged).
+// Convergence criteria (post-synthesis):
+//   1. No unresolved blocking issues (deferred_suggestions must not contain "severity: blocking")
+//   2. Claude has dispositioned every critique item (plan schema complete)
+//   3. open_questions are all marked "(requires user decision)" or "(addressed)"
+
+function checkSynthesisConvergence(plan) {
+  if (!plan) return ["Synthesis produced no valid JSON plan"];
+  const violations = [];
+
+  if (!plan.objective?.trim())   violations.push("Plan has no objective");
+  if (!plan.constraints?.length) violations.push("Plan has no constraints defined");
+  if (!plan.steps?.length)       violations.push("Plan has no steps defined");
+
+  const unmarked = (plan.open_questions || []).filter(q =>
+    !q.startsWith("(requires user decision)") && !q.startsWith("(addressed)")
+  );
+  if (unmarked.length) {
+    violations.push(
+      `${unmarked.length} open question(s) not marked "(requires user decision)" or "(addressed)"`
+    );
+  }
+
+  const deferredBlocking = (plan.deferred_suggestions || []).filter(s =>
+    /severity:\s*blocking/i.test(s)
+  );
+  if (deferredBlocking.length) {
+    violations.push(
+      `${deferredBlocking.length} BLOCKING item(s) incorrectly deferred — must be accepted or rejected`
+    );
+  }
+
+  return violations;
+}
+
 // ── Phase 3 — Synthesis ───────────────────────────────────────────────────────
 // Produces the authoritative final plan from compressed phase summaries.
 // Receives ONLY summaries + structured plans — NOT raw debate transcripts.
@@ -1421,11 +1455,13 @@ async function runSynthesisPhase(draftResult, critiqueResult, taskContext) {
       : "",
   ].filter(Boolean).join("\n\n");
 
-  const synthesisSystem = `You are the SYNTHESIS stage of a structured planning pipeline.
+  const synthesisSystem = `You are the SYNTHESIS stage of a structured planning pipeline. You are Claude and you own this decision.
 You receive compressed summaries and final plans — NOT raw debate transcripts.
 Rules:
 - Produce one authoritative plan; do NOT introduce ideas beyond what was debated
-- Explicitly list accepted and rejected suggestions with a brief reason for each
+- BLOCKING critique items MUST appear in accepted_suggestions or rejected_suggestions. Never defer them.
+- IMPORTANT critique items may appear in deferred_suggestions; they will be surfaced to the user before execution.
+- open_questions: prefix each with "(requires user decision)" if it needs user input, or "(addressed)" if resolved. No bare unresolved questions.
 - Respect every hard constraint established in the critique phase
 - Output ONLY valid JSON — no prose, no markdown fences`;
 
@@ -1436,21 +1472,21 @@ Produce the final authoritative plan using this schema:
   "objective": "...",
   "constraints": ["..."],
   "steps": [{"id": 1, "description": "...", "risks": "...", "success_criteria": "..."}],
-  "open_questions": ["..."],
-  "accepted_suggestions": ["suggestion (source: GPT/Claude) — reason accepted"],
-  "rejected_suggestions": ["suggestion (source: GPT/Claude) — reason rejected"]
+  "open_questions": ["(requires user decision) question text" or "(addressed) explanation"],
+  "accepted_suggestions": ["suggestion (source: GPT/Claude, severity: blocking/important) — reason accepted"],
+  "rejected_suggestions": ["suggestion (source: GPT/Claude, severity: blocking/important) — reason rejected"],
+  "deferred_suggestions": ["suggestion (source: GPT/Claude, severity: important) — reason deferred"]
 }
 Output ONLY valid JSON.`;
 
   process.stdout.write(dim("  Synthesising..."));
-  const synthesisRaw = await askGPT([
-    { role: "system", content: synthesisSystem },
-    { role: "user",   content: synthesisUser },
+  const synthesisRaw = await askClaude([
+    { role: "user", content: `${synthesisSystem}\n\n${synthesisUser}` },
   ], { maxTokens: SYNTHESIS_MAX_TOKENS });
   process.stdout.write("\r               \r");
 
   const synthesisPlan = parsePlanJson(synthesisRaw);
-  DB.logMessage(state.proposalId, "gpt", synthesisRaw, { phase: PHASE_SYNTHESIS });
+  DB.logMessage(state.proposalId, "claude", synthesisRaw, { phase: PHASE_SYNTHESIS });
 
   const summary = await compressPhaseSummary("synthesis", synthesisRaw);
   DB.logPhaseSummary(state.proposalId, PHASE_SYNTHESIS, 1, summary, synthesisPlan);
@@ -1692,12 +1728,29 @@ async function proposalFlow(initialProposal) {
       continue;
     }
 
-    // Phase 3 — GPT synthesises authoritative final plan from summaries
+    // Phase 3 — Claude synthesises authoritative final plan from summaries
     const synthesisResult = await runSynthesisPhase(draftResult, critiqueResult, currentContext);
 
     console.log(hr("═")); console.log(bold(mag("\n  Final Plan\n")));
     synthesisResult.planText.split("\n").forEach(l => console.log(`  ${l}`));
     console.log(""); console.log(hr("═")); console.log("");
+
+    // ── Approval gate: deferred items and convergence violations ───────────────
+    const deferred = synthesisResult.finalPlan?.deferred_suggestions || [];
+    if (deferred.length) {
+      console.log(hr("·"));
+      console.log(bold(yellow(`\n  ⚑ Deferred items — review before proceeding (${deferred.length}):\n`)));
+      deferred.forEach(d => console.log(`    • ${d}`));
+      console.log("");
+    }
+
+    const convergenceViolations = checkSynthesisConvergence(synthesisResult.finalPlan);
+    if (convergenceViolations.length) {
+      console.log(hr("·"));
+      console.log(bold(red(`\n  ⚠ Convergence issues (${convergenceViolations.length}):\n`)));
+      convergenceViolations.forEach(v => console.log(`    • ${v}`));
+      console.log("");
+    }
 
     DB.updateProposal(state.proposalId, {
       finalPlan: synthesisResult.planText,
