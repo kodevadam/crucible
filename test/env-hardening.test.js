@@ -396,3 +396,71 @@ test("paranoid mode: CRUCIBLE_EXTRA_ENV allows opt-in of additional vars", () =>
     else delete process.env.MY_CUSTOM_VAR_FOR_TEST;
   }
 });
+
+// ── Paranoid warn mode (CRUCIBLE_PARANOID_ENV=warn) ───────────────────────────
+
+function withWarnEnv(fn) {
+  const saved = process.env.CRUCIBLE_PARANOID_ENV;
+  process.env.CRUCIBLE_PARANOID_ENV = "warn";
+  try { fn(); } finally {
+    if (saved !== undefined) process.env.CRUCIBLE_PARANOID_ENV = saved;
+    else delete process.env.CRUCIBLE_PARANOID_ENV;
+  }
+}
+
+test("warn mode: returns full env (no vars dropped)", () => {
+  process.env._CRUCIBLE_WARN_TEST_VAR = "should-survive";
+  try {
+    withWarnEnv(() => {
+      const env = safeEnv();
+      assert.ok("_CRUCIBLE_WARN_TEST_VAR" in env,
+        "warn mode must not drop any vars — it only logs");
+    });
+  } finally {
+    delete process.env._CRUCIBLE_WARN_TEST_VAR;
+  }
+});
+
+test("warn mode: PATH and HOME are present", () => {
+  withWarnEnv(() => {
+    const env = safeEnv();
+    assert.ok("PATH" in env);
+    assert.ok("HOME" in env);
+  });
+});
+
+test("warn mode: logs to stderr what would be dropped", () => {
+  // Intercept stderr
+  const chunks = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { chunks.push(String(chunk)); return orig(chunk, ...rest); };
+
+  process.env._CRUCIBLE_WARN_SENTINEL = "value";
+  try {
+    withWarnEnv(() => safeEnv());
+    const output = chunks.join("");
+    assert.ok(output.includes("warn/dry-run"), "warn mode must label its output as dry-run");
+    assert.ok(output.includes("_CRUCIBLE_WARN_SENTINEL"), "warn mode must name the var that would be dropped");
+  } finally {
+    process.stderr.write = orig;
+    delete process.env._CRUCIBLE_WARN_SENTINEL;
+  }
+});
+
+test("warn mode: unknown values are NOT present in logged output (names only)", () => {
+  const chunks = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { chunks.push(String(chunk)); return orig(chunk, ...rest); };
+
+  const secretValue = "super-secret-do-not-log-12345";
+  process.env._CRUCIBLE_WARN_SECRET_TEST = secretValue;
+  try {
+    withWarnEnv(() => safeEnv());
+    const output = chunks.join("");
+    assert.ok(!output.includes(secretValue),
+      "warn mode must log var NAMES only — never their values");
+  } finally {
+    process.stderr.write = orig;
+    delete process.env._CRUCIBLE_WARN_SECRET_TEST;
+  }
+});

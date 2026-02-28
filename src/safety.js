@@ -58,7 +58,24 @@ const STRIP_FROM_CHILD_ENV = new Set([
   "_CRUCIBLE_ANTHROPIC_KEY",
 ]);
 
-// ── Paranoid env mode (CRUCIBLE_PARANOID_ENV=1) ───────────────────────────────
+// ── Paranoid env mode (CRUCIBLE_PARANOID_ENV=1 | warn) ───────────────────────
+//
+// SCOPE CAVEAT — paranoid mode is NOT a sandbox.
+//
+// It meaningfully reduces the env surface area forwarded to child processes
+// (git, gh, etc.), making accidental credential leakage through spawned tools
+// much harder.  But it does NOT:
+//   • prevent child processes from reading files on disk,
+//   • prevent network access by git/gh,
+//   • restrict filesystem operations of those tools,
+//   • protect secrets that were baked into the binary or config files.
+//
+// Think of it as "we removed the easy paths," not "we built a jail."
+// For actual process isolation, use a container or seccomp profile.
+//
+// Modes:
+//   CRUCIBLE_PARANOID_ENV=1     enforce — drops vars and logs their names to stderr
+//   CRUCIBLE_PARANOID_ENV=warn  audit   — logs what WOULD be dropped; nothing is removed
 
 /**
  * Exact-match allowlist for paranoid mode.
@@ -92,17 +109,16 @@ const PARANOID_PREFIX_ALLOW = [
 ];
 
 /**
- * Build a minimal environment for child processes using a default-deny
- * allowlist. Only variables in PARANOID_EXACT_ALLOW or matching a
- * PARANOID_PREFIX_ALLOW prefix are forwarded.
+ * Core allowlist computation shared by enforce and warn modes.
  *
- * Dropped variable *names* (never values) are written to stderr once so
- * users can add explicit CRUCIBLE_EXTRA_ENV overrides if something breaks.
+ * Returns { allowed, dropped } where:
+ *   allowed — env object containing only permitted variables
+ *   dropped — names (NOT values) of variables that were removed
  *
- * Additional vars can be opt-in via CRUCIBLE_EXTRA_ENV (comma-separated
- * list of names), e.g.:  CRUCIBLE_EXTRA_ENV=SSH_AGENT_PID,KUBECONFIG
+ * Additional vars can be opted-in via CRUCIBLE_EXTRA_ENV (comma-separated),
+ * e.g.:  CRUCIBLE_EXTRA_ENV=SSH_AGENT_PID,KUBECONFIG
  */
-function paranoidEnv() {
+function applyParanoidFilter() {
   const extra = new Set(
     (process.env.CRUCIBLE_EXTRA_ENV || "").split(",").map(s => s.trim()).filter(Boolean)
   );
@@ -123,26 +139,66 @@ function paranoidEnv() {
     }
   }
 
+  return { allowed, dropped };
+}
+
+/**
+ * CRUCIBLE_PARANOID_ENV=1 — enforce mode.
+ * Builds a minimal allowlisted env; logs dropped var names to stderr.
+ */
+function paranoidEnforceEnv() {
+  const { allowed, dropped } = applyParanoidFilter();
   if (dropped.length > 0) {
     process.stderr.write(
-      `[crucible] paranoid-env: dropped ${dropped.length} var(s) from child env: ` +
+      `[crucible] paranoid-env (enforce): dropped ${dropped.length} var(s) from child env: ` +
       dropped.join(", ") + "\n"
     );
   }
-
   return allowed;
+}
+
+/**
+ * CRUCIBLE_PARANOID_ENV=warn — audit/dry-run mode.
+ * Returns the full environment unmodified, but logs what WOULD have been
+ * dropped under enforce mode.  Safe rollout path: run with =warn first to
+ * discover which tools depend on non-allowlisted vars, then switch to =1.
+ */
+function paranoidWarnEnv() {
+  const { dropped } = applyParanoidFilter();
+  if (dropped.length > 0) {
+    process.stderr.write(
+      `[crucible] paranoid-env (warn/dry-run): would drop ${dropped.length} var(s): ` +
+      dropped.join(", ") +
+      " — set CRUCIBLE_PARANOID_ENV=1 to enforce, or add to CRUCIBLE_EXTRA_ENV to allowlist.\n"
+    );
+  }
+  return { ...process.env };
 }
 
 /**
  * Return a copy of process.env suitable for child processes.
  *
- * Normal mode: strip known AI provider credentials (blacklist).
- * Paranoid mode (CRUCIBLE_PARANOID_ENV=1): default-deny allowlist —
- *   only PATH, HOME, GIT_*, SSH_*, GH_TOKEN, CRUCIBLE_*, etc. are kept.
- *   Dropped variable names are logged to stderr.
+ * Three modes, controlled by CRUCIBLE_PARANOID_ENV:
+ *
+ *   (unset / any other value)
+ *     Normal: strip known AI provider credentials (blacklist).  Low breakage
+ *     risk; covers all known provider keys.
+ *
+ *   CRUCIBLE_PARANOID_ENV=warn
+ *     Audit/dry-run: logs what WOULD be dropped under enforce mode, but
+ *     returns the full env unchanged.  Use this first to discover deps.
+ *     NOTE: still strips STRIP_FROM_CHILD_ENV regardless.
+ *
+ *   CRUCIBLE_PARANOID_ENV=1
+ *     Enforce: default-deny allowlist — only PATH, HOME, GIT_*, SSH_*,
+ *     GH_TOKEN, CRUCIBLE_*, etc. are kept.  Dropped variable *names*
+ *     (never values) are logged to stderr.
+ *     See SCOPE CAVEAT above: this is not a sandbox.
  */
 export function safeEnv() {
-  if (process.env.CRUCIBLE_PARANOID_ENV === "1") return paranoidEnv();
+  const mode = process.env.CRUCIBLE_PARANOID_ENV;
+  if (mode === "1")    return paranoidEnforceEnv();
+  if (mode === "warn") return paranoidWarnEnv();
   const env = { ...process.env };
   for (const k of STRIP_FROM_CHILD_ENV) delete env[k];
   return env;
