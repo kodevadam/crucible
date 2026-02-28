@@ -366,3 +366,28 @@ export function ghq(args) {
   });
   return (r.stdout || "").trim();
 }
+
+// ── GitHub URL normalisation ───────────────────────────────────────────────────
+
+/**
+ * Normalise a GitHub repo input to "owner/repo".
+ *
+ * Accepts:
+ *   owner/repo
+ *   https://github.com/owner/repo
+ *   https://github.com/owner/repo/tree/branch[/path]
+ *   https://github.com/owner/repo/blob/branch/file
+ *   https://github.com/owner/repo/commits/branch
+ *
+ * Unknown inputs are returned unchanged so that `gh` can produce its own error.
+ */
+export function normalizeGitHubRepoInput(input) {
+  const s = (input || "").trim();
+  // Full GitHub URL — strip tree/blob/commits suffix
+  const m = s.match(/^https?:\/\/github\.com\/([^/]+\/[^/]+?)(?:\/(?:tree|blob|commits?)\/.*)?$/);
+  if (m) return m[1];
+  // Short owner/repo form
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(s)) return s;
+  // Unknown — pass through for gh to handle
+  return s;
+}
