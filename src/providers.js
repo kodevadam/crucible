@@ -34,12 +34,22 @@ export class OpenAIProvider {
    * @returns {Promise<string>}
    */
   async chat(messages, { model, maxTokens = 2000 } = {}) {
-    const res = await this.client.chat.completions.create({
-      model,
-      messages,
-      max_tokens: maxTokens,
-    });
-    return res.choices[0].message.content;
+    try {
+      // max_completion_tokens is required by GPT-5+ / o-series models
+      const res = await this.client.chat.completions.create({
+        model, messages, max_completion_tokens: maxTokens,
+      });
+      return res.choices[0].message.content;
+    } catch (err) {
+      // Older models (gpt-4, gpt-4-turbo) reject max_completion_tokens — retry
+      if (err?.status === 400 && err?.code === "unsupported_parameter") {
+        const res = await this.client.chat.completions.create({
+          model, messages, max_tokens: maxTokens,
+        });
+        return res.choices[0].message.content;
+      }
+      throw err;
+    }
   }
 
   /**

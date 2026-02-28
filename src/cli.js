@@ -14,15 +14,18 @@
 
 import { spawnSync }            from "child_process";
 import { createInterface }      from "readline";
-import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
+import { writeFileSync, existsSync, readFileSync, mkdirSync, readdirSync } from "fs";
 import { join, resolve }        from "path";
+import { homedir }              from "os";
 import * as DB   from "./db.js";
 import { analyseRepo, getRepoSummary, getChangeLog, clearRepoKnowledge,
          UNTRUSTED_REPO_BANNER }                                          from "./repo.js";
 import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers,
          INFER_MAX_TOKENS, GENERATE_MAX_TOKENS }                                   from "./staging.js";
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
-import { validateBranchName, gitq, gitExec, ghExec, ghq, shortHash } from "./safety.js";
+import { validateBranchName, gitq, gitExec, ghExec, ghq, shortHash,
+         normalizeGitHubRepoInput, isSafeDeletionTarget }             from "./safety.js";
+import { runChatSession }                                             from "./chat.js";
 import { selectBestGPTModel, selectBestClaudeModel,
          OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
 import { getOpenAI, getAnthropic }                        from "./providers.js";
@@ -301,13 +304,43 @@ async function getLatestClaudeModel() {
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
-async function askGPT(messages) {
-  const res = await getOpenAI().chat.completions.create({ model: state.gptModel, messages, max_tokens: GPT_MAX_TOKENS });
-  return res.choices[0].message.content;
+// ── Token ceiling warning ─────────────────────────────────────────────────────
+
+function _warnTokenCeiling(label, used, budget) {
+  if (!process.env.CRUCIBLE_DEBUG) return;
+  if (used == null || !budget) return;
+  const pct = Math.round((used / budget) * 100);
+  if (pct >= 90) {
+    process.stderr.write(
+      `[crucible:debug] ${label} reply used ${used}/${budget} tokens (${pct}%) — approaching ceiling\n`
+    );
+  }
 }
 
-async function askClaude(messages) {
-  const res = await getAnthropic().messages.create({ model: state.claudeModel, max_tokens: CLAUDE_MAX_TOKENS, messages });
+async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
+  try {
+    // Prefer max_completion_tokens (required by GPT-5+ / o-series models)
+    const res = await getOpenAI().chat.completions.create({
+      model: state.gptModel, messages, max_completion_tokens: maxTokens,
+    });
+    _warnTokenCeiling("GPT", res.usage?.completion_tokens, maxTokens);
+    return res.choices[0].message.content;
+  } catch (err) {
+    // Older models (gpt-4, gpt-4-turbo) reject max_completion_tokens — retry with max_tokens
+    if (err?.status === 400 && err?.code === "unsupported_parameter") {
+      const res = await getOpenAI().chat.completions.create({
+        model: state.gptModel, messages, max_tokens: maxTokens,
+      });
+      _warnTokenCeiling("GPT", res.usage?.completion_tokens, maxTokens);
+      return res.choices[0].message.content;
+    }
+    throw err;
+  }
+}
+
+async function askClaude(messages, { maxTokens = CLAUDE_MAX_TOKENS } = {}) {
+  const res = await getAnthropic().messages.create({ model: state.claudeModel, max_tokens: maxTokens, messages });
+  _warnTokenCeiling("Claude", res.usage?.output_tokens, maxTokens);
   return res.content[0].text;
 }
 
@@ -345,6 +378,11 @@ async function loadRepoContext(repoPath, repoUrl) {
 
 // ── Repo setup ────────────────────────────────────────────────────────────────
 
+/** Return true when dir exists AND contains at least one entry. */
+function dirNonEmpty(p) {
+  try { return readdirSync(p).length > 0; } catch { return false; }
+}
+
 async function setupRepo() {
   console.log("");
   crucibleSay("Let's get the repo set up.");
@@ -371,13 +409,75 @@ async function setupRepo() {
 
   else if (choice === "2") {
     if (!ghInstalled()) { crucibleSay("GitHub CLI not found — run setup-crucible-git.sh first."); return; }
-    const url = await ask("  GitHub repo URL or owner/name:");
-    if (!url.trim()) return;
-    const dest = await ask("  Clone to:", { defaultVal: process.cwd() });
-    ghExec(["repo", "clone", url.trim(), dest.trim()]);
-    state.repoPath = dest.trim();
-    state.repoUrl  = url.trim();
-    crucibleSay(`Cloned to ${yellow(state.repoPath)}`);
+    const rawUrl = await ask("  GitHub repo URL or owner/name:");
+    if (!rawUrl.trim()) return;
+    const normalized = normalizeGitHubRepoInput(rawUrl);
+    const repoName   = normalized.split("/").pop() || "repo";
+    const defaultDest = join(homedir(), ".crucible", "repos", repoName);
+    let dest = (await ask("  Clone to:", { defaultVal: defaultDest })).trim() || defaultDest;
+
+    // Handle existing non-empty destination
+    while (dirNonEmpty(dest)) {
+      crucibleSay(`${yellow(dest)} already exists and is non-empty.`);
+      console.log(`  ${cyan("1")}  Use existing repo at that path (skip clone)`);
+      console.log(`  ${cyan("2")}  Choose a different destination`);
+      console.log(`  ${cyan("3")}  Abort back to menu`);
+      console.log(`  ${cyan("4")}  Delete directory and re-clone ${red("(destructive)")}`);
+      const pick = (await ask("  ›")).trim();
+      if (pick === "1") {
+        if (!existsSync(join(dest, ".git"))) {
+          crucibleSay(`${yellow("No .git/ directory found at")} ${yellow(dest)}.`);
+          crucibleSay("This may not be a git repository — proceed with caution.");
+          // fall through and let inGitRepo be the final authority
+        }
+        if (!inGitRepo(dest)) {
+          crucibleSay(`${red("That path isn't a git repo.")} Pick another option.`);
+          continue;
+        }
+        state.repoPath = resolve(dest);
+        state.repoUrl  = normalized;
+        crucibleSay(`Using existing repo at ${yellow(state.repoPath)}`);
+        state.repoContext = await loadRepoContext(state.repoPath, state.repoUrl);
+        if (state.repoContext) systemMsg(`Context loaded (${state.repoContext.length} chars)`);
+        DB.updateSession(state.sessionId, { repoPath: state.repoPath, repoUrl: state.repoUrl });
+        return;
+      } else if (pick === "2") {
+        dest = (await ask("  New destination:", { defaultVal: defaultDest })).trim() || defaultDest;
+      } else if (pick === "4") {
+        const guard = isSafeDeletionTarget(dest);
+        if (!guard.safe) {
+          crucibleSay(`${red("Blocked:")} ${guard.reason}`);
+          continue;
+        }
+        const preferredBase = join(homedir(), ".crucible", "repos");
+        if (!resolve(dest).startsWith(preferredBase + "/")) {
+          crucibleSay(yellow(`  Warning: ${dest} is outside ${preferredBase}`));
+          crucibleSay(yellow("  Double-check this is really what you want to delete."));
+        }
+        const sure = await confirm(`  Permanently delete ${red(dest)} and re-clone?`, false);
+        if (sure) {
+          spawnSync("rm", ["-rf", dest], { stdio: "inherit" });
+          break; // proceed to clone
+        }
+      } else {
+        crucibleSay("Aborted.");
+        return;
+      }
+    }
+
+    try {
+      ghExec(["repo", "clone", normalized, dest]);
+      state.repoPath = resolve(dest);
+      state.repoUrl  = normalized;
+      crucibleSay(`Cloned to ${yellow(state.repoPath)}`);
+    } catch (err) {
+      console.log("");
+      console.log(`  ${red("✗ clone-failed")}`);
+      console.log(`  ${err.message}`);
+      console.log(`  repo: ${normalized}   dest: ${dest}`);
+      console.log("");
+      return;
+    }
   }
 
   else if (choice === "3") {
@@ -934,14 +1034,19 @@ async function offerStagingAndCommit(task, finalPlan, round) {
 
 // ── Proposal flow ─────────────────────────────────────────────────────────────
 
-async function proposalFlow() {
+async function proposalFlow(initialProposal) {
   console.log("");
-  crucibleSay("What's your proposal? Describe what you want to build or change.");
-  console.log(dim("  (As rough or detailed as you like — GPT and Claude will refine it together first)"));
-  console.log("");
-
-  const rawProposal = await ask("  ›");
-  if (!rawProposal.trim()) return;
+  let rawProposal;
+  if (initialProposal) {
+    rawProposal = initialProposal;
+    crucibleSay("Using chat context as proposal — moving to refinement.");
+  } else {
+    crucibleSay("What's your proposal? Describe what you want to build or change.");
+    console.log(dim("  (As rough or detailed as you like — GPT and Claude will refine it together first)"));
+    console.log("");
+    rawProposal = await ask("  ›");
+    if (!rawProposal.trim()) return;
+  }
 
   DB.logMessage(state.proposalId, "user", rawProposal, { phase: "proposal" });
   DB.updateProposal(state.proposalId, { title: rawProposal.slice(0, 80) });
@@ -1167,7 +1272,14 @@ async function cmdGit() {
       }
       case 4: {
         const url = await ask("  Repo URL:");
-        if (url.trim()) { ghExec(["repo", "clone", url.trim()]); console.log(green("\n  ✔ Cloned\n")); }
+        if (url.trim()) {
+          try {
+            ghExec(["repo", "clone", normalizeGitHubRepoInput(url)]);
+            console.log(green("\n  ✔ Cloned\n"));
+          } catch (err) {
+            crucibleSay(`${red("Clone failed:")} ${err.message}`);
+          }
+        }
         break;
       }
       case 5: console.log(""); ghExec(["pr", "list"]); console.log(""); break;
@@ -1260,6 +1372,7 @@ async function interactiveSession() {
     console.log(`  ${cyan("4")}  Repo — understanding & change log`);
     console.log(`  ${cyan("5")}  Stage files from a previous plan`);
     console.log(`  ${cyan("6")}  Switch repo`);
+    console.log(`  ${cyan("7")}  Chat (conversational mode)`);
     console.log(`  ${cyan("0")}  Exit`);
     console.log("");
 
@@ -1292,6 +1405,18 @@ async function interactiveSession() {
       }
     }
     else if (ans === "6") await setupRepo();
+    else if (ans === "7") {
+      const planPayload = await runChatSession(state, {
+        ask, crucibleSay, systemMsg,
+        bold, dim, cyan, yellow, red, hr,
+        DB, askGPT, askClaude,
+      });
+      if (planPayload) {
+        // User ran /plan — feed payload into the proposal flow
+        state.proposalId = DB.createProposal(state.sessionId, state.project, planPayload);
+        await proposalFlow(planPayload);
+      }
+    }
     else if (ans === "0" || ans === "q" || ans === "exit") {
       DB.endSession(state.sessionId);
       crucibleSay("Session saved. See you next time.");
@@ -1370,6 +1495,7 @@ function cmdHelp() {
 const [,, cmd, ...rest] = process.argv;
 const arg = rest.join(" ");
 
+async function main() {
 switch (cmd) {
   case undefined:
   case "session":  await interactiveSession(); break;
@@ -1520,3 +1646,10 @@ switch (cmd) {
   default:
     console.error(red(`\n  Unknown command: ${cmd}\n`)); cmdHelp(); process.exit(1);
 }
+} // end main()
+
+main().catch(err => {
+  console.error(red(`\n  Fatal: ${err.message || err}\n`));
+  if (process.env.DEBUG) console.error(err.stack);
+  process.exitCode = 1;
+});

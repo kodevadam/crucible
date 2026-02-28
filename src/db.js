@@ -96,6 +96,19 @@ db.exec(`
 
   CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_changes_unique ON repo_changes(repo_path, commit_hash);
   CREATE INDEX IF NOT EXISTS idx_repo_changes_path ON repo_changes(repo_path);
+
+  CREATE TABLE IF NOT EXISTS chat_turns (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES sessions(id),
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    turn_num    INTEGER NOT NULL,
+    speaker     TEXT    NOT NULL,
+    content     TEXT    NOT NULL,
+    model       TEXT,
+    provider    TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(session_id);
 `);
 
 // ── Schema migrations — idempotent ALTER TABLE additions ──────────────────────
@@ -140,6 +153,8 @@ const stmts = {
   countRepoChanges:    db.prepare(`SELECT COUNT(*) as n FROM repo_changes WHERE repo_path=?`),
   hasCommit:           db.prepare(`SELECT id FROM repo_changes WHERE repo_path=? AND commit_hash=?`),
   deleteRepoKnowledge: db.prepare(`DELETE FROM repo_knowledge WHERE repo_path=?`),
+  addChatTurn:         db.prepare(`INSERT INTO chat_turns (session_id, turn_num, speaker, content, model, provider) VALUES (?, ?, ?, ?, ?, ?)`),
+  getChatTurns:        db.prepare(`SELECT * FROM chat_turns WHERE session_id=? ORDER BY turn_num ASC`),
 };
 
 export function createSession({ project, repoPath, repoUrl, gptModel, claudeModel,
@@ -239,3 +254,9 @@ export function deleteRepoKnowledge(repoPath) {
   stmts.deleteRepoKnowledge.run(repoPath);
 }
 export function getDB() { return db; }
+export function logChatTurn(sessionId, { turnNum, speaker, content, model, provider }) {
+  stmts.addChatTurn.run(sessionId, turnNum, speaker, content, model||null, provider||null);
+}
+export function getChatTurns(sessionId) {
+  return stmts.getChatTurns.all(sessionId);
+}
