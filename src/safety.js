@@ -12,6 +12,7 @@
 import { resolve, normalize, isAbsolute, sep } from "path";
 import { spawnSync }                            from "child_process";
 import { createHash }                           from "crypto";
+import { homedir }                              from "os";
 
 // ── Child-process environment sanitisation ────────────────────────────────────
 
@@ -365,6 +366,33 @@ export function ghq(args) {
     env:      safeEnv(),
   });
   return (r.stdout || "").trim();
+}
+
+// ── Deletion target guard ─────────────────────────────────────────────────────
+
+/**
+ * Check whether a path is safe to pass to "rm -rf".
+ *
+ * Returns { safe: true } on success, or { safe: false, reason: string }.
+ *
+ * Guards:
+ *   1. Must be a non-empty string
+ *   2. Must not resolve to the filesystem root (/)
+ *   3. Must not resolve to the user's home directory
+ *   4. Resolved path must have at least 3 components (depth guard)
+ *
+ * Does NOT throw — callers check the returned object.
+ */
+export function isSafeDeletionTarget(p) {
+  const s = String(p ?? "").trim();
+  if (!s) return { safe: false, reason: "Empty path" };
+  const abs = resolve(s);
+  if (abs === "/") return { safe: false, reason: "Refusing to delete filesystem root (/)" };
+  const home = homedir();
+  if (abs === home) return { safe: false, reason: `Refusing to delete home directory (${home})` };
+  const parts = abs.split(sep).filter(Boolean);
+  if (parts.length < 3) return { safe: false, reason: `Path too shallow to delete safely: ${abs}` };
+  return { safe: true };
 }
 
 // ── GitHub URL normalisation ───────────────────────────────────────────────────

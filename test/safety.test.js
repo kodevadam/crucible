@@ -2,14 +2,16 @@
  * Tests for src/safety.js
  *
  * Covers:
- *   - validateStagingPath: traversal rejection, absolute paths, valid paths
- *   - validateBranchName:  injection vectors, reserved words, valid names
+ *   - validateStagingPath:    traversal rejection, absolute paths, valid paths
+ *   - validateBranchName:     injection vectors, reserved words, valid names
+ *   - isSafeDeletionTarget:   blocks /, $HOME, shallow paths, empty input
  */
 
 import { test } from "node:test";
 import assert   from "node:assert/strict";
-import { validateStagingPath, validateBranchName } from "../src/safety.js";
+import { validateStagingPath, validateBranchName, isSafeDeletionTarget } from "../src/safety.js";
 import { sep } from "path";
+import { homedir } from "os";
 
 // ── validateStagingPath ───────────────────────────────────────────────────────
 
@@ -201,4 +203,51 @@ test("validateBranchName: rejects --foo (double-dash option-like name)", () => {
     () => validateBranchName("--foo"),
     /cannot start with/i
   );
+});
+
+// ── isSafeDeletionTarget ──────────────────────────────────────────────────────
+
+test("isSafeDeletionTarget: rejects empty string", () => {
+  const r = isSafeDeletionTarget("");
+  assert.equal(r.safe, false);
+  assert.ok(r.reason, "should provide a reason");
+});
+
+test("isSafeDeletionTarget: rejects null/undefined", () => {
+  assert.equal(isSafeDeletionTarget(null).safe,      false);
+  assert.equal(isSafeDeletionTarget(undefined).safe, false);
+});
+
+test("isSafeDeletionTarget: rejects filesystem root /", () => {
+  const r = isSafeDeletionTarget("/");
+  assert.equal(r.safe, false);
+  assert.ok(/root/i.test(r.reason), "reason should mention root");
+});
+
+test("isSafeDeletionTarget: rejects home directory", () => {
+  const r = isSafeDeletionTarget(homedir());
+  assert.equal(r.safe, false);
+  assert.ok(/home/i.test(r.reason), "reason should mention home");
+});
+
+test("isSafeDeletionTarget: rejects shallow paths (fewer than 3 components)", () => {
+  const r = isSafeDeletionTarget("/tmp");
+  assert.equal(r.safe, false);
+  assert.ok(/shallow/i.test(r.reason), "reason should mention shallow");
+});
+
+test("isSafeDeletionTarget: accepts a deep-enough safe path", () => {
+  const safePath = `${homedir()}/.crucible/repos/myrepo`;
+  const r = isSafeDeletionTarget(safePath);
+  assert.equal(r.safe, true, `Expected safe for ${safePath}: ${r.reason}`);
+});
+
+test("isSafeDeletionTarget: accepts /tmp/a/b (3 components)", () => {
+  const r = isSafeDeletionTarget("/tmp/a/b");
+  assert.equal(r.safe, true);
+});
+
+test("isSafeDeletionTarget: returns safe:true for deeply nested path", () => {
+  const r = isSafeDeletionTarget("/home/user/.crucible/repos/deep/nested/path");
+  assert.equal(r.safe, true);
 });

@@ -24,7 +24,8 @@ import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers
          INFER_MAX_TOKENS, GENERATE_MAX_TOKENS }                                   from "./staging.js";
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
 import { validateBranchName, gitq, gitExec, ghExec, ghq, shortHash,
-         normalizeGitHubRepoInput }                                   from "./safety.js";
+         normalizeGitHubRepoInput, isSafeDeletionTarget }             from "./safety.js";
+import { runChatSession }                                             from "./chat.js";
 import { selectBestGPTModel, selectBestClaudeModel,
          OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
 import { getOpenAI, getAnthropic }                        from "./providers.js";
@@ -408,6 +409,11 @@ async function setupRepo() {
       console.log(`  ${cyan("4")}  Delete directory and re-clone ${red("(destructive)")}`);
       const pick = (await ask("  ›")).trim();
       if (pick === "1") {
+        if (!existsSync(join(dest, ".git"))) {
+          crucibleSay(`${yellow("No .git/ directory found at")} ${yellow(dest)}.`);
+          crucibleSay("This may not be a git repository — proceed with caution.");
+          // fall through and let inGitRepo be the final authority
+        }
         if (!inGitRepo(dest)) {
           crucibleSay(`${red("That path isn't a git repo.")} Pick another option.`);
           continue;
@@ -422,7 +428,17 @@ async function setupRepo() {
       } else if (pick === "2") {
         dest = (await ask("  New destination:", { defaultVal: defaultDest })).trim() || defaultDest;
       } else if (pick === "4") {
-        const sure = await confirm(`  Really delete ${dest}?`, false);
+        const guard = isSafeDeletionTarget(dest);
+        if (!guard.safe) {
+          crucibleSay(`${red("Blocked:")} ${guard.reason}`);
+          continue;
+        }
+        const preferredBase = join(homedir(), ".crucible", "repos");
+        if (!resolve(dest).startsWith(preferredBase + "/")) {
+          crucibleSay(yellow(`  Warning: ${dest} is outside ${preferredBase}`));
+          crucibleSay(yellow("  Double-check this is really what you want to delete."));
+        }
+        const sure = await confirm(`  Permanently delete ${red(dest)} and re-clone?`, false);
         if (sure) {
           spawnSync("rm", ["-rf", dest], { stdio: "inherit" });
           break; // proceed to clone
@@ -439,7 +455,11 @@ async function setupRepo() {
       state.repoUrl  = normalized;
       crucibleSay(`Cloned to ${yellow(state.repoPath)}`);
     } catch (err) {
-      crucibleSay(`${red("Clone failed:")} ${err.message}`);
+      console.log("");
+      console.log(`  ${red("✗ clone-failed")}`);
+      console.log(`  ${err.message}`);
+      console.log(`  repo: ${normalized}   dest: ${dest}`);
+      console.log("");
       return;
     }
   }
@@ -998,14 +1018,19 @@ async function offerStagingAndCommit(task, finalPlan, round) {
 
 // ── Proposal flow ─────────────────────────────────────────────────────────────
 
-async function proposalFlow() {
+async function proposalFlow(initialProposal) {
   console.log("");
-  crucibleSay("What's your proposal? Describe what you want to build or change.");
-  console.log(dim("  (As rough or detailed as you like — GPT and Claude will refine it together first)"));
-  console.log("");
-
-  const rawProposal = await ask("  ›");
-  if (!rawProposal.trim()) return;
+  let rawProposal;
+  if (initialProposal) {
+    rawProposal = initialProposal;
+    crucibleSay("Using chat context as proposal — moving to refinement.");
+  } else {
+    crucibleSay("What's your proposal? Describe what you want to build or change.");
+    console.log(dim("  (As rough or detailed as you like — GPT and Claude will refine it together first)"));
+    console.log("");
+    rawProposal = await ask("  ›");
+    if (!rawProposal.trim()) return;
+  }
 
   DB.logMessage(state.proposalId, "user", rawProposal, { phase: "proposal" });
   DB.updateProposal(state.proposalId, { title: rawProposal.slice(0, 80) });
@@ -1331,6 +1356,7 @@ async function interactiveSession() {
     console.log(`  ${cyan("4")}  Repo — understanding & change log`);
     console.log(`  ${cyan("5")}  Stage files from a previous plan`);
     console.log(`  ${cyan("6")}  Switch repo`);
+    console.log(`  ${cyan("7")}  Chat (conversational mode)`);
     console.log(`  ${cyan("0")}  Exit`);
     console.log("");
 
@@ -1363,6 +1389,18 @@ async function interactiveSession() {
       }
     }
     else if (ans === "6") await setupRepo();
+    else if (ans === "7") {
+      const planPayload = await runChatSession(state, {
+        ask, crucibleSay, systemMsg,
+        bold, dim, cyan, yellow, red, hr,
+        DB, askGPT, askClaude,
+      });
+      if (planPayload) {
+        // User ran /plan — feed payload into the proposal flow
+        state.proposalId = DB.createProposal(state.sessionId, state.project, planPayload);
+        await proposalFlow(planPayload);
+      }
+    }
     else if (ans === "0" || ans === "q" || ans === "exit") {
       DB.endSession(state.sessionId);
       crucibleSay("Session saved. See you next time.");
