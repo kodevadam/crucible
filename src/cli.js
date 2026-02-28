@@ -1401,7 +1401,21 @@ async function cmdRepoInfo() {
 async function cmdGit() {
   // repoPath is re-evaluated each iteration so that after a clone the new
   // repo becomes the active target for subsequent operations.
-  if (!ghInstalled()) { crucibleSay(red("Run setup-crucible-git.sh first.")); done(); return; }
+  if (!ghInstalled()) {
+    console.log("");
+    crucibleSay(yellow("GitHub CLI (gh) is not installed."));
+    console.log(`\n  Run ${bold("./setup-git.sh")} to install gh and sign in to GitHub.\n`);
+    console.log(`  This enables:\n    · Browsing & cloning private repos\n    · Creating and merging PRs\n    · Pushing without password prompts\n`);
+    const doSetup = await confirm("  Run setup-git.sh now?", true);
+    if (doSetup) {
+      const r = spawnSync("bash", [join(homedir(), ".local", "share", "crucible", "src", "..", "..", "..", "..", "crucible", "setup-git.sh")], { stdio: "inherit", shell: false });
+      if (r.status !== 0) {
+        // Try from common install location fallback
+        crucibleSay(red("Could not find setup-git.sh — run it manually from your crucible clone directory."));
+      }
+    }
+    done(); return;
+  }
 
   let running = true;
   while (running) {
@@ -1413,28 +1427,30 @@ async function cmdGit() {
     const ghAuth    = getGhAuthStatus();
     const authLabel = ghAuth.authed
       ? green(`${ghAuth.username || "connected"}`)
-      : dim("not connected");
+      : yellow("not signed in — choose option 10 to connect");
 
     console.log(""); console.log(hr());
     const repoRemote = gitq(repoPath, ["remote", "get-url", "origin"]) || "(no remote)";
-    console.log(`  ${dim("repo:")} ${repoRemote}   ${dim("branch:")} ${yellow(branch)}   ${dim("github:")} ${authLabel}`);
+    console.log(`  ${dim("repo:")} ${repoRemote}   ${dim("branch:")} ${yellow(branch)}   ${dim("GitHub:")} ${authLabel}`);
     console.log(hr());
 
     const items = [
-      "Switch branch",
-      "Create new branch",
-      "Pull latest",
-      "Push current branch",
-      "Clone a repo",
-      "View open PRs",
-      "Create pull request",
-      "Squash & merge a PR",
-      "Merge current branch to main",
-      ghAuth.authed ? "Browse my GitHub repos" : "Connect GitHub account",
+      `Switch branch              ${dim("checkout a different branch")}`,
+      `Create new branch          ${dim("create and switch to a new branch")}`,
+      `Pull latest                ${dim("git pull from remote")}`,
+      `Push current branch        ${dim("push to remote, set upstream")}`,
+      `Clone a repo               ${dim("clone from GitHub or URL")}`,
+      `View open PRs              ${dim("list pull requests for this repo")}`,
+      `Create pull request        ${dim("open a PR from the current branch")}`,
+      `Squash & merge a PR        ${dim("pick a PR and squash-merge it")}`,
+      `Merge current branch       ${dim("merge into main / master")}`,
+      ghAuth.authed
+        ? `Browse my GitHub repos     ${dim("pick a repo to clone or inspect")}`
+        : `Connect GitHub account     ${dim("sign in with gh to enable private repos & PRs")}`,
     ];
-    console.log(bold(cyan("\n  Git\n")));
+    console.log(bold(cyan("\n  Git / GitHub\n")));
     items.forEach((o, i) => console.log(`  ${bold(cyan(String(i + 1)))}  ${o}`));
-    console.log(`  ${bold(cyan("0"))}  Exit`); console.log("");
+    console.log(`  ${bold(cyan("0"))}  Back`); console.log("");
     const choice = parseInt((await ask("  ›")).trim());
     if (!choice || choice === 0) { running = false; break; }
 
@@ -1607,6 +1623,7 @@ async function interactiveSession() {
   box([
     bold("  crucible"),
     dim("  AI-powered planning with Claude & GPT"),
+    dim("  Type ? at any menu for help"),
   ]);
 
   process.stdout.write(dim("\n  Loading models..."));
@@ -1619,6 +1636,20 @@ async function interactiveSession() {
   console.log(`  ${bold("GPT:")}    ${yellow(gptModel)}`);
   console.log(`  ${bold("Claude:")} ${blue(claudeModel)}`);
   console.log("");
+
+  // ── GitHub status & first-run prompt ────────────────────────────────────────
+  const ghAuth = getGhAuthStatus();
+  if (ghAuth.installed && ghAuth.authed) {
+    console.log(`  ${dim("GitHub:")} ${green(ghAuth.username || "connected")}  ${dim("(gh CLI)")}`);
+    console.log("");
+  } else if (ghAuth.installed && !ghAuth.authed) {
+    console.log(`  ${dim("GitHub:")} ${yellow("not signed in")}  ${dim("→ choose Git / GitHub to connect")}`);
+    console.log("");
+  } else {
+    // gh not installed — offer a one-line tip
+    console.log(`  ${dim("GitHub:")} ${dim("gh CLI not found — run setup-git.sh for GitHub features")}`);
+    console.log("");
+  }
 
   // Start session in DB, recording model IDs, providers, and a prompt hash
   // so every session is fully reproducible (answerable later: "why did it do that?")
@@ -1641,16 +1672,44 @@ async function interactiveSession() {
 
   console.log("");
 
-  // Repo setup
-  const wantsRepo = await confirm("  Do you have a repo to work with?", true);
-  if (wantsRepo) await setupRepo();
+  // ── Auto-detect current directory as a git repo ────────────────────────────
+  const cwd = process.cwd();
+  if (inGitRepo(cwd) && cwd !== homedir()) {
+    const autoUse = await confirm(
+      `  Detected git repo at ${yellow(cwd)} — use it?`, true
+    );
+    if (autoUse) {
+      state.repoPath = cwd;
+      state.repoUrl  = gitq(cwd, ["remote", "get-url", "origin"]) || null;
+      crucibleSay(`Using ${yellow(state.repoPath)}`);
+      state.repoContext = await loadRepoContext(state.repoPath, state.repoUrl);
+      if (state.repoContext) systemMsg(`Context loaded (${state.repoContext.length} chars)`);
+      DB.updateSession(state.sessionId, { repoPath: state.repoPath, repoUrl: state.repoUrl });
+    } else {
+      const wantsRepo = await confirm("  Do you have a different repo to work with?", false);
+      if (wantsRepo) await setupRepo();
+    }
+  } else {
+    // Repo setup
+    const wantsRepo = await confirm("  Do you have a repo to work with?", true);
+    if (wantsRepo) await setupRepo();
+  }
 
-  // Main loop
+  // ── Main loop ────────────────────────────────────────────────────────────────
   let running = true;
   while (running) {
     console.log("");
     console.log(hr());
-    console.log(bold(cyan(`\n  ${state.project}  ${state.repoPath ? dim("· " + state.repoPath) : ""}\n`)));
+
+    // Status bar: project · repo · branch · github
+    const branch    = state.repoPath ? currentBranch(state.repoPath) : null;
+    const ghStatus  = getGhAuthStatus();
+    const ghLabel   = ghStatus.authed ? green(ghStatus.username || "github") : dim("github: not signed in");
+    const repoLabel = state.repoPath ? dim("· " + state.repoPath + (branch ? ` (${branch})` : "")) : "";
+    console.log(bold(cyan(`\n  ${state.project}  ${repoLabel}\n`)));
+    console.log(`  ${dim("GitHub:")} ${ghLabel}`);
+    console.log("");
+
     console.log(`  ${cyan("1")}  New proposal`);
     console.log(`  ${cyan("2")}  Git / GitHub`);
     console.log(`  ${cyan("3")}  History`);
@@ -1658,6 +1717,7 @@ async function interactiveSession() {
     console.log(`  ${cyan("5")}  Stage files from a previous plan`);
     console.log(`  ${cyan("6")}  Switch repo`);
     console.log(`  ${cyan("7")}  Chat (conversational mode)`);
+    console.log(`  ${cyan("?")}  Help`);
     console.log(`  ${cyan("0")}  Exit`);
     console.log("");
 
@@ -1702,13 +1762,16 @@ async function interactiveSession() {
         await proposalFlow(planPayload);
       }
     }
+    else if (ans === "?" || ans === "help") {
+      cmdHelp();
+    }
     else if (ans === "0" || ans === "q" || ans === "exit") {
       DB.endSession(state.sessionId);
       crucibleSay("Session saved. See you next time.");
       running = false;
     }
     else {
-      console.log(dim("  Enter 0–4."));
+      console.log(dim("  Enter 0–7, ? for help."));
     }
   }
 
@@ -1756,21 +1819,48 @@ function cmdHelp() {
   ${bold(cyan("crucible"))} — AI-powered planning sessions
 
   ${bold("Commands:")}
-    ${bold("crucible")}              open interactive planning session
-    ${bold("crucible plan")} ${dim('"task"')}  start a plan directly
-    ${bold("crucible debate")} ${dim('"task"')} raw debate with inter-round controls
-    ${bold("crucible git")}          GitHub/git menu
-    ${bold("crucible history")}      browse past sessions, proposals, actions
-    ${bold("crucible repo refresh")} force-rebuild repo knowledge for current dir
-    ${bold("crucible keys status")}  show API key storage source (no values shown)
-    ${bold("crucible models")}       show current model versions
-    ${bold("crucible help")}         show this help
+    ${bold("crucible")}                   open interactive session  ${dim("(recommended)")}
+    ${bold("crucible plan")} ${dim('"task"')}       jump straight into a planning session
+    ${bold("crucible debate")} ${dim('"task"')}     raw debate with inter-round controls
+    ${bold("crucible git")}               GitHub / git menu
+    ${bold("crucible history")}           browse past sessions, proposals, actions
+    ${bold("crucible stage")}             re-run staging on a previous completed plan
+    ${bold("crucible repo refresh")}      force-rebuild repo understanding for cwd
+    ${bold("crucible keys status")}       show where API keys are stored ${dim("(no values)")}
+    ${bold("crucible models")}            show auto-detected model versions
+    ${bold("crucible help")}              show this help
 
-  ${bold("Database:")} ~/.local/share/crucible/crucible.db
+  ${bold("Interactive session menu:")}
+    ${cyan("1")} New proposal        Start a new Claude ↔ GPT planning debate
+    ${cyan("2")} Git / GitHub        Branches, PRs, clone, push, merge
+    ${cyan("3")} History             Browse past sessions, proposals, git actions
+    ${cyan("4")} Repo                View codebase understanding & commit log
+    ${cyan("5")} Stage files         Apply a previous plan's file changes
+    ${cyan("6")} Switch repo         Change the active git repository
+    ${cyan("7")} Chat                Conversational mode (use /plan to start a plan)
+    ${cyan("?")} Help                Show this help
+    ${cyan("0")} Exit                Save session and quit
+
+  ${bold("Planning flow:")}
+    Phase 0 — Refinement   GPT critiques, Claude responds, GPT synthesises
+    Phase 1 — Debate       Claude ↔ GPT back-and-forth
+    Phase 2 — Plan         Models converge → final plan
+    Phase 3 — Staging      Claude generates files; you review each one
 
   ${bold("Between debate rounds:")}
-    1 continue   2 agreed summary   3 diff
-    4 steer      5 accept early     6 reject & restart
+    ${cyan("1")} continue   ${cyan("2")} agreed summary   ${cyan("3")} show diff
+    ${cyan("4")} steer      ${cyan("5")} accept early     ${cyan("6")} reject & restart
+
+  ${bold("File staging (per file):")}
+    ${cyan("y")} approve & write   ${cyan("f")} view full file   ${cyan("e")} edit & regenerate
+    ${cyan("s")} skip              ${cyan("0")} stop staging
+
+  ${bold("GitHub features")} ${dim("(requires gh CLI — run setup-git.sh to enable):")}
+    Browse & clone private repos · Create / merge PRs · Auto push · Switch branches
+
+  ${bold("Key storage:")} OS keychain > ~/.config/crucible/keys/ > env vars
+  ${bold("Database:")}    ~/.local/share/crucible/crucible.db
+  ${bold("Docs:")}        https://github.com/YOUR_USERNAME/crucible
   `);
   done();
 }

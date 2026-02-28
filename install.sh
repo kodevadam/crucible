@@ -117,44 +117,110 @@ echo "Installing npm dependencies..."
 cd "$DEST" && npm install --silent
 echo "Dependencies installed"
 
-# ── API keys ──────────────────────────────────────────────────────────────────
+# ── API key discovery — search ALL storage locations before prompting ──────────
 #
-#   update mode     — always skip; existing keys are already in place
-#   wipe / fresh    — check file fallback for pre-existing keys; offer to keep
-#   factory reset   — keys were just deleted above; always prompt
+# Priority (mirrors keys.js retrieval order):
+#   1. OS keychain      macOS: security, Linux: secret-tool
+#   2. File fallback    ~/.config/crucible/keys/
+#   3. Env vars         OPENAI_API_KEY / ANTHROPIC_API_KEY
+#
+# update mode — skip entirely; existing keys are already in place.
 
-NEED_KEYS=1
+NEED_OPENAI=0
+NEED_ANTHROPIC=0
 OPENAI_KEY=""
 ANTHROPIC_KEY=""
+OPENAI_SOURCE=""
+ANTHROPIC_SOURCE=""
 
 if [ "$INSTALL_MODE" = "update" ]; then
-  NEED_KEYS=0
   echo "Update mode — existing API keys are unchanged."
+else
 
-elif [ -f "$KEYS_DIR/crucible-openai" ] && [ -f "$KEYS_DIR/crucible-anthropic" ]; then
-  # Keys found in the file fallback — offer to keep them
   echo ""
-  echo "  Stored API keys detected in $KEYS_DIR"
-  read -rp "  Re-use existing keys? [Y/n]: " _KEEPKEYS
-  if [[ "${_KEEPKEYS:-y}" =~ ^[Yy]?$ ]]; then
-    NEED_KEYS=0
-    echo "  Keeping existing keys."
+  echo "  Searching for existing API keys..."
+
+  # ── 1. OS keychain ──────────────────────────────────────────────────────────
+  if command -v security &>/dev/null; then
+    # macOS Keychain
+    _K=$(security find-generic-password -s "crucible-openai"    -a "crucible" -w 2>/dev/null || true)
+    if [ -n "$_K" ]; then OPENAI_KEY="$_K";    OPENAI_SOURCE="macOS Keychain"; fi
+    _K=$(security find-generic-password -s "crucible-anthropic" -a "crucible" -w 2>/dev/null || true)
+    if [ -n "$_K" ]; then ANTHROPIC_KEY="$_K"; ANTHROPIC_SOURCE="macOS Keychain"; fi
+  elif command -v secret-tool &>/dev/null; then
+    # Linux libsecret
+    _K=$(secret-tool lookup service "crucible-openai"    account "crucible" 2>/dev/null || true)
+    if [ -n "$_K" ]; then OPENAI_KEY="$_K";    OPENAI_SOURCE="OS keychain (libsecret)"; fi
+    _K=$(secret-tool lookup service "crucible-anthropic" account "crucible" 2>/dev/null || true)
+    if [ -n "$_K" ]; then ANTHROPIC_KEY="$_K"; ANTHROPIC_SOURCE="OS keychain (libsecret)"; fi
   fi
-fi
 
-if [ "$NEED_KEYS" = "1" ]; then
-  echo ""
-  read -rsp "  OpenAI API key (sk-...):        " OPENAI_KEY
-  echo ""
-  read -rsp "  Anthropic API key (sk-ant-...): " ANTHROPIC_KEY
-  echo ""
-  if [[ -z "$OPENAI_KEY" || -z "$ANTHROPIC_KEY" ]]; then
-    echo "Both API keys are required."
-    exit 1
+  # ── 2. File fallback ────────────────────────────────────────────────────────
+  if [ -z "$OPENAI_KEY" ] && [ -f "$KEYS_DIR/crucible-openai" ]; then
+    _K=$(cat "$KEYS_DIR/crucible-openai" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -n "$_K" ]; then OPENAI_KEY="$_K"; OPENAI_SOURCE="file ($KEYS_DIR/crucible-openai)"; fi
   fi
-fi
+  if [ -z "$ANTHROPIC_KEY" ] && [ -f "$KEYS_DIR/crucible-anthropic" ]; then
+    _K=$(cat "$KEYS_DIR/crucible-anthropic" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -n "$_K" ]; then ANTHROPIC_KEY="$_K"; ANTHROPIC_SOURCE="file ($KEYS_DIR/crucible-anthropic)"; fi
+  fi
 
-# ── Store new keys ─────────────────────────────────────────────────────────────
+  # ── 3. Environment variables ─────────────────────────────────────────────────
+  if [ -z "$OPENAI_KEY" ] && [ -n "$OPENAI_API_KEY" ]; then
+    OPENAI_KEY="$OPENAI_API_KEY"
+    OPENAI_SOURCE="env var OPENAI_API_KEY"
+  fi
+  if [ -z "$ANTHROPIC_KEY" ] && [ -n "$ANTHROPIC_API_KEY" ]; then
+    ANTHROPIC_KEY="$ANTHROPIC_API_KEY"
+    ANTHROPIC_SOURCE="env var ANTHROPIC_API_KEY"
+  fi
+
+  # ── Report what was found ────────────────────────────────────────────────────
+  if [ -n "$OPENAI_KEY" ]; then
+    echo "  ✔ OpenAI key found    — $OPENAI_SOURCE"
+  else
+    echo "  ✗ OpenAI key          — not found in any storage location"
+    NEED_OPENAI=1
+  fi
+  if [ -n "$ANTHROPIC_KEY" ]; then
+    echo "  ✔ Anthropic key found — $ANTHROPIC_SOURCE"
+  else
+    echo "  ✗ Anthropic key       — not found in any storage location"
+    NEED_ANTHROPIC=1
+  fi
+
+  # ── Offer to replace existing keys ──────────────────────────────────────────
+  if [ -n "$OPENAI_KEY" ] || [ -n "$ANTHROPIC_KEY" ]; then
+    echo ""
+    read -rp "  Replace any found keys with new ones? [y/N]: " _REPLACE
+    if [[ "${_REPLACE:-n}" =~ ^[Yy]$ ]]; then
+      NEED_OPENAI=1
+      NEED_ANTHROPIC=1
+      OPENAI_KEY=""
+      ANTHROPIC_KEY=""
+    fi
+  fi
+
+  # ── Prompt for missing keys ──────────────────────────────────────────────────
+  if [ "$NEED_OPENAI" = "1" ] || [ "$NEED_ANTHROPIC" = "1" ]; then
+    echo ""
+    if [ "$NEED_OPENAI" = "1" ]; then
+      read -rsp "  OpenAI API key (sk-...):        " OPENAI_KEY
+      echo ""
+    fi
+    if [ "$NEED_ANTHROPIC" = "1" ]; then
+      read -rsp "  Anthropic API key (sk-ant-...): " ANTHROPIC_KEY
+      echo ""
+    fi
+    if [[ -z "$OPENAI_KEY" || -z "$ANTHROPIC_KEY" ]]; then
+      echo "Both API keys are required."
+      exit 1
+    fi
+  fi
+
+fi  # end: not update mode
+
+# ── Store new / replaced keys ──────────────────────────────────────────────────
 #
 # Keys are stored via keys.js which picks the best available backend:
 #   macOS  → Keychain  (security add-generic-password)
@@ -163,7 +229,7 @@ fi
 #
 # They are NOT embedded in the wrapper script or MCP config.
 
-if [ -n "$OPENAI_KEY" ] && [ -n "$ANTHROPIC_KEY" ]; then
+if [ -n "$OPENAI_KEY" ] && [ -n "$ANTHROPIC_KEY" ] && [ "$INSTALL_MODE" != "update" ]; then
   echo "Storing API keys securely..."
   KEYFILE=$(mktemp /tmp/crucible-keys-XXXXXX.mjs)
   cat > "$KEYFILE" << EOF
@@ -216,6 +282,74 @@ console.log('Claude Code MCP config updated (no keys stored in config)');
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
   echo "Added ~/.local/bin to PATH — run: source ~/.bashrc"
+fi
+
+# ── GitHub CLI setup (optional) ───────────────────────────────────────────────
+#
+# Offers to install gh CLI and authenticate so crucible can browse repos,
+# create PRs, and push to private repos without password prompts.
+# Skipped on update mode to avoid re-prompting existing users.
+
+if [ "$INSTALL_MODE" != "update" ]; then
+  echo ""
+  echo "  ── GitHub integration (optional) ──────────────────────────────────────"
+  echo "  The gh CLI enables browsing your GitHub repos, creating PRs, cloning"
+  echo "  private repos, and push to GitHub without password prompts."
+  echo ""
+
+  if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+    GH_USER=$(gh api /user --jq '.login' 2>/dev/null || true)
+    echo "  ✔ GitHub already connected — signed in as ${GH_USER:-unknown}"
+  else
+    read -rp "  Set up GitHub integration now? [Y/n]: " _GH_SETUP
+    if [[ "${_GH_SETUP:-y}" =~ ^[Yy]?$ ]]; then
+      # Install gh CLI if missing
+      if ! command -v gh &>/dev/null; then
+        echo "  Installing GitHub CLI..."
+        if command -v apt-get &>/dev/null; then
+          type -p curl >/dev/null || sudo apt install -y curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update -qq && sudo apt install -y gh
+        elif command -v brew &>/dev/null; then
+          brew install gh
+        else
+          echo "  Could not auto-install gh. See https://cli.github.com for instructions."
+          echo "  Skipping GitHub setup."
+        fi
+      fi
+
+      # Authenticate
+      if command -v gh &>/dev/null; then
+        echo "  Launching GitHub login (browser will open)..."
+        gh auth login --web --git-protocol ssh || true
+        if gh auth status &>/dev/null 2>&1; then
+          GH_USER=$(gh api /user --jq '.login' 2>/dev/null || true)
+          echo "  ✔ GitHub connected — signed in as ${GH_USER:-unknown}"
+          # Configure git to use gh as credential helper
+          gh auth setup-git 2>/dev/null || true
+
+          # Collect git identity if not already set
+          GIT_NAME=$(git config --global user.name 2>/dev/null || true)
+          GIT_EMAIL=$(git config --global user.email 2>/dev/null || true)
+          if [ -z "$GIT_NAME" ]; then
+            read -rp "  Your name for git commits: " GIT_NAME
+            [ -n "$GIT_NAME" ] && git config --global user.name "$GIT_NAME"
+          fi
+          if [ -z "$GIT_EMAIL" ]; then
+            read -rp "  Your email for git commits: " GIT_EMAIL
+            [ -n "$GIT_EMAIL" ] && git config --global user.email "$GIT_EMAIL"
+          fi
+        else
+          echo "  GitHub login did not complete — run 'gh auth login' manually later."
+        fi
+      fi
+    else
+      echo "  Skipping — run setup-git.sh later to enable GitHub features."
+    fi
+  fi
 fi
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
