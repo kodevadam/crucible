@@ -5,10 +5,43 @@
  *
  * All git operations go through gitq() / gitExec() which use spawnSync with
  * explicit args arrays — no shell interpolation, no injection surface.
+ * All child processes receive a sanitized copy of the environment via safeEnv()
+ * so that provider API keys are never forwarded to git, gh, or other tools.
  */
 
 import { resolve, normalize, isAbsolute, sep } from "path";
 import { spawnSync }                            from "child_process";
+
+// ── Child-process environment sanitisation ────────────────────────────────────
+
+/**
+ * Names of environment variables that should never be forwarded to child
+ * processes (git, gh, etc.).  These are AI provider credentials; they have
+ * no legitimate use in git/gh and would represent a key-leakage surface if
+ * passed through.
+ *
+ * NOTE: GitHub tokens (GH_TOKEN, GITHUB_TOKEN) are intentionally NOT listed
+ * here — the gh CLI legitimately needs them.
+ */
+const STRIP_FROM_CHILD_ENV = new Set([
+  "OPENAI_API_KEY",
+  "OPENAI_ORG_ID",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "_CRUCIBLE_OPENAI_KEY",
+  "_CRUCIBLE_ANTHROPIC_KEY",
+]);
+
+/**
+ * Return a copy of process.env with known API keys stripped.
+ * Pass this as `{ env: safeEnv() }` to every spawnSync call so provider
+ * credentials cannot leak into child process environments.
+ */
+export function safeEnv() {
+  const env = { ...process.env };
+  for (const k of STRIP_FROM_CHILD_ENV) delete env[k];
+  return env;
+}
 
 // ── Path validation ───────────────────────────────────────────────────────────
 
@@ -18,6 +51,7 @@ import { spawnSync }                            from "child_process";
  * Rules enforced:
  *   - Must be a non-empty string
  *   - Must not be absolute
+ *   - Must not be a UNC path (\\server\share) or NT device path (\\?\...)
  *   - Must not contain '..' segments after normalisation
  *   - Resolved path must sit inside repoRoot (boundary-checked)
  *   - Normalises both / and \ separators (cheap Windows compat)
@@ -32,7 +66,14 @@ export function validateStagingPath(repoRoot, proposedPath) {
     );
   }
 
-  // Reject absolute paths immediately
+  // Reject UNC paths (\\server\share) and NT device paths (\\.\, \\?\)
+  // On Windows these reach network shares or raw devices; proactively reject
+  // them on all platforms for defence in depth.
+  if (/^\\\\/.test(proposedPath)) {
+    throw new Error(`UNC/device path rejected: ${proposedPath}`);
+  }
+
+  // Reject absolute paths immediately (also catches //server/share on Linux)
   if (isAbsolute(proposedPath)) {
     throw new Error(`Absolute path rejected: ${proposedPath}`);
   }
@@ -94,13 +135,14 @@ export function validateBranchName(name) {
  * Returns "" on non-zero exit (never throws).
  *
  * Equivalent to the old shq(`git -C "..." <args>`) pattern but without
- * shell interpolation.
+ * shell interpolation.  safeEnv() ensures API keys are not forwarded.
  */
 export function gitq(repoPath, args) {
   const r = spawnSync("git", ["-C", repoPath, ...args], {
     encoding: "utf8",
     stdio:    ["ignore", "pipe", "pipe"],
     shell:    false,
+    env:      safeEnv(),
   });
   return (r.stdout || "").trim();
 }
@@ -110,10 +152,14 @@ export function gitq(repoPath, args) {
  * Throws on non-zero exit.
  *
  * Equivalent to the old sh(`git -C "..." <args>`) pattern but without
- * shell interpolation.
+ * shell interpolation.  safeEnv() ensures API keys are not forwarded.
  */
 export function gitExec(repoPath, args) {
-  const r = spawnSync("git", ["-C", repoPath, ...args], { stdio: "inherit", shell: false });
+  const r = spawnSync("git", ["-C", repoPath, ...args], {
+    stdio:  "inherit",
+    shell:  false,
+    env:    safeEnv(),
+  });
   if (r.status !== 0 && r.status !== null) {
     throw new Error(`git ${args.join(" ")} failed (exit ${r.status})`);
   }
@@ -122,9 +168,14 @@ export function gitExec(repoPath, args) {
 /**
  * Run a gh (GitHub CLI) command with an explicit args array.
  * Output shown to user. Throws on non-zero exit.
+ * safeEnv() ensures AI provider keys are not forwarded (GH_TOKEN is preserved).
  */
 export function ghExec(args) {
-  const r = spawnSync("gh", args, { stdio: "inherit", shell: false });
+  const r = spawnSync("gh", args, {
+    stdio:  "inherit",
+    shell:  false,
+    env:    safeEnv(),
+  });
   if (r.status !== 0 && r.status !== null) {
     throw new Error(`gh ${args[0]} failed (exit ${r.status})`);
   }
@@ -133,12 +184,14 @@ export function ghExec(args) {
 /**
  * Run a gh command capturing output.
  * Returns "" on failure (never throws).
+ * safeEnv() ensures AI provider keys are not forwarded (GH_TOKEN is preserved).
  */
 export function ghq(args) {
   const r = spawnSync("gh", args, {
     encoding: "utf8",
     stdio:    ["ignore", "pipe", "pipe"],
     shell:    false,
+    env:      safeEnv(),
   });
   return (r.stdout || "").trim();
 }

@@ -20,6 +20,7 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync,
          renameSync, chmodSync, statSync, unlinkSync }          from "fs";
 import { join }                                                  from "path";
 import os                                                        from "os";
+import { safeEnv }                                              from "./safety.js";
 
 export const SERVICE_OPENAI    = "crucible-openai";
 export const SERVICE_ANTHROPIC = "crucible-anthropic";
@@ -76,7 +77,7 @@ function linuxStore(service, key) {
   try {
     const r = spawnSync("secret-tool", [
       "store", `--label=${service}`, "service", service, "account", "crucible",
-    ], { input: key, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8", shell: false });
+    ], { input: key, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8", shell: false, env: safeEnv() });
     return r.status === 0;
   } catch { return false; }
 }
@@ -85,7 +86,7 @@ function linuxRead(service) {
   try {
     const r = spawnSync("secret-tool", [
       "lookup", "service", service, "account", "crucible",
-    ], { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", shell: false });
+    ], { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", shell: false, env: safeEnv() });
     return (r.status === 0 && r.stdout) ? r.stdout.trim() || null : null;
   } catch { return null; }
 }
@@ -94,7 +95,7 @@ function linuxDelete(service) {
   try {
     spawnSync("secret-tool", [
       "clear", "service", service, "account", "crucible",
-    ], { stdio: "ignore", shell: false });
+    ], { stdio: "ignore", shell: false, env: safeEnv() });
   } catch { /* best-effort */ }
 }
 

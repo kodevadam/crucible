@@ -129,7 +129,9 @@ setInteractiveHelpers(ask, confirm, { bold, dim, cyan, green, yellow, red, blue,
 function inGitRepo(p)    { return gitq(p||".", ["rev-parse", "--is-inside-work-tree"]) === "true"; }
 function currentBranch(p){ return gitq(p||".", ["branch", "--show-current"]); }
 function ghInstalled()   {
-  const r = spawnSync("which", ["gh"], { stdio: "ignore", shell: false });
+  // Use `gh --version` rather than `which gh`: more portable (no `which` on
+  // Windows/minimal containers) and confirms the binary is actually runnable.
+  const r = spawnSync("gh", ["--version"], { stdio: "ignore", shell: false });
   return r.status === 0;
 }
 
