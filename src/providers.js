@@ -120,17 +120,36 @@ export function createProvider(type, apiKey) {
 //   This keeps the lazy-init pattern while supporting multi-key scenarios
 //   without breaking any existing call sites.
 
-let _openai    = null;
-let _anthropic = null;
+let _openai       = null;
+let _openaiKey    = null;
+let _anthropic    = null;
+let _anthropicKey = null;
 
-/** Shared lazy OpenAI SDK client. */
+/**
+ * Shared lazy OpenAI SDK client.
+ * Re-creates the client whenever the stored key changes so that a key entered
+ * after first launch (or updated via `crucible keys`) takes effect immediately
+ * without requiring a process restart.
+ */
 export function getOpenAI() {
-  if (!_openai) _openai = new OpenAI({ apiKey: retrieveKey(SERVICE_OPENAI) || "" });
+  const key = retrieveKey(SERVICE_OPENAI) || "";
+  if (!_openai || _openaiKey !== key) {
+    _openai    = new OpenAI({ apiKey: key });
+    _openaiKey = key;
+  }
   return _openai;
 }
 
-/** Shared lazy Anthropic SDK client. */
+/**
+ * Shared lazy Anthropic SDK client.
+ * Re-creates the client whenever the stored key changes (same rationale as
+ * getOpenAI above).
+ */
 export function getAnthropic() {
-  if (!_anthropic) _anthropic = new Anthropic({ apiKey: retrieveKey(SERVICE_ANTHROPIC) || "" });
+  const key = retrieveKey(SERVICE_ANTHROPIC) || "";
+  if (!_anthropic || _anthropicKey !== key) {
+    _anthropic    = new Anthropic({ apiKey: key });
+    _anthropicKey = key;
+  }
   return _anthropic;
 }
