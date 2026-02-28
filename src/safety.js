@@ -11,6 +11,7 @@
 
 import { resolve, normalize, isAbsolute, sep } from "path";
 import { spawnSync }                            from "child_process";
+import { createHash }                           from "crypto";
 
 // ── Child-process environment sanitisation ────────────────────────────────────
 
@@ -57,15 +58,160 @@ const STRIP_FROM_CHILD_ENV = new Set([
   "_CRUCIBLE_ANTHROPIC_KEY",
 ]);
 
+// ── Paranoid env mode (CRUCIBLE_PARANOID_ENV=1 | warn) ───────────────────────
+//
+// SCOPE CAVEAT — paranoid mode is NOT a sandbox.
+//
+// It meaningfully reduces the env surface area forwarded to child processes
+// (git, gh, etc.), making accidental credential leakage through spawned tools
+// much harder.  But it does NOT:
+//   • prevent child processes from reading files on disk,
+//   • prevent network access by git/gh,
+//   • restrict filesystem operations of those tools,
+//   • protect secrets that were baked into the binary or config files.
+//
+// Think of it as "we removed the easy paths," not "we built a jail."
+// For actual process isolation, use a container or seccomp profile.
+//
+// Modes:
+//   CRUCIBLE_PARANOID_ENV=1     enforce — drops vars and logs their names to stderr
+//   CRUCIBLE_PARANOID_ENV=warn  audit   — logs what WOULD be dropped; nothing is removed
+
 /**
- * Return a copy of process.env with known API keys stripped.
- * Pass this as `{ env: safeEnv() }` to every spawnSync call so provider
- * credentials cannot leak into child process environments.
+ * Exact-match allowlist for paranoid mode.
+ * These are the only env vars forwarded to child processes when
+ * CRUCIBLE_PARANOID_ENV=1. Everything not covered by this set or the
+ * prefix allowlist below is silently dropped (and its name is logged to
+ * stderr so users can diagnose breakage).
+ */
+const PARANOID_EXACT_ALLOW = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "COLORTERM",
+  "LANG", "LANGUAGE", "TZ",
+  // GitHub CLI auth
+  "GH_TOKEN", "GITHUB_TOKEN",
+  // Corporate proxies (non-secret; required in many environments)
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+  "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+  // Linux keychain / D-Bus (needed by libsecret / gnome-keyring)
+  "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+]);
+
+/**
+ * Prefix allowlist for paranoid mode.
+ * Any var whose name starts with one of these prefixes is forwarded.
+ */
+const PARANOID_PREFIX_ALLOW = [
+  "LC_",       // locale categories (LC_ALL, LC_CTYPE, …)
+  "GIT_",      // git internals (GIT_AUTHOR_NAME, GIT_SSH_COMMAND, …)
+  "SSH_",      // SSH agent (SSH_AUTH_SOCK, SSH_AGENT_PID)
+  "GPG_",      // GPG agent (GPG_AGENT_INFO)
+  "CRUCIBLE_", // first-party overrides
+];
+
+/**
+ * Core allowlist computation shared by enforce and warn modes.
+ *
+ * Returns { allowed, dropped } where:
+ *   allowed — env object containing only permitted variables
+ *   dropped — names (NOT values) of variables that were removed
+ *
+ * Additional vars can be opted-in via CRUCIBLE_EXTRA_ENV (comma-separated),
+ * e.g.:  CRUCIBLE_EXTRA_ENV=SSH_AGENT_PID,KUBECONFIG
+ */
+function applyParanoidFilter() {
+  const extra = new Set(
+    (process.env.CRUCIBLE_EXTRA_ENV || "").split(",").map(s => s.trim()).filter(Boolean)
+  );
+
+  const allowed = {};
+  const dropped = [];
+
+  for (const [k, v] of Object.entries(process.env)) {
+    const permitted =
+      PARANOID_EXACT_ALLOW.has(k) ||
+      PARANOID_PREFIX_ALLOW.some(pfx => k.startsWith(pfx)) ||
+      extra.has(k);
+
+    if (permitted) {
+      allowed[k] = v;
+    } else {
+      dropped.push(k);
+    }
+  }
+
+  return { allowed, dropped };
+}
+
+/**
+ * CRUCIBLE_PARANOID_ENV=1 — enforce mode.
+ * Builds a minimal allowlisted env; logs dropped var names to stderr.
+ */
+function paranoidEnforceEnv() {
+  const { allowed, dropped } = applyParanoidFilter();
+  if (dropped.length > 0) {
+    process.stderr.write(
+      `[crucible] paranoid-env (enforce): dropped ${dropped.length} var(s) from child env: ` +
+      dropped.join(", ") + "\n"
+    );
+  }
+  return allowed;
+}
+
+/**
+ * CRUCIBLE_PARANOID_ENV=warn — audit/dry-run mode.
+ * Returns the full environment unmodified, but logs what WOULD have been
+ * dropped under enforce mode.  Safe rollout path: run with =warn first to
+ * discover which tools depend on non-allowlisted vars, then switch to =1.
+ */
+function paranoidWarnEnv() {
+  const { dropped } = applyParanoidFilter();
+  if (dropped.length > 0) {
+    process.stderr.write(
+      `[crucible] paranoid-env (warn/dry-run): would drop ${dropped.length} var(s): ` +
+      dropped.join(", ") +
+      " — set CRUCIBLE_PARANOID_ENV=1 to enforce, or add to CRUCIBLE_EXTRA_ENV to allowlist.\n"
+    );
+  }
+  return { ...process.env };
+}
+
+/**
+ * Return a copy of process.env suitable for child processes.
+ *
+ * Three modes, controlled by CRUCIBLE_PARANOID_ENV:
+ *
+ *   (unset / any other value)
+ *     Normal: strip known AI provider credentials (blacklist).  Low breakage
+ *     risk; covers all known provider keys.
+ *
+ *   CRUCIBLE_PARANOID_ENV=warn
+ *     Audit/dry-run: logs what WOULD be dropped under enforce mode, but
+ *     returns the full env unchanged.  Use this first to discover deps.
+ *     NOTE: still strips STRIP_FROM_CHILD_ENV regardless.
+ *
+ *   CRUCIBLE_PARANOID_ENV=1
+ *     Enforce: default-deny allowlist — only PATH, HOME, GIT_*, SSH_*,
+ *     GH_TOKEN, CRUCIBLE_*, etc. are kept.  Dropped variable *names*
+ *     (never values) are logged to stderr.
+ *     See SCOPE CAVEAT above: this is not a sandbox.
  */
 export function safeEnv() {
+  const mode = process.env.CRUCIBLE_PARANOID_ENV;
+  if (mode === "1")    return paranoidEnforceEnv();
+  if (mode === "warn") return paranoidWarnEnv();
   const env = { ...process.env };
   for (const k of STRIP_FROM_CHILD_ENV) delete env[k];
   return env;
+}
+
+/**
+ * Compute a short, stable hash of an arbitrary string (prompt text, config
+ * blob, etc.) for reproducibility bookkeeping.  Returns the first 12 hex
+ * chars of the SHA-256 digest — long enough to be collision-resistant at
+ * human scale, short enough to store cheaply.
+ */
+export function shortHash(text) {
+  return createHash("sha256").update(text ?? "").digest("hex").slice(0, 12);
 }
 
 // ── Path validation ───────────────────────────────────────────────────────────
