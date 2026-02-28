@@ -15,11 +15,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-      - run: npm ci
+      - run: npm install
       - name: Check syntax
         run: |
           node --check src/cli.js
           node --check src/db.js
           node --check src/repo.js
+          node --check src/staging.js
           echo "All files pass syntax check"
