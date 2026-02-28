@@ -14,16 +14,35 @@
 
 import OpenAI    from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import { execSync }          from "child_process";
-import { createInterface }   from "readline";
-import { writeFileSync, existsSync, readFileSync } from "fs";
-import { join, resolve }     from "path";
+import { spawnSync }            from "child_process";
+import { createInterface }      from "readline";
+import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
+import { join, resolve }        from "path";
 import * as DB   from "./db.js";
-import { analyseRepo, getRepoSummary, getChangeLog } from "./repo.js";
+import { analyseRepo, getRepoSummary, getChangeLog, clearRepoKnowledge } from "./repo.js";
 import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers } from "./staging.js";
+import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
+import { validateBranchName, gitq, gitExec, ghExec, ghq } from "./safety.js";
 
-const openai    = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Keys retrieved from secure store (keychain or file), with env var fallback
+let _openai    = null;
+let _anthropic = null;
+
+function getOpenAI() {
+  if (!_openai) {
+    const key = retrieveKey(SERVICE_OPENAI) || "";
+    _openai = new OpenAI({ apiKey: key });
+  }
+  return _openai;
+}
+
+function getAnthropic() {
+  if (!_anthropic) {
+    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
+    _anthropic = new Anthropic({ apiKey: key });
+  }
+  return _anthropic;
+}
 
 const MAX_ROUNDS         = parseInt(process.env.MAX_ROUNDS || "10");
 const CONVERGENCE_PHRASE = "I AGREE WITH THIS PLAN";
@@ -107,23 +126,20 @@ const done = () => { if (_rl) { _rl.close(); _rl = null; } };
 // Pass interactive helpers and colour fns to staging.js
 setInteractiveHelpers(ask, confirm, { bold, dim, cyan, green, yellow, red, blue, hr });
 
-// ── Shell ─────────────────────────────────────────────────────────────────────
-
-function sh(cmd, opts={}) {
-  return execSync(cmd, { encoding:"utf8", stdio: opts.silent ? "pipe" : "inherit", ...opts }).trim();
+function inGitRepo(p)    { return gitq(p||".", ["rev-parse", "--is-inside-work-tree"]) === "true"; }
+function currentBranch(p){ return gitq(p||".", ["branch", "--show-current"]); }
+function ghInstalled()   {
+  // Use `gh --version` rather than `which gh`: more portable (no `which` on
+  // Windows/minimal containers) and confirms the binary is actually runnable.
+  const r = spawnSync("gh", ["--version"], { stdio: "ignore", shell: false });
+  return r.status === 0;
 }
-function shq(cmd) {
-  try { return execSync(cmd, { encoding:"utf8", stdio:"pipe" }).trim(); } catch { return ""; }
-}
-function inGitRepo(p)    { return shq(`git -C "${p||"."}" rev-parse --is-inside-work-tree`) === "true"; }
-function currentBranch(p){ return shq(`git -C "${p||"."}" branch --show-current`); }
-function ghInstalled()   { return shq("which gh") !== ""; }
 
 // ── Model detection ───────────────────────────────────────────────────────────
 
 async function getLatestGPTModel() {
   try {
-    const { data: models } = await openai.models.list();
+    const { data: models } = await getOpenAI().models.list();
     const chat = models.map(m=>m.id).filter(id => /^gpt-(4|5)/.test(id) && !EXCLUDE.test(id));
     const candidates = [];
     for (const pat of PRIORITY) {
@@ -138,7 +154,7 @@ async function getLatestGPTModel() {
     }
     for (const model of candidates) {
       try {
-        await openai.chat.completions.create({ model, max_tokens:1, messages:[{ role:"user", content:"hi" }] });
+        await getOpenAI().chat.completions.create({ model, max_tokens:1, messages:[{ role:"user", content:"hi" }] });
         return model;
       } catch(e) {
         if (e.status === 404 || e.status === 400) continue;
@@ -151,7 +167,7 @@ async function getLatestGPTModel() {
 
 async function getLatestClaudeModel() {
   try {
-    const { data: models } = await anthropic.models.list();
+    const { data: models } = await getAnthropic().models.list();
     return models
       .filter(m => m.id.includes("sonnet"))
       .sort((a,b) => new Date(b.created_at) - new Date(a.created_at))[0]?.id
@@ -162,12 +178,12 @@ async function getLatestClaudeModel() {
 // ── API helpers ───────────────────────────────────────────────────────────────
 
 async function askGPT(messages) {
-  const res = await openai.chat.completions.create({ model: state.gptModel, messages, max_tokens:2000 });
+  const res = await getOpenAI().chat.completions.create({ model: state.gptModel, messages, max_tokens:2000 });
   return res.choices[0].message.content;
 }
 
 async function askClaude(messages) {
-  const res = await anthropic.messages.create({ model: state.claudeModel, max_tokens:2000, messages });
+  const res = await getAnthropic().messages.create({ model: state.claudeModel, max_tokens:2000, messages });
   return res.content[0].text;
 }
 
@@ -225,7 +241,7 @@ async function setupRepo() {
       return setupRepo();
     }
     state.repoPath = resolved;
-    state.repoUrl  = shq(`git -C "${resolved}" remote get-url origin 2>/dev/null`);
+    state.repoUrl  = gitq(resolved, ["remote", "get-url", "origin"]);
     crucibleSay(`Got it — ${yellow(resolved)}`);
   }
 
@@ -234,7 +250,7 @@ async function setupRepo() {
     const url = await ask("  GitHub repo URL or owner/name:");
     if (!url.trim()) return;
     const dest = await ask("  Clone to:", { defaultVal: process.cwd() });
-    sh(`gh repo clone "${url.trim()}" "${dest.trim()}"`, { silent: false });
+    ghExec(["repo", "clone", url.trim(), dest.trim()]);
     state.repoPath = dest.trim();
     state.repoUrl  = url.trim();
     crucibleSay(`Cloned to ${yellow(state.repoPath)}`);
@@ -246,11 +262,11 @@ async function setupRepo() {
     const desc    = await ask("  Description (optional):");
     const priv    = await confirm("  Make it private?", false);
     if (!name.trim()) return;
-    const flags   = `--name "${name.trim()}" --description "${desc.trim()}" ${priv ? "--private" : "--public"}`;
-    sh(`gh repo create ${flags} --confirm`, { silent: false });
+    ghExec(["repo", "create", "--name", name.trim(), "--description", desc.trim(),
+            priv ? "--private" : "--public", "--confirm"]);
     const dest = join(process.cwd(), name.trim());
     state.repoPath = dest;
-    state.repoUrl  = shq(`gh repo view "${name.trim()}" --json url -q .url`);
+    state.repoUrl  = ghq(["repo", "view", name.trim(), "--json", "url", "-q", ".url"]);
     DB.logAction(null, state.sessionId, "create_repo", `Created repo: ${name.trim()}`, { name: name.trim(), url: state.repoUrl });
     crucibleSay(`Repo created: ${yellow(state.repoUrl)}`);
   }
@@ -634,7 +650,7 @@ async function offerCommitSpec(task, finalPlan, round) {
   const fname = `specs/${stamp}-${slug}.md`;
   const specsDir = join(state.repoPath, "specs");
 
-  if (!existsSync(specsDir)) sh(`mkdir -p "${specsDir}"`, { silent:true });
+  if (!existsSync(specsDir)) mkdirSync(specsDir, { recursive: true });
 
   writeFileSync(join(state.repoPath, fname), [
     `# Spec: ${task}`, ``,
@@ -648,27 +664,32 @@ async function offerCommitSpec(task, finalPlan, round) {
   const actionId = DB.logAction(state.proposalId, state.sessionId, "commit", `spec: ${task.slice(0,72)}`, { file: fname });
 
   const branchAns = await ask(`  Branch:`, { defaultVal: currentBranch(state.repoPath) });
-  const target    = branchAns.trim() || currentBranch(state.repoPath);
+  let target;
+  try {
+    target = validateBranchName(branchAns.trim() || currentBranch(state.repoPath));
+  } catch (e) {
+    crucibleSay(red(`Invalid branch name: ${e.message}`)); return;
+  }
 
   if (target !== currentBranch(state.repoPath)) {
-    if (shq(`git -C "${state.repoPath}" branch --list "${target}"`)) {
-      sh(`git -C "${state.repoPath}" checkout "${target}"`, { silent:true });
+    if (gitq(state.repoPath, ["branch", "--list", target])) {
+      gitExec(state.repoPath, ["checkout", target]);
     } else {
-      sh(`git -C "${state.repoPath}" checkout -b "${target}"`, { silent:true });
+      gitExec(state.repoPath, ["checkout", "-b", target]);
       console.log(green(`  ✔ Created branch: ${target}`));
       DB.logAction(state.proposalId, state.sessionId, "branch", `Created branch ${target}`, { branch: target });
     }
   }
 
-  sh(`git -C "${state.repoPath}" add "${fname}"`);
-  sh(`git -C "${state.repoPath}" commit -m "spec: ${task.slice(0,72)}"`);
+  gitExec(state.repoPath, ["add", fname]);
+  gitExec(state.repoPath, ["commit", "-m", `spec: ${task.slice(0,72)}`]);
   DB.executeAction(actionId);
   console.log(green(`  ✔ Committed: ${fname}`));
 
   const push = await confirm("  Push now?");
   if (push) {
     const pushActionId = DB.logAction(state.proposalId, state.sessionId, "push", `Push ${target}`, { branch: target });
-    sh(`git -C "${state.repoPath}" push -u origin "${currentBranch(state.repoPath)}"`);
+    gitExec(state.repoPath, ["push", "-u", "origin", currentBranch(state.repoPath)]);
     DB.executeAction(pushActionId);
     console.log(green("  ✔ Pushed"));
 
@@ -676,7 +697,8 @@ async function offerCommitSpec(task, finalPlan, round) {
       const pr = await confirm("  Open a PR for this spec?");
       if (pr) {
         const prActionId = DB.logAction(state.proposalId, state.sessionId, "pr", `PR: spec: ${task.slice(0,72)}`, { base:"main" });
-        sh(`gh pr create --title "spec: ${task.slice(0,72)}" --body "Auto-generated spec from crucible debate." --base main`);
+        ghExec(["pr", "create", "--title", `spec: ${task.slice(0,72)}`,
+                "--body", "Auto-generated spec from crucible debate.", "--base", "main"]);
         DB.executeAction(prActionId);
         console.log(green("  ✔ PR created"));
       }
@@ -699,22 +721,89 @@ async function offerMergeToMain() {
   if (ghInstalled() && state.repoUrl) {
     const prActionId = DB.logAction(state.proposalId, state.sessionId, "merge", `Squash-merge ${branch} → main`, { branch, base:"main" });
     // Try to find an open PR for this branch, otherwise create + merge
-    const existingPR = shq(`gh pr list --head "${branch}" --json number -q ".[0].number" 2>/dev/null`);
+    const existingPR = ghq(["pr", "list", "--head", branch, "--json", "number", "-q", ".[0].number"]);
     if (existingPR) {
-      sh(`gh pr merge ${existingPR} --squash --delete-branch`);
+      ghExec(["pr", "merge", existingPR, "--squash", "--delete-branch"]);
     } else {
-      sh(`gh pr create --title "Merge ${branch}" --body "" --base main`);
-      const prNum = shq(`gh pr list --head "${branch}" --json number -q ".[0].number"`);
-      sh(`gh pr merge ${prNum} --squash --delete-branch`);
+      ghExec(["pr", "create", "--title", `Merge ${branch}`, "--body", "", "--base", "main"]);
+      const prNum = ghq(["pr", "list", "--head", branch, "--json", "number", "-q", ".[0].number"]);
+      ghExec(["pr", "merge", prNum, "--squash", "--delete-branch"]);
     }
     DB.executeAction(prActionId);
     console.log(green(`  ✔ Merged ${branch} → main`));
   } else {
-    sh(`git -C "${state.repoPath}" checkout main`);
-    sh(`git -C "${state.repoPath}" merge --squash "${branch}"`);
-    sh(`git -C "${state.repoPath}" commit -m "Merge ${branch}"`);
+    gitExec(state.repoPath, ["checkout", "main"]);
+    gitExec(state.repoPath, ["merge", "--squash", branch]);
+    gitExec(state.repoPath, ["commit", "-m", `Merge ${branch}`]);
     DB.logAction(state.proposalId, state.sessionId, "merge", `Merged ${branch} → main`, { branch, base:"main" });
     console.log(green(`  ✔ Merged locally. Push main when ready.`));
+  }
+}
+
+// ── Commit staged files (user-gated) ─────────────────────────────────────────
+
+async function commitStagedFiles(title, stagedPaths, rounds) {
+  if (!state.repoPath || !inGitRepo(state.repoPath)) return;
+  if (!stagedPaths.length) return;
+
+  console.log("");
+  const go = await confirm(`  Commit ${stagedPaths.length} staged file(s)?`);
+  if (!go) { crucibleSay("Files remain staged — commit when ready."); return; }
+
+  const branchAns = await ask("  Branch:", { defaultVal: currentBranch(state.repoPath) });
+  let target;
+  try {
+    target = validateBranchName(branchAns.trim() || currentBranch(state.repoPath));
+  } catch (e) {
+    crucibleSay(red(`Invalid branch name: ${e.message}`)); return;
+  }
+
+  if (target !== currentBranch(state.repoPath)) {
+    if (gitq(state.repoPath, ["branch", "--list", target])) {
+      gitExec(state.repoPath, ["checkout", target]);
+    } else {
+      gitExec(state.repoPath, ["checkout", "-b", target]);
+      console.log(green(`  ✔ Created branch: ${target}`));
+      DB.logAction(state.proposalId, state.sessionId, "branch", `Created branch ${target}`, { branch: target });
+    }
+  }
+
+  const msg = `feat: ${title.slice(0, 72)}`;
+  const actionId = DB.logAction(state.proposalId, state.sessionId, "commit", msg, { files: stagedPaths });
+  gitExec(state.repoPath, ["commit", "-m", msg]);
+  DB.executeAction(actionId);
+  console.log(green(`  ✔ Committed ${stagedPaths.length} file(s)`));
+
+  const push = await confirm("  Push now?");
+  if (push) {
+    const remote = gitq(state.repoPath, ["remote"]) || "origin";
+    const pushId = DB.logAction(state.proposalId, state.sessionId, "push", `Push ${target}`, { branch: target });
+    gitExec(state.repoPath, ["push", "-u", remote, currentBranch(state.repoPath)]);
+    DB.executeAction(pushId);
+    console.log(green("  ✔ Pushed"));
+  }
+}
+
+// ── Stage + commit after a debate ─────────────────────────────────────────────
+
+async function offerStagingAndCommit(task, finalPlan, round) {
+  if (!state.repoPath || !inGitRepo(state.repoPath)) {
+    await offerCommitSpec(task, finalPlan, round);
+    return;
+  }
+
+  const stage = await confirm("  Stage and implement these changes in the repo?");
+  if (stage) {
+    const r = await runStagingFlow({
+      proposalId:       state.proposalId,
+      repoPath:         state.repoPath,
+      plan:             finalPlan,
+      repoUnderstanding: state.repoContext,
+      onStatus:         msg => systemMsg(msg),
+    });
+    if (r.staged.length) await commitStagedFiles(task, r.staged, round);
+  } else {
+    await offerCommitSpec(task, finalPlan, round);
   }
 }
 
@@ -907,7 +996,8 @@ async function cmdGit() {
   while (running) {
     const branch = currentBranch(repoPath);
     console.log(""); console.log(hr());
-    console.log(`  ${dim("repo:")} ${shq(`git -C "${repoPath}" remote get-url origin 2>/dev/null || echo "(no remote)"`)}   ${dim("branch:")} ${yellow(branch)}`);
+    const repoRemote = gitq(repoPath, ["remote", "get-url", "origin"]) || "(no remote)";
+    console.log(`  ${dim("repo:")} ${repoRemote}   ${dim("branch:")} ${yellow(branch)}`);
     console.log(hr());
 
     const items = ["Switch branch","Create new branch","Pull latest","Push current branch","Clone a repo","View open PRs","Create pull request","Squash & merge a PR","Merge current branch to main"];
@@ -919,58 +1009,64 @@ async function cmdGit() {
 
     switch (choice - 1) {
       case 0: {
-        const branches = shq(`git -C "${repoPath}" branch -a --format='%(refname:short)'`)
+        const branches = gitq(repoPath, ["branch", "-a", "--format=%(refname:short)"])
           .split("\n").filter(b=>b&&b!==branch).map(b=>b.replace(/^origin\//,"")).filter((b,i,a)=>a.indexOf(b)===i);
         if (!branches.length) { console.log(yellow("\n  No other branches.\n")); break; }
         branches.forEach((b,i)=>console.log(`  ${cyan(String(i+1))}  ${b}`));
         const p = parseInt((await ask("  ›")).trim()) - 1;
         if (p >= 0 && p < branches.length) {
-          sh(`git -C "${repoPath}" checkout "${branches[p]}"`);
+          gitExec(repoPath, ["checkout", branches[p]]);
           DB.logAction(state.proposalId, state.sessionId, "branch", `Switched to ${branches[p]}`, { branch: branches[p] });
           console.log(green(`\n  ✔ Switched to ${branches[p]}\n`));
         }
         break;
       }
       case 1: {
-        const name = await ask("  New branch name:");
-        if (name.trim()) {
-          sh(`git -C "${repoPath}" checkout -b "${name.trim()}"`);
-          DB.logAction(state.proposalId, state.sessionId, "branch", `Created ${name.trim()}`, { branch: name.trim() });
-          console.log(green(`\n  ✔ Created ${name.trim()}\n`));
+        const nameRaw = await ask("  New branch name:");
+        if (nameRaw.trim()) {
+          let safeName;
+          try { safeName = validateBranchName(nameRaw.trim()); }
+          catch (e) { console.log(red(`\n  ${e.message}\n`)); break; }
+          gitExec(repoPath, ["checkout", "-b", safeName]);
+          DB.logAction(state.proposalId, state.sessionId, "branch", `Created ${safeName}`, { branch: safeName });
+          console.log(green(`\n  ✔ Created ${safeName}\n`));
         }
         break;
       }
-      case 2: sh(`git -C "${repoPath}" pull`); console.log(green("\n  ✔ Pulled\n")); break;
+      case 2: gitExec(repoPath, ["pull"]); console.log(green("\n  ✔ Pulled\n")); break;
       case 3: {
-        sh(`git -C "${repoPath}" push -u ${shq(`git -C "${repoPath}" remote`)||"origin"} "${currentBranch(repoPath)}"`);
+        const remote = gitq(repoPath, ["remote"]) || "origin";
+        gitExec(repoPath, ["push", "-u", remote, currentBranch(repoPath)]);
         DB.logAction(state.proposalId, state.sessionId, "push", `Pushed ${currentBranch(repoPath)}`, {});
         console.log(green("\n  ✔ Pushed\n")); break;
       }
       case 4: {
         const url = await ask("  Repo URL:");
-        if (url.trim()) { sh(`gh repo clone "${url.trim()}"`); console.log(green("\n  ✔ Cloned\n")); }
+        if (url.trim()) { ghExec(["repo", "clone", url.trim()]); console.log(green("\n  ✔ Cloned\n")); }
         break;
       }
-      case 5: console.log(""); sh("gh pr list"); console.log(""); break;
+      case 5: console.log(""); ghExec(["pr", "list"]); console.log(""); break;
       case 6: {
         const title = await ask("  PR title:");
         const body  = await ask("  Description:");
         const base  = await ask("  Base branch:", { defaultVal:"main" });
         if (title.trim()) {
-          sh(`gh pr create --title "${title.trim()}" --body "${body.trim()}" --base "${base}"`);
+          ghExec(["pr", "create", "--title", title.trim(), "--body", body.trim(), "--base", base.trim() || "main"]);
           DB.logAction(state.proposalId, state.sessionId, "pr", title.trim(), { base });
           console.log(green("\n  ✔ PR created\n"));
         }
         break;
       }
       case 7: {
-        const prs = shq("gh pr list --json number,title,headRefName --template '{{range .}}{{.number}}|{{.title}}|{{.headRefName}}\n{{end}}'").split("\n").filter(Boolean);
+        const prs = ghq(["pr", "list", "--json", "number,title,headRefName",
+          "--template", "{{range .}}{{.number}}|{{.title}}|{{.headRefName}}\n{{end}}"
+        ]).split("\n").filter(Boolean);
         if (!prs.length) { console.log(yellow("  No open PRs.\n")); break; }
         prs.forEach((p,i)=>{ const [num,,head]=p.split("|"); console.log(`  ${cyan(String(i+1))}  #${num} — ${head}`); });
         const p = parseInt((await ask("  ›")).trim()) - 1;
         if (p >= 0 && p < prs.length) {
           const prNum = prs[p].split("|")[0];
-          sh(`gh pr merge ${prNum} --squash --delete-branch`);
+          ghExec(["pr", "merge", prNum, "--squash", "--delete-branch"]);
           DB.logAction(state.proposalId, state.sessionId, "merge", `Squash-merged PR #${prNum}`, { pr: prNum });
           console.log(green(`\n  ✔ PR #${prNum} squash-merged\n`));
         }
@@ -1085,6 +1181,30 @@ async function cmdModels() {
   done();
 }
 
+// ── keys status ───────────────────────────────────────────────────────────────
+
+function cmdKeysStatus() {
+  const SERVICES = [
+    { id: SERVICE_OPENAI,    label: "OpenAI   " },
+    { id: SERVICE_ANTHROPIC, label: "Anthropic" },
+  ];
+  console.log(`\n  ${bold(cyan("crucible keys status"))}\n`);
+  for (const { id, label } of SERVICES) {
+    const src = getKeySource(id);
+    const indicator = src === "not-set"
+      ? red("✗ not set")
+      : src === "env"       ? yellow("env var (legacy)")
+      : src === "keychain"  ? green("keychain")
+      : src === "file"      ? yellow("file (~/.config/crucible/keys/)")
+      : src === "cache"     ? green("loaded (cache)")
+      : src === "session-only" ? cyan("session-only (in memory)")
+      : dim(src);
+    console.log(`    ${bold(label)}  ${indicator}`);
+  }
+  console.log();
+  done();
+}
+
 // ── help ──────────────────────────────────────────────────────────────────────
 
 function cmdHelp() {
@@ -1097,6 +1217,8 @@ function cmdHelp() {
     ${bold("crucible debate")} ${dim('"task"')} raw debate with inter-round controls
     ${bold("crucible git")}          GitHub/git menu
     ${bold("crucible history")}      browse past sessions, proposals, actions
+    ${bold("crucible repo refresh")} force-rebuild repo knowledge for current dir
+    ${bold("crucible keys status")}  show API key storage source (no values shown)
     ${bold("crucible models")}       show current model versions
     ${bold("crucible help")}         show this help
 
@@ -1211,6 +1333,41 @@ switch (cmd) {
       }
     }
     done(); break;
+  }
+  case "repo": {
+    // crucible repo refresh [path]
+    const subCmd = rest[0];
+    if (subCmd === "refresh") {
+      const repoPath = rest[1] ? resolve(rest[1]) : process.cwd();
+      if (!inGitRepo(repoPath)) {
+        console.error(red(`\n  Not a git repo: ${repoPath}\n`)); done(); process.exit(1);
+      }
+      process.stdout.write(dim("  Clearing cached understanding..."));
+      clearRepoKnowledge(repoPath);
+      process.stdout.write("\r                                  \r");
+      // Need Claude model for re-analysis
+      const cm = await getLatestClaudeModel();
+      state.claudeModel = cm;
+      crucibleSay(`Rebuilding understanding for ${yellow(repoPath)}...`);
+      try {
+        const result = await analyseRepo(repoPath, null, {
+          claudeModel: cm,
+          onStatus: msg => systemMsg(msg),
+        });
+        crucibleSay(`Done — ${dim(result.stackSummary || "understanding rebuilt")}`);
+      } catch (e) {
+        console.error(red(`\n  Repo analysis failed: ${e.message}\n`));
+        done(); process.exit(1);
+      }
+    } else {
+      console.error(red(`\n  Usage: crucible repo refresh [path]\n`));
+      process.exit(1);
+    }
+    done(); break;
+  }
+  case "keys": {
+    if (rest[0] === "status") { cmdKeysStatus(); break; }
+    console.error(red(`\n  Usage: crucible keys status\n`)); process.exit(1);
   }
   case "history":  await cmdHistory(); break;
   case "models":   await cmdModels(); break;

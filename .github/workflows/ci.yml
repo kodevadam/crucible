@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  lint:
-    name: Syntax check
+  test:
+    name: Syntax check + Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,4 +22,9 @@ jobs:
           node --check src/db.js
           node --check src/repo.js
           node --check src/staging.js
+          node --check src/keys.js
+          node --check src/safety.js
+          node --check src/providers.js
           echo "All files pass syntax check"
+      - name: Run tests
+        run: npm test

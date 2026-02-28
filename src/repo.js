@@ -8,20 +8,28 @@
  *               with delta → each new commit logged to repo_changes
  */
 
-import { execSync }                            from "child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { join, extname, relative }             from "path";
 import Anthropic                               from "@anthropic-ai/sdk";
 import * as DB                                 from "./db.js";
+import { retrieveKey, SERVICE_ANTHROPIC }      from "./keys.js";
+import { gitq }                                from "./safety.js";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-// ── Shell helpers ─────────────────────────────────────────────────────────────
-
-function shq(cmd) {
-  try { return execSync(cmd, { encoding: "utf8", stdio: "pipe" }).trim(); }
-  catch { return ""; }
+// Lazy Anthropic client
+let _anthropic = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
+    _anthropic = new Anthropic({ apiKey: key });
+  }
+  return _anthropic;
 }
+
+// Token/size budget constants
+const MAX_SNAPSHOT_FILES   = 200;   // Max source files included in raw snapshot
+const MAX_FILE_BYTES       = 200_000; // Max bytes read per file
+const MAX_SNAPSHOT_CHARS   = 6_000; // Max aggregate chars for context injection
+const DIVERGENCE_THRESHOLD = 50;    // Warn when >N unprocessed commits
 
 // ── Language detection ────────────────────────────────────────────────────────
 
@@ -118,14 +126,14 @@ function readKeyFiles(repoPath) {
     }
   }
 
-  // Top-level source files (up to 5, up to 1500 chars each)
+  // Top-level source files (up to MAX_SNAPSHOT_FILES, up to MAX_FILE_BYTES each)
   let srcCount = 0;
   function scanSrc(dir, depth = 0) {
-    if (depth > 2 || srcCount >= 5) return;
+    if (depth > 2 || srcCount >= MAX_SNAPSHOT_FILES) return;
     let entries;
     try { entries = readdirSync(dir); } catch { return; }
     for (const f of entries.sort()) {
-      if (srcCount >= 5) break;
+      if (srcCount >= MAX_SNAPSHOT_FILES) break;
       if (IGNORE_DIRS.has(f)) continue;
       const full = join(dir, f);
       let stat;
@@ -136,7 +144,9 @@ function readKeyFiles(repoPath) {
       const rel = relative(repoPath, full);
       if (entryPoints.includes(rel)) continue;
       try {
-        const content = readFileSync(full, "utf8").slice(0, 1500);
+        // Cap individual file size
+        const maxChars = Math.min(1500, MAX_FILE_BYTES);
+        const content = readFileSync(full, "utf8").slice(0, maxChars);
         parts.push(`=== ${rel} ===\n${content}`);
         srcCount++;
       } catch { /* skip */ }
@@ -150,11 +160,11 @@ function readKeyFiles(repoPath) {
 }
 
 function buildRawSnapshot(repoPath) {
-  const tree    = buildFileTree(repoPath);
-  const files   = readKeyFiles(repoPath);
-  const gitLog  = shq(`git -C "${repoPath}" log --oneline -20 2>/dev/null`);
-  const branches = shq(`git -C "${repoPath}" branch -a --format='%(refname:short)' 2>/dev/null | head -15`);
-  const remotes  = shq(`git -C "${repoPath}" remote -v 2>/dev/null | head -4`);
+  const tree     = buildFileTree(repoPath);
+  const files    = readKeyFiles(repoPath);
+  const gitLog   = gitq(repoPath, ["log", "--oneline", "-20"]);
+  const branches = gitq(repoPath, ["branch", "-a", "--format=%(refname:short)"]).split("\n").slice(0, 15).join("\n");
+  const remotes  = gitq(repoPath, ["remote", "-v"]).split("\n").slice(0, 4).join("\n");
 
   return [
     `=== FILE TREE ===\n${tree}`,
@@ -168,14 +178,29 @@ function buildRawSnapshot(repoPath) {
 // ── Count files ───────────────────────────────────────────────────────────────
 
 function countSourceFiles(repoPath) {
-  const result = shq(`find "${repoPath}" -type f -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/__pycache__/*" 2>/dev/null | wc -l`);
-  return parseInt(result) || 0;
+  let count = 0;
+  function walk(dir, depth = 0) {
+    if (depth > 5) return;
+    try {
+      for (const f of readdirSync(dir)) {
+        if (IGNORE_DIRS.has(f)) continue;
+        const full = join(dir, f);
+        try {
+          const stat = statSync(full);
+          if (stat.isDirectory()) walk(full, depth + 1);
+          else count++;
+        } catch { /* skip unreadable */ }
+      }
+    } catch { /* skip unreadable dir */ }
+  }
+  walk(repoPath);
+  return count;
 }
 
 // ── Claude calls ──────────────────────────────────────────────────────────────
 
 async function askClaude(prompt, maxTokens = 2000) {
-  const res = await anthropic.messages.create({
+  const res = await getAnthropic().messages.create({
     model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
@@ -184,7 +209,11 @@ async function askClaude(prompt, maxTokens = 2000) {
 }
 
 async function synthesiseUnderstanding(repoPath, rawSnapshot) {
-  const prompt = `You are analysing a software repository to build a persistent understanding of it. 
+  // Cap snapshot to avoid huge token bills; MAX_SNAPSHOT_CHARS*2 gives headroom
+  // for the prompt itself while staying within model context limits.
+  const snapshotForPrompt = rawSnapshot.slice(0, Math.max(12000, MAX_SNAPSHOT_CHARS * 2));
+
+  const prompt = `You are analysing a software repository to build a persistent understanding of it.
 Based on the snapshot below, produce a structured understanding covering:
 
 1. **Purpose** — what this project does and who it's for
@@ -200,7 +229,7 @@ Keep it dense and factual — this will be used as context for future planning s
 
 Repository: ${repoPath}
 
-${rawSnapshot.slice(0, 12000)}`;
+${snapshotForPrompt}`;
 
   return askClaude(prompt, 2500);
 }
@@ -250,23 +279,23 @@ async function detectStackSummary(rawSnapshot) {
 function getNewCommits(repoPath, sinceHash) {
   // Get all commits newer than sinceHash
   const range = sinceHash ? `${sinceHash}..HEAD` : "HEAD~20..HEAD";
-  const log   = shq(`git -C "${repoPath}" log ${range} --format="%H|%ai|%an|%s" 2>/dev/null`);
+  const log   = gitq(repoPath, ["log", range, "--format=%H|%ai|%an|%s"]);
   if (!log) return [];
 
   return log.split("\n").filter(Boolean).map(line => {
     const [hash, date, author, ...msgParts] = line.split("|");
-    const message  = msgParts.join("|");
-    const files    = shq(`git -C "${repoPath}" diff-tree --no-commit-id -r --name-only ${hash} 2>/dev/null`).split("\n").filter(Boolean);
+    const message = msgParts.join("|");
+    const files   = gitq(repoPath, ["diff-tree", "--no-commit-id", "-r", "--name-only", hash]).split("\n").filter(Boolean);
     return { hash, date, author, message, files };
   });
 }
 
 function getCurrentHead(repoPath) {
-  return shq(`git -C "${repoPath}" rev-parse HEAD 2>/dev/null`);
+  return gitq(repoPath, ["rev-parse", "HEAD"]);
 }
 
 function getHeadDate(repoPath) {
-  return shq(`git -C "${repoPath}" log -1 --format="%ai" 2>/dev/null`);
+  return gitq(repoPath, ["log", "-1", "--format=%ai"]);
 }
 
 // ── Main public function ──────────────────────────────────────────────────────
@@ -351,6 +380,15 @@ export async function analyseRepo(repoPath, repoUrl, { claudeModel, onStatus } =
   const newCommits = getNewCommits(repoPath, existing.last_commit_hash).filter(
     c => !DB.hasCommit(repoPath, c.hash)
   );
+
+  // Warn if the repo has diverged significantly from the indexed state
+  if (newCommits.length > DIVERGENCE_THRESHOLD) {
+    status(
+      `⚠️  ${newCommits.length} unprocessed commits since last index ` +
+      `(threshold: ${DIVERGENCE_THRESHOLD}). Understanding may be stale. ` +
+      `Run: crucible repo refresh`
+    );
+  }
 
   if (!newCommits.length) {
     status("No unprocessed commits — using cached understanding.");
@@ -460,4 +498,13 @@ export function getChangeLog(repoPath, limit = 50) {
     ...r,
     filesChanged: r.files_changed ? JSON.parse(r.files_changed) : [],
   }));
+}
+
+/**
+ * clearRepoKnowledge(repoPath)
+ * Delete all cached understanding for a repo, forcing a full re-analysis on
+ * the next analyseRepo() call.
+ */
+export function clearRepoKnowledge(repoPath) {
+  DB.deleteRepoKnowledge(repoPath);
 }

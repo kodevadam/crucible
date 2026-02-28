@@ -12,27 +12,25 @@
  */
 
 import Anthropic                                       from "@anthropic-ai/sdk";
-import { execSync }                                    from "child_process";
 import { existsSync, readFileSync, writeFileSync,
          mkdirSync }                                   from "fs";
 import { join, dirname, relative, extname }            from "path";
 import * as DB                                         from "./db.js";
+import { validateStagingPath, gitq }                   from "./safety.js";
+import { retrieveKey, SERVICE_ANTHROPIC }              from "./keys.js";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function shq(cmd) {
-  try { return execSync(cmd, { encoding: "utf8", stdio: "pipe" }).trim(); }
-  catch { return ""; }
-}
-
-function sh(cmd) {
-  return execSync(cmd, { encoding: "utf8", stdio: "inherit" }).trim();
+// Lazy Anthropic client — key may come from keychain rather than env var
+let _anthropic = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
+    _anthropic = new Anthropic({ apiKey: key });
+  }
+  return _anthropic;
 }
 
 async function askClaude(messages, maxTokens = 3000) {
-  const res = await anthropic.messages.create({
+  const res = await getAnthropic().messages.create({
     model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
     max_tokens: maxTokens,
     messages,
@@ -131,7 +129,17 @@ Respond with ONLY the JSON array, no markdown fences, no explanation.`;
     const cleaned = raw.replace(/^```[a-z]*\n?/m, "").replace(/```$/m, "").trim();
     const files = JSON.parse(cleaned);
     if (!Array.isArray(files)) throw new Error("Not an array");
-    return files.filter(f => f.path && f.action);
+    // Validate every path before trusting Claude's output
+    return files.filter(f => {
+      if (!f.path || !f.action) return false;
+      try {
+        validateStagingPath(repoPath, f.path);
+        return true;
+      } catch (e) {
+        process.stderr.write(`[staging] Rejected path from model: ${e.message}\n`);
+        return false;
+      }
+    });
   } catch {
     return [];
   }
@@ -252,7 +260,14 @@ export async function runStagingFlow({
       const p    = (await _ask("  File path (relative to repo root):\n  ›")).trim();
       const act  = (await _ask("  Action [create/modify/delete] (default: modify):\n  ›")).trim() || "modify";
       const note = (await _ask("  Why is this file affected?\n  ›")).trim();
-      if (p) affectedFiles.push({ path: p, action: act, note });
+      if (p) {
+        try {
+          validateStagingPath(repoPath, p);
+          affectedFiles.push({ path: p, action: act, note });
+        } catch (e) {
+          console.log(_colours.red(`  Path rejected: ${e.message}`));
+        }
+      }
       continue;
     }
 
@@ -409,13 +424,18 @@ export async function runStagingFlow({
 
   const writtenPaths = [];
   for (const f of staged) {
-    const fullPath = join(repoPath, f.path);
+    // Final defence-in-depth path check before any disk or git operation
+    let fullPath;
+    try {
+      fullPath = validateStagingPath(repoPath, f.path);
+    } catch (e) {
+      say(`Skipping ${f.path}: ${e.message}`);
+      continue;
+    }
 
     if (f.action === "delete") {
       // git rm handles both the fs delete and staging
-      shq(`git -C "${repoPath}" rm -f "${f.path}" 2>/dev/null`) ||
-        shq(`rm -f "${fullPath}"`);
-      shq(`git -C "${repoPath}" add "${f.path}"`);
+      gitq(repoPath, ["rm", "-f", f.path]);
       updateStagedFileStatus(f.id, "staged");
       console.log(red(`  ✔ Deleted and staged: ${f.path}`));
     } else {
@@ -424,7 +444,7 @@ export async function runStagingFlow({
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
       writeFileSync(fullPath, f.content, "utf8");
-      shq(`git -C "${repoPath}" add "${f.path}"`);
+      gitq(repoPath, ["add", f.path]);
       updateStagedFileStatus(f.id, "staged");
       console.log(green(`  ✔ Written and staged: ${f.path}`));
     }
@@ -460,14 +480,20 @@ export async function restageApproved(proposalId, repoPath, colours) {
 
   const written = [];
   for (const f of files) {
-    const fullPath = join(repoPath, f.file_path);
+    let fullPath;
+    try {
+      fullPath = validateStagingPath(repoPath, f.file_path);
+    } catch (e) {
+      console.log(`  Skipping ${f.file_path}: ${e.message}`);
+      continue;
+    }
     if (f.action === "delete") {
-      shq(`git -C "${repoPath}" rm -f "${f.file_path}" 2>/dev/null`);
+      gitq(repoPath, ["rm", "-f", f.file_path]);
     } else if (f.content) {
       const dir = dirname(fullPath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       writeFileSync(fullPath, f.content, "utf8");
-      shq(`git -C "${repoPath}" add "${f.file_path}"`);
+      gitq(repoPath, ["add", f.file_path]);
     }
     updateStagedFileStatus(f.id, "staged");
     console.log(green(`  ✔ Re-staged: ${f.file_path}`));
