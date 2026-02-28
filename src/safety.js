@@ -29,7 +29,21 @@ import { spawnSync }                            from "child_process";
  *   blacklist is the pragmatic middle ground: low breakage risk, covers
  *   all known AI provider credentials.  If a "paranoid mode" is ever
  *   added (CRUCIBLE_PARANOID_ENV=1), switching to a whitelist there would
- *   be a clean opt-in without disturbing normal operation.
+ *   be a clean opt-in without disturbing normal operation.  A paranoid
+ *   baseline would include: PATH, HOME, USER, SHELL, TERM, LANG, LC_*,
+ *   GIT_*, SSH_*, GPG_*, GH_TOKEN, GITHUB_TOKEN, CRUCIBLE_*, plus
+ *   OS-specific keychain vars — with "warn on drop" logging so users
+ *   can see what broke before it bites them.
+ *
+ * PROXY VARIABLES (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY):
+ *   These are deliberately NOT stripped.  They are not secrets, and
+ *   corporate users legitimately need them to reach GitHub through
+ *   firewalls.  Stripping them silently would break `git fetch` and
+ *   `gh pr create` in those environments with no obvious error.
+ *   The trust-boundary concern is different here: a malicious proxy
+ *   is a network-level threat, not a credential-exfiltration threat
+ *   from within the process.  If Crucible ever adds a `--no-proxy`
+ *   flag, it should be an explicit opt-in, not a silent default.
  *
  * NOTE: GitHub tokens (GH_TOKEN, GITHUB_TOKEN) are intentionally NOT listed
  * here — the gh CLI legitimately needs them.
