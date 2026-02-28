@@ -76,7 +76,7 @@ function linuxStore(service, key) {
   try {
     const r = spawnSync("secret-tool", [
       "store", `--label=${service}`, "service", service, "account", "crucible",
-    ], { input: key, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" });
+    ], { input: key, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8", shell: false });
     return r.status === 0;
   } catch { return false; }
 }
@@ -85,7 +85,7 @@ function linuxRead(service) {
   try {
     const r = spawnSync("secret-tool", [
       "lookup", "service", service, "account", "crucible",
-    ], { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
+    ], { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", shell: false });
     return (r.status === 0 && r.stdout) ? r.stdout.trim() || null : null;
   } catch { return null; }
 }
@@ -94,7 +94,7 @@ function linuxDelete(service) {
   try {
     spawnSync("secret-tool", [
       "clear", "service", service, "account", "crucible",
-    ], { stdio: "ignore" });
+    ], { stdio: "ignore", shell: false });
   } catch { /* best-effort */ }
 }
 
@@ -207,6 +207,22 @@ export function getLoadedKeys() {
   if (process.env.OPENAI_API_KEY)    vals.push(process.env.OPENAI_API_KEY);
   if (process.env.ANTHROPIC_API_KEY) vals.push(process.env.ANTHROPIC_API_KEY);
   return [...new Set(vals)].filter(v => v && v.length >= 8);
+}
+
+/**
+ * Report where a key would be retrieved from, without revealing its value.
+ * Returns one of: "session-only" | "env" | "keychain" | "file" | "not-set"
+ */
+export function getKeySource(service) {
+  if (SESSION_ONLY) {
+    return _cache.has(service) ? "session-only" : "not-set";
+  }
+  if (_cache.has(service))                                                    return "cache";
+  if (service === SERVICE_OPENAI    && process.env.OPENAI_API_KEY)            return "env";
+  if (service === SERVICE_ANTHROPIC && process.env.ANTHROPIC_API_KEY)         return "env";
+  if (keychainRead(service) !== null)                                         return "keychain";
+  if (fileRead(service)    !== null)                                          return "file";
+  return "not-set";
 }
 
 /**

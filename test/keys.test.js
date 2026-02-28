@@ -126,3 +126,42 @@ test("SERVICE_ANTHROPIC is a non-empty string", () => {
 test("SERVICE_OPENAI and SERVICE_ANTHROPIC are different", () => {
   assert.notEqual(SERVICE_OPENAI, SERVICE_ANTHROPIC);
 });
+
+// ── Session-only mode ─────────────────────────────────────────────────────────
+
+test("session-only mode: CRUCIBLE_SESSION_ONLY=1 never writes to disk", async () => {
+  // Run a child process with HOME redirected to a temp dir and SESSION_ONLY=1.
+  // After calling storeKey, the temp dir must remain empty.
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync, existsSync, rmSync } = await import("node:fs");
+  const { tmpdir }  = await import("node:os");
+  const { join }    = await import("node:path");
+
+  const fakeHome = mkdtempSync(join(tmpdir(), "crucible-session-only-"));
+  const keysDir  = join(fakeHome, ".config", "crucible", "keys");
+  const keysJsPath = new URL("../src/keys.js", import.meta.url).pathname;
+
+  // Build a small script that runs storeKey under session-only mode
+  const script = [
+    `process.env.HOME = ${JSON.stringify(fakeHome)};`,
+    `process.env.CRUCIBLE_SESSION_ONLY = "1";`,
+    `process.env.CRUCIBLE_SILENCE_KEY_WARN = "1";`,
+    `const { storeKey } = await import(${JSON.stringify(keysJsPath)});`,
+    `storeKey("crucible-openai", "sk-test-session-only-key12345");`,
+  ].join("\n");
+
+  try {
+    const r = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", script],
+      { encoding: "utf8", shell: false, timeout: 10_000 }
+    );
+    assert.equal(r.status, 0, `child script exited with error:\n${r.stderr}`);
+    assert.ok(
+      !existsSync(keysDir),
+      `session-only mode should not write files to disk, but ${keysDir} was created`
+    );
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});

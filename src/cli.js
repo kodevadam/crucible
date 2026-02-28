@@ -14,14 +14,14 @@
 
 import OpenAI    from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import { execSync, spawnSync }  from "child_process";
+import { spawnSync }            from "child_process";
 import { createInterface }      from "readline";
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
 import { join, resolve }        from "path";
 import * as DB   from "./db.js";
 import { analyseRepo, getRepoSummary, getChangeLog, clearRepoKnowledge } from "./repo.js";
 import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers } from "./staging.js";
-import { retrieveKey, storeKey, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
+import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
 import { validateBranchName, gitq, gitExec, ghExec, ghq } from "./safety.js";
 
 // Keys retrieved from secure store (keychain or file), with env var fallback
@@ -126,17 +126,12 @@ const done = () => { if (_rl) { _rl.close(); _rl = null; } };
 // Pass interactive helpers and colour fns to staging.js
 setInteractiveHelpers(ask, confirm, { bold, dim, cyan, green, yellow, red, blue, hr });
 
-// ── Shell (legacy — kept for non-git/non-gh commands only) ────────────────────
-
-function sh(cmd, opts={}) {
-  return execSync(cmd, { encoding:"utf8", stdio: opts.silent ? "pipe" : "inherit", ...opts }).trim();
-}
-function shq(cmd) {
-  try { return execSync(cmd, { encoding:"utf8", stdio:"pipe" }).trim(); } catch { return ""; }
-}
 function inGitRepo(p)    { return gitq(p||".", ["rev-parse", "--is-inside-work-tree"]) === "true"; }
 function currentBranch(p){ return gitq(p||".", ["branch", "--show-current"]); }
-function ghInstalled()   { return shq("which gh") !== ""; }
+function ghInstalled()   {
+  const r = spawnSync("which", ["gh"], { stdio: "ignore", shell: false });
+  return r.status === 0;
+}
 
 // ── Model detection ───────────────────────────────────────────────────────────
 
@@ -1184,6 +1179,30 @@ async function cmdModels() {
   done();
 }
 
+// ── keys status ───────────────────────────────────────────────────────────────
+
+function cmdKeysStatus() {
+  const SERVICES = [
+    { id: SERVICE_OPENAI,    label: "OpenAI   " },
+    { id: SERVICE_ANTHROPIC, label: "Anthropic" },
+  ];
+  console.log(`\n  ${bold(cyan("crucible keys status"))}\n`);
+  for (const { id, label } of SERVICES) {
+    const src = getKeySource(id);
+    const indicator = src === "not-set"
+      ? red("✗ not set")
+      : src === "env"       ? yellow("env var (legacy)")
+      : src === "keychain"  ? green("keychain")
+      : src === "file"      ? yellow("file (~/.config/crucible/keys/)")
+      : src === "cache"     ? green("loaded (cache)")
+      : src === "session-only" ? cyan("session-only (in memory)")
+      : dim(src);
+    console.log(`    ${bold(label)}  ${indicator}`);
+  }
+  console.log();
+  done();
+}
+
 // ── help ──────────────────────────────────────────────────────────────────────
 
 function cmdHelp() {
@@ -1197,6 +1216,7 @@ function cmdHelp() {
     ${bold("crucible git")}          GitHub/git menu
     ${bold("crucible history")}      browse past sessions, proposals, actions
     ${bold("crucible repo refresh")} force-rebuild repo knowledge for current dir
+    ${bold("crucible keys status")}  show API key storage source (no values shown)
     ${bold("crucible models")}       show current model versions
     ${bold("crucible help")}         show this help
 
@@ -1342,6 +1362,10 @@ switch (cmd) {
       process.exit(1);
     }
     done(); break;
+  }
+  case "keys": {
+    if (rest[0] === "status") { cmdKeysStatus(); break; }
+    console.error(red(`\n  Usage: crucible keys status\n`)); process.exit(1);
   }
   case "history":  await cmdHistory(); break;
   case "models":   await cmdModels(); break;

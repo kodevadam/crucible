@@ -8,12 +8,12 @@
  *               with delta → each new commit logged to repo_changes
  */
 
-import { execSync }                            from "child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { join, extname, relative }             from "path";
 import Anthropic                               from "@anthropic-ai/sdk";
 import * as DB                                 from "./db.js";
 import { retrieveKey, SERVICE_ANTHROPIC }      from "./keys.js";
+import { gitq }                                from "./safety.js";
 
 // Lazy Anthropic client
 let _anthropic = null;
@@ -30,13 +30,6 @@ const MAX_SNAPSHOT_FILES   = 200;   // Max source files included in raw snapshot
 const MAX_FILE_BYTES       = 200_000; // Max bytes read per file
 const MAX_SNAPSHOT_CHARS   = 6_000; // Max aggregate chars for context injection
 const DIVERGENCE_THRESHOLD = 50;    // Warn when >N unprocessed commits
-
-// ── Shell helpers ─────────────────────────────────────────────────────────────
-
-function shq(cmd) {
-  try { return execSync(cmd, { encoding: "utf8", stdio: "pipe" }).trim(); }
-  catch { return ""; }
-}
 
 // ── Language detection ────────────────────────────────────────────────────────
 
@@ -167,11 +160,11 @@ function readKeyFiles(repoPath) {
 }
 
 function buildRawSnapshot(repoPath) {
-  const tree    = buildFileTree(repoPath);
-  const files   = readKeyFiles(repoPath);
-  const gitLog  = shq(`git -C "${repoPath}" log --oneline -20 2>/dev/null`);
-  const branches = shq(`git -C "${repoPath}" branch -a --format='%(refname:short)' 2>/dev/null | head -15`);
-  const remotes  = shq(`git -C "${repoPath}" remote -v 2>/dev/null | head -4`);
+  const tree     = buildFileTree(repoPath);
+  const files    = readKeyFiles(repoPath);
+  const gitLog   = gitq(repoPath, ["log", "--oneline", "-20"]);
+  const branches = gitq(repoPath, ["branch", "-a", "--format=%(refname:short)"]).split("\n").slice(0, 15).join("\n");
+  const remotes  = gitq(repoPath, ["remote", "-v"]).split("\n").slice(0, 4).join("\n");
 
   return [
     `=== FILE TREE ===\n${tree}`,
@@ -185,8 +178,23 @@ function buildRawSnapshot(repoPath) {
 // ── Count files ───────────────────────────────────────────────────────────────
 
 function countSourceFiles(repoPath) {
-  const result = shq(`find "${repoPath}" -type f -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/__pycache__/*" 2>/dev/null | wc -l`);
-  return parseInt(result) || 0;
+  let count = 0;
+  function walk(dir, depth = 0) {
+    if (depth > 5) return;
+    try {
+      for (const f of readdirSync(dir)) {
+        if (IGNORE_DIRS.has(f)) continue;
+        const full = join(dir, f);
+        try {
+          const stat = statSync(full);
+          if (stat.isDirectory()) walk(full, depth + 1);
+          else count++;
+        } catch { /* skip unreadable */ }
+      }
+    } catch { /* skip unreadable dir */ }
+  }
+  walk(repoPath);
+  return count;
 }
 
 // ── Claude calls ──────────────────────────────────────────────────────────────
@@ -271,23 +279,23 @@ async function detectStackSummary(rawSnapshot) {
 function getNewCommits(repoPath, sinceHash) {
   // Get all commits newer than sinceHash
   const range = sinceHash ? `${sinceHash}..HEAD` : "HEAD~20..HEAD";
-  const log   = shq(`git -C "${repoPath}" log ${range} --format="%H|%ai|%an|%s" 2>/dev/null`);
+  const log   = gitq(repoPath, ["log", range, "--format=%H|%ai|%an|%s"]);
   if (!log) return [];
 
   return log.split("\n").filter(Boolean).map(line => {
     const [hash, date, author, ...msgParts] = line.split("|");
-    const message  = msgParts.join("|");
-    const files    = shq(`git -C "${repoPath}" diff-tree --no-commit-id -r --name-only ${hash} 2>/dev/null`).split("\n").filter(Boolean);
+    const message = msgParts.join("|");
+    const files   = gitq(repoPath, ["diff-tree", "--no-commit-id", "-r", "--name-only", hash]).split("\n").filter(Boolean);
     return { hash, date, author, message, files };
   });
 }
 
 function getCurrentHead(repoPath) {
-  return shq(`git -C "${repoPath}" rev-parse HEAD 2>/dev/null`);
+  return gitq(repoPath, ["rev-parse", "HEAD"]);
 }
 
 function getHeadDate(repoPath) {
-  return shq(`git -C "${repoPath}" log -1 --format="%ai" 2>/dev/null`);
+  return gitq(repoPath, ["log", "-1", "--format=%ai"]);
 }
 
 // ── Main public function ──────────────────────────────────────────────────────

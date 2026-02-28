@@ -95,3 +95,26 @@ test("validateStagingPath: rejects undefined", () => {
 test("validateStagingPath: rejects empty string", () => {
   assert.throws(() => validateStagingPath("/repo", ""), /non-empty string/i);
 });
+
+// ── Windows-style paths on Linux ─────────────────────────────────────────────
+
+test("validateStagingPath: Windows absolute path C:\\... is relative on Linux", () => {
+  // On Linux, 'C:\\Users\\foo' is not isAbsolute(), so it's treated as a
+  // relative path with backslash in the name — should not throw and should
+  // remain inside the repo root.
+  const r = validateStagingPath("/repo", "C:\\Users\\foo");
+  assert.ok(typeof r === "string");
+  assert.ok(r.startsWith("/repo"));
+});
+
+test("validateStagingPath: Windows-style traversal C:\\..\\.. stays inside root", () => {
+  // '\\' is normalised to '/' on Linux but '..' is still checked
+  // If the path contains '..' after normalisation it must be rejected
+  // 'C:\..\..\ after normalize → still has '..' → rejected
+  // Note: on Linux, path.normalize("C:\\..\\..") = "C:\\..\\.." (no change)
+  // The split on /[/\\]/ will find ".." segments → rejected
+  assert.throws(
+    () => validateStagingPath("/repo", "C:\\..\\..\\etc\\passwd"),
+    /traversal/i
+  );
+});

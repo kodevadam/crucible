@@ -171,3 +171,34 @@ test("validateBranchName: rejects dollar sign", () => {
     /forbidden characters/i
   );
 });
+
+// ── Edge cases per security review ────────────────────────────────────────────
+
+test("validateBranchName: accepts refs/heads/foo style", () => {
+  // Slash is in the allowlist; full refspec-style names are valid
+  assert.equal(validateBranchName("refs/heads/foo"), "refs/heads/foo");
+});
+
+test("validateBranchName: rejects @{1} (reflog shorthand)", () => {
+  // '@' is not in the allowlist — caught as forbidden characters
+  assert.throws(
+    () => validateBranchName("@{1}"),
+    /forbidden characters/i
+  );
+});
+
+test("validateBranchName: rejects HEAD^ (parent ref)", () => {
+  // '^' is not in the allowlist
+  assert.throws(
+    () => validateBranchName("HEAD^"),
+    /forbidden characters/i
+  );
+});
+
+test("validateBranchName: rejects --foo (double-dash option-like name)", () => {
+  // Leading '-' is caught by the leading-dash check after allowlist passes
+  assert.throws(
+    () => validateBranchName("--foo"),
+    /cannot start with/i
+  );
+});

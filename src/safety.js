@@ -100,6 +100,7 @@ export function gitq(repoPath, args) {
   const r = spawnSync("git", ["-C", repoPath, ...args], {
     encoding: "utf8",
     stdio:    ["ignore", "pipe", "pipe"],
+    shell:    false,
   });
   return (r.stdout || "").trim();
 }
@@ -112,7 +113,7 @@ export function gitq(repoPath, args) {
  * shell interpolation.
  */
 export function gitExec(repoPath, args) {
-  const r = spawnSync("git", ["-C", repoPath, ...args], { stdio: "inherit" });
+  const r = spawnSync("git", ["-C", repoPath, ...args], { stdio: "inherit", shell: false });
   if (r.status !== 0 && r.status !== null) {
     throw new Error(`git ${args.join(" ")} failed (exit ${r.status})`);
   }
@@ -123,7 +124,7 @@ export function gitExec(repoPath, args) {
  * Output shown to user. Throws on non-zero exit.
  */
 export function ghExec(args) {
-  const r = spawnSync("gh", args, { stdio: "inherit" });
+  const r = spawnSync("gh", args, { stdio: "inherit", shell: false });
   if (r.status !== 0 && r.status !== null) {
     throw new Error(`gh ${args[0]} failed (exit ${r.status})`);
   }
@@ -137,6 +138,7 @@ export function ghq(args) {
   const r = spawnSync("gh", args, {
     encoding: "utf8",
     stdio:    ["ignore", "pipe", "pipe"],
+    shell:    false,
   });
   return (r.stdout || "").trim();
 }
