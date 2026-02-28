@@ -25,8 +25,8 @@ import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
 import { validateBranchName, gitq, gitExec, ghExec, ghq, shortHash,
          normalizeGitHubRepoInput, isSafeDeletionTarget }             from "./safety.js";
-import { getGhAuthStatus, runGhAuthLogin, runGhAuthLogout,
-         listUserRepos, listOrgRepos, searchRepos }                   from "./github.js";
+import { getGhAuthStatus, runGhAuthLogin, runGhAuthLogout, runGhAuthSetupGit,
+         listUserRepos, listCollaboratorRepos, listOrgRepos, searchRepos } from "./github.js";
 import { runChatSession }                                             from "./chat.js";
 import { selectBestGPTModel, selectBestClaudeModel,
          OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
@@ -399,23 +399,38 @@ const GITHUB_PAGE_SIZE = 20;
  * Returns the selected { nameWithOwner, name, isPrivate } object, or null
  * if the user cancels.
  */
+// View modes for the repo browser
+const BROWSER_VIEW_OWN          = "own";          // repos you own
+const BROWSER_VIEW_COLLABORATOR = "collaborator"; // repos you can push to but don't own
+const BROWSER_VIEW_ORG          = "org";          // specific user/org
+const BROWSER_VIEW_SEARCH       = "search";       // search results
+
 async function browseGitHubRepos() {
-  let repos       = [];
-  let page        = 0;
-  let searchQuery = null;
-  let orgHandle   = null;   // non-null when browsing another user/org
-  let fetched     = false;
+  let repos   = [];
+  let page    = 0;
+  let view    = BROWSER_VIEW_OWN;
+  let query   = null;   // search query or org handle, depending on view
+  let fetched = false;
 
   while (true) {
-    // ── Fetch (or re-fetch after filter change) ─────────────────────────────
+    // ── Fetch (or re-fetch after view/filter change) ─────────────────────────
     if (!fetched) {
       process.stdout.write(dim("  Fetching repos..."));
-      if (searchQuery) {
-        repos = searchRepos(searchQuery, { limit: 30 });
-      } else if (orgHandle) {
-        repos = listOrgRepos(orgHandle, { limit: 100 });
-      } else {
-        repos = listUserRepos({ limit: 100 });
+      switch (view) {
+        case BROWSER_VIEW_SEARCH:
+          repos = searchRepos(query, { limit: 30 });
+          break;
+        case BROWSER_VIEW_ORG:
+          repos = listOrgRepos(query, { limit: 100 });
+          break;
+        case BROWSER_VIEW_COLLABORATOR:
+          // Repos you can push to but don't own: org repos, invited collabs, team repos.
+          // This is where private repos shared with you by a team/org appear.
+          repos = listCollaboratorRepos({ limit: 100 });
+          break;
+        default: // BROWSER_VIEW_OWN
+          repos = listUserRepos({ limit: 100 });
+          break;
       }
       process.stdout.write("\r                      \r");
       fetched = true;
@@ -429,8 +444,10 @@ async function browseGitHubRepos() {
 
     console.log("");
     let header = bold(cyan("  GitHub Repos"));
-    if (searchQuery) header += dim(`  search: "${searchQuery}"`);
-    else if (orgHandle) header += dim(`  org/user: ${orgHandle}`);
+    if      (view === BROWSER_VIEW_SEARCH)       header += dim(`  search: "${query}"`);
+    else if (view === BROWSER_VIEW_ORG)           header += dim(`  org/user: ${query}`);
+    else if (view === BROWSER_VIEW_COLLABORATOR)  header += dim("  collaborator/team access");
+    else                                          header += dim("  mine");
     header += dim(`  (${repos.length} repos, page ${page + 1}/${totalPages})`);
     console.log(header);
     console.log(hr());
@@ -450,40 +467,39 @@ async function browseGitHubRepos() {
 
     console.log("");
     const hints = [
-      page > 0                            ? `${cyan("p")} prev`        : null,
-      start + GITHUB_PAGE_SIZE < repos.length ? `${cyan("n")} next`   : null,
+      page > 0                                    ? `${cyan("p")} prev`    : null,
+      start + GITHUB_PAGE_SIZE < repos.length     ? `${cyan("n")} next`   : null,
+      view !== BROWSER_VIEW_OWN                   ? `${cyan("m")} mine`   : null,
+      view !== BROWSER_VIEW_COLLABORATOR          ? `${cyan("c")} collab` : null,
       `${cyan("s")} search`,
-      `${cyan("o")} other user/org`,
-      searchQuery || orgHandle ? `${cyan("r")} reset` : null,
+      `${cyan("o")} org/user`,
       `${cyan("0")} cancel`,
     ].filter(Boolean).join("   ");
     console.log("  " + hints);
+    console.log(dim("  ⚿ = private repo"));
     console.log("");
 
     const ans = (await ask("  Enter # to select:")).trim().toLowerCase();
 
     if (ans === "0" || ans === "q" || ans === "") return null;
 
-    if (ans === "n") {
-      if (start + GITHUB_PAGE_SIZE < repos.length) page++;
-      continue;
+    if (ans === "n") { if (start + GITHUB_PAGE_SIZE < repos.length) page++; continue; }
+    if (ans === "p") { if (page > 0) page--; continue; }
+
+    if (ans === "m") {
+      view = BROWSER_VIEW_OWN; query = null; fetched = false; continue;
     }
-    if (ans === "p") {
-      if (page > 0) page--;
-      continue;
+    if (ans === "c") {
+      view = BROWSER_VIEW_COLLABORATOR; query = null; fetched = false; continue;
     }
     if (ans === "s") {
       const q = (await ask("  Search query:")).trim();
-      if (q) { searchQuery = q; orgHandle = null; fetched = false; }
+      if (q) { view = BROWSER_VIEW_SEARCH; query = q; fetched = false; }
       continue;
     }
     if (ans === "o") {
       const h = (await ask("  GitHub username or org:")).trim();
-      if (h) { orgHandle = h; searchQuery = null; fetched = false; }
-      continue;
-    }
-    if (ans === "r") {
-      searchQuery = null; orgHandle = null; fetched = false;
+      if (h) { view = BROWSER_VIEW_ORG; query = h; fetched = false; }
       continue;
     }
 
@@ -643,9 +659,17 @@ async function setupRepo() {
     const ok = runGhAuthLogin();
     if (ok) {
       const status = getGhAuthStatus();
-      crucibleSay(status.authed
-        ? `${green("Connected!")} Signed in as ${bold(status.username || "unknown")}`
-        : red("Login may not have completed — try again."));
+      if (status.authed) {
+        crucibleSay(`${green("Connected!")} Signed in as ${bold(status.username || "unknown")}`);
+        // Configure git credential helper so git push works on private repos
+        // via HTTPS without interactive prompts (GitHub dropped password auth).
+        process.stdout.write(dim("  Configuring git credential helper..."));
+        runGhAuthSetupGit();
+        process.stdout.write("\r                                         \r");
+        crucibleSay(green("git credential helper configured — private repo push ready."));
+      } else {
+        crucibleSay(red("Login may not have completed — try again."));
+      }
     } else {
       crucibleSay(red("GitHub login failed or was cancelled."));
     }
@@ -1375,12 +1399,16 @@ async function cmdRepoInfo() {
 // ── Git menu ──────────────────────────────────────────────────────────────────
 
 async function cmdGit() {
-  const repoPath = state.repoPath || process.cwd();
-  if (!inGitRepo(repoPath)) { crucibleSay(red("Not inside a git repo.")); done(); return; }
-  if (!ghInstalled())       { crucibleSay(red("Run setup-crucible-git.sh first.")); done(); return; }
+  // repoPath is re-evaluated each iteration so that after a clone the new
+  // repo becomes the active target for subsequent operations.
+  if (!ghInstalled()) { crucibleSay(red("Run setup-crucible-git.sh first.")); done(); return; }
 
   let running = true;
   while (running) {
+    // Re-read each iteration so state.repoPath updates (e.g. after clone) take effect
+    const repoPath = state.repoPath || process.cwd();
+    if (!inGitRepo(repoPath)) { crucibleSay(red("Not inside a git repo.")); done(); return; }
+
     const branch    = currentBranch(repoPath);
     const ghAuth    = getGhAuthStatus();
     const authLabel = ghAuth.authed
@@ -1448,6 +1476,8 @@ async function cmdGit() {
       }
       case 4: {
         // Clone — offer browser if authed, else prompt URL
+        let cloneTarget = null;  // { nameWithOwner, name }
+
         if (ghAuth.authed) {
           console.log(`  ${cyan("1")}  Browse & pick from my GitHub repos`);
           console.log(`  ${cyan("2")}  Enter URL / owner/name manually`);
@@ -1456,23 +1486,30 @@ async function cmdGit() {
           if (cloneMode === "1") {
             const selected = await browseGitHubRepos();
             if (!selected) { crucibleSay("Cancelled."); break; }
-            try {
-              ghExec(["repo", "clone", selected.nameWithOwner]);
-              console.log(green("\n  ✔ Cloned\n"));
-            } catch (err) {
-              crucibleSay(`${red("Clone failed:")} ${err.message}`);
-            }
-            break;
+            cloneTarget = selected;
           }
         }
-        const url = await ask("  Repo URL or owner/name:");
-        if (url.trim()) {
-          try {
-            ghExec(["repo", "clone", normalizeGitHubRepoInput(url)]);
-            console.log(green("\n  ✔ Cloned\n"));
-          } catch (err) {
-            crucibleSay(`${red("Clone failed:")} ${err.message}`);
-          }
+
+        if (!cloneTarget) {
+          const url = (await ask("  Repo URL or owner/name:")).trim();
+          if (!url) break;
+          const nwo = normalizeGitHubRepoInput(url);
+          cloneTarget = { nameWithOwner: nwo, name: nwo.split("/").pop() || nwo };
+        }
+
+        const defaultDest = join(homedir(), ".crucible", "repos", cloneTarget.name);
+        const dest = (await ask("  Clone to:", { defaultVal: defaultDest })).trim() || defaultDest;
+        try {
+          ghExec(["repo", "clone", cloneTarget.nameWithOwner, dest]);
+          const clonedPath = resolve(dest);
+          console.log(green(`\n  ✔ Cloned to ${clonedPath}\n`));
+          // Make this repo active in crucible
+          state.repoPath = clonedPath;
+          state.repoUrl  = cloneTarget.nameWithOwner;
+          DB.updateSession(state.sessionId, { repoPath: state.repoPath, repoUrl: state.repoUrl });
+          crucibleSay(`Active repo switched to ${yellow(clonedPath)}`);
+        } catch (err) {
+          crucibleSay(`${red("Clone failed:")} ${err.message}`);
         }
         break;
       }
@@ -1512,16 +1549,24 @@ async function cmdGit() {
           // Browse repos
           const selected = await browseGitHubRepos();
           if (selected) {
+            const privTag = selected.isPrivate ? dim(" (private)") : "";
             console.log("");
-            console.log(`  ${cyan("1")}  Clone ${selected.nameWithOwner}`);
+            console.log(`  ${cyan("1")}  Clone ${selected.nameWithOwner}${privTag} and make it active`);
             console.log(`  ${cyan("2")}  Just copy the name (for manual use)`);
             console.log(`  ${cyan("0")}  Cancel`);
             console.log("");
             const repoAction = (await ask("  ›")).trim();
             if (repoAction === "1") {
+              const defaultDest = join(homedir(), ".crucible", "repos", selected.name);
+              const dest = (await ask("  Clone to:", { defaultVal: defaultDest })).trim() || defaultDest;
               try {
-                ghExec(["repo", "clone", selected.nameWithOwner]);
-                console.log(green(`\n  ✔ Cloned ${selected.nameWithOwner}\n`));
+                ghExec(["repo", "clone", selected.nameWithOwner, dest]);
+                const clonedPath = resolve(dest);
+                console.log(green(`\n  ✔ Cloned to ${clonedPath}\n`));
+                state.repoPath = clonedPath;
+                state.repoUrl  = selected.nameWithOwner;
+                DB.updateSession(state.sessionId, { repoPath: state.repoPath, repoUrl: state.repoUrl });
+                crucibleSay(`Active repo switched to ${yellow(clonedPath)}`);
               } catch (err) {
                 crucibleSay(`${red("Clone failed:")} ${err.message}`);
               }
@@ -1535,9 +1580,15 @@ async function cmdGit() {
           const ok = runGhAuthLogin();
           if (ok) {
             const status = getGhAuthStatus();
-            crucibleSay(status.authed
-              ? `${green("Connected!")} Signed in as ${bold(status.username || "unknown")}`
-              : red("Login may not have completed — run 'gh auth login' manually."));
+            if (status.authed) {
+              crucibleSay(`${green("Connected!")} Signed in as ${bold(status.username || "unknown")}`);
+              process.stdout.write(dim("  Configuring git credential helper..."));
+              runGhAuthSetupGit();
+              process.stdout.write("\r                                         \r");
+              crucibleSay(green("git credential helper configured — private repo push ready."));
+            } else {
+              crucibleSay(red("Login may not have completed — run 'gh auth login' manually."));
+            }
           } else {
             crucibleSay(red("GitHub login failed or was cancelled."));
           }

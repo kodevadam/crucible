@@ -10,10 +10,12 @@
  * Public API:
  *   getGhAuthStatus()           → { installed, authed, username }
  *   listUserRepos(opts)         → repo[]
+ *   listCollaboratorRepos(opts) → repo[] (repos you can push to but don't own)
  *   listOrgRepos(handle, opts)  → repo[]
  *   searchRepos(query, opts)    → repo[]
  *   runGhAuthLogin()            → bool
  *   runGhAuthLogout()           → bool
+ *   runGhAuthSetupGit()         → bool (configure git credential helper)
  */
 
 import { spawnSync } from "child_process";
@@ -113,6 +115,22 @@ export function runGhAuthLogout() {
   return ghInteractive(["auth", "logout"]);
 }
 
+/**
+ * Configure git to use gh as the HTTPS credential helper for github.com.
+ *
+ * This is required for `git push` to work on private repos cloned via HTTPS
+ * without interactive password prompts.  GitHub removed password auth in
+ * August 2021, so without this, plain git push will fail with a 403.
+ *
+ * Equivalent to: gh auth setup-git
+ * Safe to call multiple times — idempotent.
+ *
+ * Returns true if setup succeeded.
+ */
+export function runGhAuthSetupGit() {
+  return ghInteractive(["auth", "setup-git"]);
+}
+
 // ── Repo listing ──────────────────────────────────────────────────────────────
 
 const REPO_JSON_FIELDS = "nameWithOwner,name,description,isPrivate,updatedAt";
@@ -135,6 +153,37 @@ export function listUserRepos({ limit = 60, source = false } = {}) {
   ];
   if (source) args.push("--source");
   return parseJson(ghCapture(args));
+}
+
+/**
+ * List repositories the authenticated user can push to but does not own.
+ *
+ * Uses the GitHub REST API to find repos where the user's permission is
+ * "push", "maintain", or "admin" — meaning they are a collaborator, team
+ * member, or org member with write access.  This covers:
+ *   - Private repos owned by an organisation you belong to
+ *   - Repos you've been invited to as a collaborator
+ *   - Repos where you're a team maintainer
+ *
+ * opts.limit: max repos to return (default 60, capped at 100)
+ *
+ * Returns same shape as listUserRepos.
+ */
+export function listCollaboratorRepos({ limit = 60 } = {}) {
+  // gh api lets us paginate the /user/repos endpoint with affiliation filter.
+  // affiliation=collaborator returns repos you're an explicit collaborator on.
+  // affiliation=organization_member returns org repos you're a member for.
+  // We request both to cover all write-access cases.
+  const cap  = Math.min(Math.max(1, limit), 100);
+  const raw  = ghCapture([
+    "api", "/user/repos",
+    "--method", "GET",
+    "--field", `affiliation=collaborator,organization_member`,
+    "--field", `per_page=${cap}`,
+    "--field", "sort=updated",
+    "--jq", `[.[] | {nameWithOwner: (.full_name), name: (.name), description: (.description // ""), isPrivate: (.private), updatedAt: (.updated_at)}]`,
+  ]);
+  return parseJson(raw);
 }
 
 /**
