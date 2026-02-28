@@ -171,23 +171,29 @@ export function storeKey(service, key) {
 
 /**
  * Retrieve a key.
- * Priority: in-process cache → env vars (compatibility) → keychain → file
+ * Priority: in-process cache → keychain → file → env vars (legacy fallback)
  * Returns null if not found.
+ *
+ * Secure storage (keychain/file) takes priority over env vars so that a
+ * correctly-installed key is never shadowed by a stale or placeholder env var
+ * (e.g. OPENAI_API_KEY=local-only set by a hosting environment).
  */
 export function retrieveKey(service) {
   if (_cache.has(service)) return _cache.get(service);
 
-  // Honour legacy env vars so existing users don't need to re-install
+  if (!SESSION_ONLY) {
+    const key = keychainRead(service) ?? fileRead(service) ?? null;
+    if (key) { _cache.set(service, key); return key; }
+  }
+
+  // Honour legacy env vars as a final fallback so existing users who rely on
+  // environment-variable keys (and have never run install) still work.
   if (service === SERVICE_OPENAI    && process.env.OPENAI_API_KEY)
     return process.env.OPENAI_API_KEY;
   if (service === SERVICE_ANTHROPIC && process.env.ANTHROPIC_API_KEY)
     return process.env.ANTHROPIC_API_KEY;
 
-  if (SESSION_ONLY) return null;
-
-  const key = keychainRead(service) ?? fileRead(service) ?? null;
-  if (key) _cache.set(service, key);
-  return key;
+  return null;
 }
 
 /**
