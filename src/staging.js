@@ -31,7 +31,7 @@ function getAnthropic() {
 
 async function askClaude(messages, maxTokens = 3000) {
   const res = await getAnthropic().messages.create({
-    model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
+    model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
     max_tokens: maxTokens,
     messages,
   });

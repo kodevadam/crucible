@@ -140,26 +140,11 @@ function ghInstalled()   {
 async function getLatestGPTModel() {
   try {
     const { data: models } = await getOpenAI().models.list();
-    const chat = models.map(m=>m.id).filter(id => /^gpt-(4|5)/.test(id) && !EXCLUDE.test(id));
-    const candidates = [];
     for (const pat of PRIORITY) {
-      const tier = chat.filter(id=>pat.test(id)).sort().reverse();
-      if (!tier.length) continue;
-      const chatLatest = tier.find(id => id.includes("chat-latest"));
-      const dated      = tier.find(id => !id.includes("chat-latest") && (/\d{4}-\d{2}-\d{2}/.test(id) || /\d{8}/.test(id)));
-      const rest       = tier.filter(id => id !== chatLatest && id !== dated);
-      if (chatLatest) candidates.push(chatLatest);
-      if (dated)      candidates.push(dated);
-      candidates.push(...rest);
-    }
-    for (const model of candidates) {
-      try {
-        await getOpenAI().chat.completions.create({ model, max_tokens:1, messages:[{ role:"user", content:"hi" }] });
-        return model;
-      } catch(e) {
-        if (e.status === 404 || e.status === 400) continue;
-        throw e;
-      }
+      const tier = models
+        .filter(m => pat.test(m.id) && !EXCLUDE.test(m.id))
+        .sort((a, b) => b.created - a.created);
+      if (tier.length) return tier[0].id;
     }
     return "gpt-4o";
   } catch { return "gpt-4o"; }
@@ -168,11 +153,11 @@ async function getLatestGPTModel() {
 async function getLatestClaudeModel() {
   try {
     const { data: models } = await getAnthropic().models.list();
-    return models
+    const sonnet = models
       .filter(m => m.id.includes("sonnet"))
-      .sort((a,b) => new Date(b.created_at) - new Date(a.created_at))[0]?.id
-      || "claude-sonnet-4-20250514";
-  } catch { return "claude-sonnet-4-20250514"; }
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    return sonnet[0]?.id || "claude-sonnet-4-6";
+  } catch { return "claude-sonnet-4-6"; }
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
