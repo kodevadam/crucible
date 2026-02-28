@@ -12,8 +12,6 @@
  *   crucible help
  */
 
-import OpenAI    from "openai";
-import Anthropic from "@anthropic-ai/sdk";
 import { spawnSync }            from "child_process";
 import { createInterface }      from "readline";
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
@@ -23,31 +21,13 @@ import { analyseRepo, getRepoSummary, getChangeLog, clearRepoKnowledge } from ".
 import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers } from "./staging.js";
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
 import { validateBranchName, gitq, gitExec, ghExec, ghq } from "./safety.js";
+import { selectBestGPTModel, selectBestClaudeModel,
+         OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
+import { getOpenAI, getAnthropic }                        from "./providers.js";
 
-// Keys retrieved from secure store (keychain or file), with env var fallback
-let _openai    = null;
-let _anthropic = null;
-
-function getOpenAI() {
-  if (!_openai) {
-    const key = retrieveKey(SERVICE_OPENAI) || "";
-    _openai = new OpenAI({ apiKey: key });
-  }
-  return _openai;
-}
-
-function getAnthropic() {
-  if (!_anthropic) {
-    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
-    _anthropic = new Anthropic({ apiKey: key });
-  }
-  return _anthropic;
-}
 
 const MAX_ROUNDS         = parseInt(process.env.MAX_ROUNDS || "10");
 const CONVERGENCE_PHRASE = "I AGREE WITH THIS PLAN";
-const EXCLUDE  = /transcribe|search|realtime|audio|vision|preview|tts|whisper|dall-e|instruct|embed|codex/i;
-const PRIORITY = [/^gpt-5/, /^gpt-4\.5/, /^gpt-4o/, /^gpt-4/];
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
@@ -137,42 +117,87 @@ function ghInstalled()   {
 
 // ── Model detection ───────────────────────────────────────────────────────────
 
+// In-memory cache so repeated calls within a session (models command, new
+// session, resume, etc.) hit the network only once per 60 seconds.
+const MODEL_CACHE_TTL = 60_000;
+const _modelCache = new Map();
+
+async function cachedModels(key, fetcher) {
+  const now = Date.now();
+  const hit = _modelCache.get(key);
+  if (hit && now - hit.ts < MODEL_CACHE_TTL) return hit.data;
+  const data = await fetcher();
+  _modelCache.set(key, { data, ts: now });
+  return data;
+}
+
+function warnFallback(provider, fallback, envVar) {
+  console.error(
+    `  [crucible] Could not list ${provider} models — falling back to ${fallback}.` +
+    ` Set ${envVar} to pin a specific model.`
+  );
+}
+
+/**
+ * Emit a single debug line to stderr when CRUCIBLE_DEBUG=1.
+ * Shows model name, key source type (never the key value), model-list cache
+ * age, and how the model was chosen.  Safe to call on every hot path because
+ * the guard is a cheap env-var check.
+ *
+ * @param {"openai"|"anthropic"} provider
+ * @param {string} model      - resolved model ID
+ * @param {string} via        - "env-pin" | "api-detected" | "fallback"
+ * @param {string} cacheKey   - key used in _modelCache ("openai"|"anthropic")
+ */
+function debugLine(provider, model, via, cacheKey) {
+  if (!process.env.CRUCIBLE_DEBUG) return;
+  const service  = provider === "openai" ? SERVICE_OPENAI : SERVICE_ANTHROPIC;
+  const keySrc   = getKeySource(service);
+  const hit      = _modelCache.get(cacheKey);
+  const cacheAge = hit ? (Date.now() - hit.ts < 2000 ? "fresh" : `${Math.round((Date.now() - hit.ts) / 1000)}s ago`) : "not cached";
+  process.stderr.write(
+    `[crucible:debug] ${provider.padEnd(9)}  model=${model}  key=${keySrc}  list=${cacheAge}  via=${via}\n`
+  );
+}
+
 async function getLatestGPTModel() {
+  if (process.env.OPENAI_MODEL) {
+    debugLine("openai", process.env.OPENAI_MODEL, "env-pin", "openai");
+    return process.env.OPENAI_MODEL;
+  }
   try {
-    const { data: models } = await getOpenAI().models.list();
-    const chat = models.map(m=>m.id).filter(id => /^gpt-(4|5)/.test(id) && !EXCLUDE.test(id));
-    const candidates = [];
-    for (const pat of PRIORITY) {
-      const tier = chat.filter(id=>pat.test(id)).sort().reverse();
-      if (!tier.length) continue;
-      const chatLatest = tier.find(id => id.includes("chat-latest"));
-      const dated      = tier.find(id => !id.includes("chat-latest") && (/\d{4}-\d{2}-\d{2}/.test(id) || /\d{8}/.test(id)));
-      const rest       = tier.filter(id => id !== chatLatest && id !== dated);
-      if (chatLatest) candidates.push(chatLatest);
-      if (dated)      candidates.push(dated);
-      candidates.push(...rest);
-    }
-    for (const model of candidates) {
-      try {
-        await getOpenAI().chat.completions.create({ model, max_tokens:1, messages:[{ role:"user", content:"hi" }] });
-        return model;
-      } catch(e) {
-        if (e.status === 404 || e.status === 400) continue;
-        throw e;
-      }
-    }
-    return "gpt-4o";
-  } catch { return "gpt-4o"; }
+    const models = await cachedModels("openai", () =>
+      getOpenAI().models.list().then(r => r.data));
+    const best = selectBestGPTModel(models);
+    if (best) { debugLine("openai", best, "api-detected", "openai"); return best; }
+    warnFallback("OpenAI", OPENAI_FALLBACK, "OPENAI_MODEL");
+    debugLine("openai", OPENAI_FALLBACK, "fallback", "openai");
+    return OPENAI_FALLBACK;
+  } catch {
+    warnFallback("OpenAI", OPENAI_FALLBACK, "OPENAI_MODEL");
+    debugLine("openai", OPENAI_FALLBACK, "fallback", "openai");
+    return OPENAI_FALLBACK;
+  }
 }
 
 async function getLatestClaudeModel() {
+  if (process.env.CLAUDE_MODEL) {
+    debugLine("anthropic", process.env.CLAUDE_MODEL, "env-pin", "anthropic");
+    return process.env.CLAUDE_MODEL;
+  }
   try {
-    const { data: models } = await getAnthropic().models.list();
-    return models
-      .filter(m => m.id.includes("sonnet"))
-      .sort((a,b) => new Date(b.created_at) - new Date(a.created_at))[0]?.id
-      || "claude-sonnet-4-20250514";
-  } catch { return "claude-sonnet-4-20250514"; }
+    const models = await cachedModels("anthropic", () =>
+      getAnthropic().models.list().then(r => r.data));
+    const best = selectBestClaudeModel(models);
+    if (best) { debugLine("anthropic", best, "api-detected", "anthropic"); return best; }
+    warnFallback("Anthropic", CLAUDE_FALLBACK, "CLAUDE_MODEL");
+    debugLine("anthropic", CLAUDE_FALLBACK, "fallback", "anthropic");
+    return CLAUDE_FALLBACK;
+  } catch {
+    warnFallback("Anthropic", CLAUDE_FALLBACK, "CLAUDE_MODEL");
+    debugLine("anthropic", CLAUDE_FALLBACK, "fallback", "anthropic");
+    return CLAUDE_FALLBACK;
+  }
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -800,6 +825,7 @@ async function offerStagingAndCommit(task, finalPlan, round) {
       plan:             finalPlan,
       repoUnderstanding: state.repoContext,
       onStatus:         msg => systemMsg(msg),
+      claudeModel:      state.claudeModel,
     });
     if (r.staged.length) await commitStagedFiles(task, r.staged, round);
   } else {
@@ -1152,7 +1178,7 @@ async function interactiveSession() {
         if (rewrites.length) {
           await commitStagedFiles(p.title, rewrites, p.rounds||0);
         } else if (p.final_plan) {
-          const r = await runStagingFlow({ proposalId: p.id, repoPath: state.repoPath, plan: p.final_plan, repoUnderstanding: state.repoContext, onStatus: msg => systemMsg(msg) });
+          const r = await runStagingFlow({ proposalId: p.id, repoPath: state.repoPath, plan: p.final_plan, repoUnderstanding: state.repoContext, onStatus: msg => systemMsg(msg), claudeModel: state.claudeModel });
           if (r.staged.length) await commitStagedFiles(p.title, r.staged, p.rounds||0);
         }
       }
@@ -1327,6 +1353,7 @@ switch (cmd) {
           plan,
           repoUnderstanding: state.repoContext,
           onStatus: msg => systemMsg(msg),
+          claudeModel: state.claudeModel,
         }).then(async r => {
           if (r.staged.length) await commitStagedFiles(p.title, r.staged, p.rounds || 0);
         });

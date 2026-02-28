@@ -10,20 +10,10 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { join, extname, relative }             from "path";
-import Anthropic                               from "@anthropic-ai/sdk";
 import * as DB                                 from "./db.js";
-import { retrieveKey, SERVICE_ANTHROPIC }      from "./keys.js";
 import { gitq }                                from "./safety.js";
-
-// Lazy Anthropic client
-let _anthropic = null;
-function getAnthropic() {
-  if (!_anthropic) {
-    const key = retrieveKey(SERVICE_ANTHROPIC) || "";
-    _anthropic = new Anthropic({ apiKey: key });
-  }
-  return _anthropic;
-}
+import { getAnthropic }                        from "./providers.js";
+import { CLAUDE_FALLBACK }                     from "./models.js";
 
 // Token/size budget constants
 const MAX_SNAPSHOT_FILES   = 200;   // Max source files included in raw snapshot
@@ -199,16 +189,16 @@ function countSourceFiles(repoPath) {
 
 // ── Claude calls ──────────────────────────────────────────────────────────────
 
-async function askClaude(prompt, maxTokens = 2000) {
+async function askClaude(prompt, maxTokens = 2000, model = process.env.CLAUDE_MODEL || CLAUDE_FALLBACK) {
   const res = await getAnthropic().messages.create({
-    model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
+    model,
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
   });
   return res.content[0].text;
 }
 
-async function synthesiseUnderstanding(repoPath, rawSnapshot) {
+async function synthesiseUnderstanding(repoPath, rawSnapshot, model) {
   // Cap snapshot to avoid huge token bills; MAX_SNAPSHOT_CHARS*2 gives headroom
   // for the prompt itself while staying within model context limits.
   const snapshotForPrompt = rawSnapshot.slice(0, Math.max(12000, MAX_SNAPSHOT_CHARS * 2));
@@ -231,10 +221,10 @@ Repository: ${repoPath}
 
 ${snapshotForPrompt}`;
 
-  return askClaude(prompt, 2500);
+  return askClaude(prompt, 2500, model);
 }
 
-async function updateUnderstanding(repoPath, existingUnderstanding, deltaContext) {
+async function updateUnderstanding(repoPath, existingUnderstanding, deltaContext, model) {
   const prompt = `You have an existing understanding of a codebase. New changes have been made since you last analysed it.
 Update your understanding to reflect what has changed, been added, or been removed.
 Keep everything that is still accurate. Remove or correct anything outdated. Add new details from the changes.
@@ -248,26 +238,26 @@ ${existingUnderstanding}
 CHANGES SINCE LAST ANALYSIS:
 ${deltaContext}`;
 
-  return askClaude(prompt, 2500);
+  return askClaude(prompt, 2500, model);
 }
 
-async function summariseCommitDelta(repoPath, commits) {
+async function summariseCommitDelta(repoPath, commits, model) {
   // For each batch of commits, ask Claude for a plain-English summary
   const commitText = commits.map(c => `${c.hash.slice(0,8)} ${c.date} ${c.author}: ${c.message}\n  Files: ${c.files.slice(0,8).join(", ")}`).join("\n");
 
   const prompt = `Summarise these git commits from the repository at ${repoPath} in 2-3 plain-English sentences describing what changed overall. Be specific about what was added, modified, or removed.\n\n${commitText}`;
 
   try {
-    return await askClaude(prompt, 300);
+    return await askClaude(prompt, 300, model);
   } catch {
     return commits.map(c => c.message).join("; ");
   }
 }
 
-async function detectStackSummary(rawSnapshot) {
+async function detectStackSummary(rawSnapshot, model) {
   const prompt = `Given this repository snapshot, produce a short one-line tech stack summary (e.g. "Node/Express + Postgres + React" or "Python/FastAPI + SQLite + Alpine.js"). Be brief — max 60 chars.\n\n${rawSnapshot.slice(0, 3000)}`;
   try {
-    const s = await askClaude(prompt, 80);
+    const s = await askClaude(prompt, 80, model);
     return s.trim().replace(/^["']|["']$/g, "");
   } catch {
     return "Unknown stack";
@@ -309,7 +299,7 @@ function getHeadDate(repoPath) {
  * Returns { understanding, stackSummary, isFirstVisit, newCommitCount }
  */
 export async function analyseRepo(repoPath, repoUrl, { claudeModel, onStatus } = {}) {
-  if (claudeModel) process.env.CLAUDE_MODEL = claudeModel;
+  const model = claudeModel || process.env.CLAUDE_MODEL || CLAUDE_FALLBACK;
 
   const status = onStatus || (msg => process.stderr.write(`[repo] ${msg}\n`));
 
@@ -327,8 +317,8 @@ export async function analyseRepo(repoPath, repoUrl, { claudeModel, onStatus } =
     const rawSnapshot  = buildRawSnapshot(repoPath);
     status("Reading files...");
     const [understanding, stackSummary] = await Promise.all([
-      synthesiseUnderstanding(repoPath, rawSnapshot),
-      detectStackSummary(rawSnapshot),
+      synthesiseUnderstanding(repoPath, rawSnapshot, model),
+      detectStackSummary(rawSnapshot, model),
     ]);
     status("Understanding built.");
 
@@ -404,7 +394,7 @@ export async function analyseRepo(repoPath, repoUrl, { claudeModel, onStatus } =
   status(`${newCommits.length} new commit(s) since last visit — updating understanding...`);
 
   // Summarise the delta
-  const deltaSummary = await summariseCommitDelta(repoPath, newCommits);
+  const deltaSummary = await summariseCommitDelta(repoPath, newCommits, model);
 
   // Build delta context
   const changedFiles  = [...new Set(newCommits.flatMap(c => c.files))];
@@ -431,12 +421,13 @@ export async function analyseRepo(repoPath, repoUrl, { claudeModel, onStatus } =
   const updatedUnderstanding = await updateUnderstanding(
     repoPath,
     existing.understanding,
-    deltaContext
+    deltaContext,
+    model
   );
 
   // Refresh raw snapshot
   const rawSnapshot = buildRawSnapshot(repoPath);
-  const stackSummary = existing.stack_summary || await detectStackSummary(rawSnapshot);
+  const stackSummary = existing.stack_summary || await detectStackSummary(rawSnapshot, model);
 
   DB.saveRepoKnowledge(repoPath, {
     repoUrl:         repoUrl || existing.repo_url,
