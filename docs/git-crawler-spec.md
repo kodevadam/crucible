@@ -1,7 +1,7 @@
 # Crucible Git Crawler Module — Implementation Specification
 
-**Version:** 1.0.0-draft
-**Status:** Ready for implementation
+**Version:** 1.1.0
+**Status:** Ready for implementation (refined per cross-model review)
 **Target:** `src/crawl.js` + `src/crawl-safety.js` + DB migration in `src/db.js`
 
 ---
@@ -96,6 +96,33 @@ allows `crucible crawl search ripgrep --format json | jq .` to work.
 | 2 | Safety validation failure (plan rejected) |
 | 3 | Schema validation failure (internal bug — output failed schema check) |
 | 4 | Rate limit exhausted after retries |
+
+> **Exit code alignment note:** Existing Crucible uses only exit code 1 for
+> all errors (confirmed by audit of `src/cli.js`). Codes 2, 3, 4 are
+> unused and reserved here for the crawl module. If future Crucible modules
+> adopt structured exit codes, these should be promoted to a shared
+> constant file. For now, they are crawl-specific and do not conflict.
+
+### 1.7 Network Surface Constraint
+
+**All network access in the crawl module is restricted to exactly two
+mechanisms. There are no exceptions.**
+
+| Allowed | Mechanism | Purpose |
+|---|---|---|
+| GitHub API calls | `gh` CLI only (via `ghCapture()` / `spawnSync("gh", ...)`) | Search, repo metadata, tarball download |
+| Git clone | `git clone --depth 1` (via `spawnSync("git", ...)`) | Repo checkout for inspection |
+
+**Explicitly prohibited:**
+- No `fetch()`, `axios`, `http.get()`, `https.get()`, or any Node.js HTTP client.
+- No `curl`, `wget`, or any shell HTTP tool.
+- No direct GitHub REST/GraphQL calls bypassing `gh`.
+- No DNS lookups, socket connections, or any network I/O outside the two mechanisms above.
+- LLM API calls (OpenAI, Anthropic) go through `getOpenAI()` / `getAnthropic()` from `providers.js` — these are the only additional network touchpoints, and they are existing infrastructure, not new code.
+
+**Rationale:** The `gh` CLI handles authentication, rate limiting, and
+pagination. Routing all GitHub access through it keeps the security surface
+minimal and auditable.
 
 ---
 
@@ -232,6 +259,21 @@ namespaced by session ID. This directory is cleaned up at session end.
 When a cap is hit, log a warning to stderr and continue with what was
 collected. Set `sampling_truncated: true` in the inspection summary.
 
+**Enforcement point:** Sampling caps are enforced at the **filesystem
+sampling layer** (the function that walks the repo and reads files), NOT
+at the prompt construction layer. By the time prompt text is assembled,
+all repo-derived content has already been truncated to within caps. This
+means:
+
+1. The file walker tracks cumulative bytes and file count.
+2. It stops reading new files once any cap is hit.
+3. The returned content is guaranteed to be within bounds.
+4. Prompt construction receives pre-truncated data and does not apply
+   its own truncation (no double-truncation, no silent data loss).
+
+This is a hard invariant — tests must verify that the sampling function
+itself enforces caps, independent of how its output is consumed.
+
 ### 3.3 Safe File Allowlist
 
 Only files matching these patterns are read. All others are skipped.
@@ -284,7 +326,11 @@ node_modules/, .git/, dist/, build/, target/, vendor/, __pycache__/,
 ### 3.4 Build System Detection
 
 Detection is purely heuristic — check for presence of known files at repo root
-and one level deep. No execution.
+and one level deep. No execution. **No LLM involvement in build detection.**
+The LLM may later *explain* the detected build system in plan drafting, but
+it MUST NOT *infer*, *override*, or *supplement* the file-based detection.
+The `build_system` and `confidence` values in the inspection artifact are
+set exclusively by the deterministic detection function.
 
 | Build System | Detection Files | Confidence |
 |---|---|---|
@@ -423,6 +469,14 @@ const VivGitInspectV1 = z.object({
 
 **Required keys always present:** All fields shown above. `sub_projects` may
 be `[]`. `readme_excerpt` may be `""`.
+
+**Truncation transparency:** When `sampling_truncated` is `true`, the
+following must also hold:
+- `warnings` array in any downstream `viv-git-plan.v1` must include a
+  string: `"Inspection data was truncated due to sampling caps. Plan may be incomplete."`
+- The `crawl_artifacts` DB row for this inspect artifact must have
+  `sampling_truncated` visible in the stored JSON content.
+- stderr must log: `[crawl] Warning: sampling caps reached — {files_hit}/{bytes_hit} — results may be incomplete`
 
 ### 4.3 `viv-git-plan.v1`
 
@@ -683,6 +737,15 @@ and workspace path.
 | 3 | Synthesis | Yes | GPT synthesizes | 4000 | crawl_artifacts (plan) |
 | 4 | Export | No | Deterministic | N/A | crawl_artifacts (recipe, manifest) |
 
+> **BINDING OWNERSHIP DECISION (do not reinterpret):**
+> GPT owns drafting, revision, and synthesis. Claude owns critique and
+> approval. This is intentional — GPT generates, Claude validates. This
+> mirrors the existing Crucible debate pattern in `cli.js` where GPT and
+> Claude have distinct roles. Implementations MUST NOT reassign synthesis
+> to Claude or critique to GPT. If the broader Crucible direction changes
+> ownership in the future, that is a separate spec revision, not an
+> implementation decision.
+
 ### 6.2 Phase 2 — Plan Draft and Debate
 
 #### 6.2.1 Draft (GPT)
@@ -815,6 +878,28 @@ Output ONLY valid JSON. No markdown fences, no preamble.
 - **Early termination:** If `critique.approved === true`, skip remaining rounds.
 - **Deadlock:** If max rounds exhausted and still not approved, proceed to synthesis
   with the last revision and all unresolved issues logged as warnings.
+
+**Enforcement mechanism (programmatic, not prompt-based):**
+
+The debate loop is a `for` loop with a hard `maxRounds` counter. The loop
+variable is an integer that increments by 1 per round. The loop breaks
+when `round >= maxRounds` OR `critique.approved === true`. This is
+enforced in code — the prompt does not ask the LLM to track or respect
+round counts. The LLM has no ability to request additional rounds.
+
+```javascript
+const maxRounds = Math.min(flags.maxDebateRounds ?? 2, 4); // hard cap
+for (let round = 0; round < maxRounds; round++) {
+  // ... GPT revision, Claude critique ...
+  if (critique.approved) break;
+}
+```
+
+**Token budget enforcement:** Token budgets (`max_tokens` parameter) are
+set on the API call itself, not communicated as a prompt instruction. The
+`max_tokens` value is a constant passed to `getOpenAI().chat.completions.create()`
+/ `getAnthropic().messages.create()`. The LLM cannot exceed it regardless
+of what the prompt says.
 
 ### 6.3 Phase 3 — Synthesis (GPT)
 
@@ -1156,7 +1241,19 @@ describe("build system detection")
   test("no build files → unknown with confidence 0.0")
 ```
 
-#### 9.1.3 Monorepo Detection
+#### 9.1.3 Sampling Cap Enforcement
+
+```
+describe("sampling cap enforcement")
+  test("stops reading after 200 files")
+  test("stops reading after 200KB per file")
+  test("stops reading after 2MB total bytes")
+  test("sets sampling_truncated: true when any cap is hit")
+  test("caps are enforced in the file walker, not in prompt construction")
+  test("returned content byte count is within 2MB bound")
+```
+
+#### 9.1.4 Monorepo Detection
 
 ```
 describe("monorepo detection")
@@ -1280,6 +1377,30 @@ Add to `package.json`:
 
 ---
 
+## Appendix Z: Mandatory Infrastructure Reuse
+
+The following existing helpers MUST be imported and used. Reimplementing
+any of them is a bug.
+
+| Helper | Source | Used For |
+|---|---|---|
+| `safeEnv()` | `src/safety.js` | Environment for all `spawnSync` calls |
+| `ghCapture(args)` pattern | `src/github.js` | All `gh` CLI calls (copy the pattern, or extract + export) |
+| `shortHash(str)` | `src/safety.js` | All hash computations (plan_hash, prompt_hash, content_hash, cache_key) |
+| `UNTRUSTED_REPO_BANNER` | `src/repo.js` | Prepended to every LLM prompt with repo-derived content |
+| `selectBestGPTModel()` | `src/models.js` | GPT model selection for Phase 2–3 |
+| `selectBestClaudeModel()` | `src/models.js` | Claude model selection for Phase 2 critique |
+| `getOpenAI()` | `src/providers.js` | OpenAI API client |
+| `getAnthropic()` | `src/providers.js` | Anthropic API client |
+| `ask()`, `confirm()`, `crucibleSay()` | `src/cli.js` | Interactive prompts (must be passed in or extracted) |
+| DB migration pattern | `src/db.js` | `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER TABLE` |
+
+If `ghCapture` is not currently exported from `github.js`, the
+implementation should export it (or extract a shared utility) rather than
+writing a new HTTP/gh wrapper.
+
+---
+
 ## Appendix A: File Map
 
 | File | Purpose | New/Modified |
@@ -1318,10 +1439,31 @@ These invariants must hold at all times. Each should have at least one test.
 - [ ] **Sampling bounded:** File count ≤ 200, bytes per file ≤ 200KB, total
       bytes ≤ 2MB, depth ≤ 4.
 - [ ] **No LLM in ranking:** Search scoring is pure arithmetic.
-- [ ] **Network confined:** Only `github.com` API and optional tarball fetch.
-      No other network access.
+- [ ] **Network confined:** Only `gh` CLI and `git clone --depth 1`. No
+      `fetch()`, `axios`, `curl`, or direct HTTP. LLM calls via existing
+      `providers.js` only.
 
-## Appendix C: Sequencing Recommendation
+## Appendix C: Out-of-Scope Prohibition
+
+The following features are **explicitly out of scope**. If the implementer
+encounters a situation that seems to require one of these, it is a sign
+that the approach is wrong — not that the scope should expand.
+
+- **No installation logic.** Crucible plans builds; it does not execute them.
+- **No auto-toolchain resolution.** The plan lists required tools; it does not install them.
+- **No repair or retry logic.** If a plan fails safety validation, it fails. No auto-fix loop.
+- **No binary release auto-download.** Tarballs are fetched for *inspection*, not for distribution.
+- **No providers beyond GitHub.** GitLab, Bitbucket, etc. are future work.
+- **No submodule fetching.** Even if the repo uses submodules.
+- **No auto-selection in interactive mode** unless `--auto-select` is passed.
+- **No LLM-based build system inference.** Detection is file-based only.
+
+If any ambiguity arises during implementation, defer to Appendix B invariant
+checklist, then to the section text, then ask — do not invent.
+
+---
+
+## Appendix D: Sequencing Recommendation
 
 Implement in this order for incremental testability:
 
