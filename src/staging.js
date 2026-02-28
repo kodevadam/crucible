@@ -292,6 +292,64 @@ export async function runStagingFlow({
     return { staged: [], skipped: [] };
   }
 
+  // ── D6: Pre-generation diff preview ───────────────────────────────────────
+  // Show the current state of each file before any content generation API calls.
+  // User must confirm before generation proceeds — no writes occur until approval.
+
+  console.log("");
+  console.log(bold(cyan("  Pre-generation preview:")));
+  console.log(dim("  Review what will change before content is generated."));
+  console.log("");
+
+  for (let i = 0; i < affectedFiles.length; i++) {
+    const f        = affectedFiles[i];
+    const fullPath = join(repoPath, f.path);
+    const hasFile  = existsSync(fullPath);
+    const tag      = f.action === "create" ? green("create") : f.action === "delete" ? red("delete") : yellow("modify");
+
+    console.log(hr("·"));
+    console.log(`\n  ${dim(String(i + 1).padStart(2))}  [${tag}]  ${bold(f.path)}`);
+    console.log(`       ${dim(f.note)}\n`);
+
+    if (f.action === "delete") {
+      if (hasFile) {
+        const existing  = readFileSync(fullPath, "utf8");
+        const lineCount = existing.split("\n").length;
+        console.log(red(`  Deletion notice: this file (${lineCount} line(s)) will be removed from the repository.`));
+        existing.split("\n").slice(0, 6).forEach(l => console.log(red(`    − ${l}`)));
+        if (lineCount > 6) console.log(dim(`    ... (${lineCount - 6} more lines)`));
+      } else {
+        console.log(dim("  (File does not exist — delete will be a no-op)"));
+      }
+    } else if (!hasFile || f.action === "create") {
+      console.log(green("  New file — full content will be generated and shown for review."));
+    } else {
+      // Existing file being modified — show current content excerpt
+      const existing  = readFileSync(fullPath, "utf8");
+      const lines     = existing.split("\n");
+      console.log(dim(`  Current file: ${lines.length} line(s). Proposed modifications will be generated and shown for diff review.`));
+      lines.slice(0, 8).forEach(l => console.log(dim(`    ${l}`)));
+      if (lines.length > 8) console.log(dim(`    ... (${lines.length - 8} more lines)`));
+    }
+    console.log("");
+  }
+
+  console.log(hr("·"));
+  console.log("");
+  console.log(`  ${cyan("y")}  Continue — generate content for each file`);
+  console.log(`  ${cyan("0")}  Cancel staging`);
+  console.log("");
+
+  while (true) {
+    const previewAns = (await _ask("  ›")).trim().toLowerCase();
+    if (previewAns === "0") {
+      say("Staging cancelled before generation.");
+      return { staged: [], skipped: [] };
+    }
+    if (previewAns === "y" || previewAns === "") break;
+    console.log(dim("  Enter y to continue or 0 to cancel."));
+  }
+
   // ── Per-file review loop ───────────────────────────────────────────────────
 
   const staged  = [];

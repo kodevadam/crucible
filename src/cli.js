@@ -927,6 +927,90 @@ async function compressPhaseSummary(phaseName, content) {
   }
 }
 
+/**
+ * Compress a critique round's output with mandatory structured headers.
+ * Used instead of compressPhaseSummary() for critique rounds to ensure
+ * no nuance is silently collapsed. All BLOCKING issues are preserved.
+ */
+async function compressCritiqueRoundSummary(round, content) {
+  try {
+    return await askClaude([{
+      role: "user",
+      content:
+        `Summarise this critique-round-${round} output in under 400 tokens.\n` +
+        `You MUST structure your output with these exact headers in order:\n\n` +
+        `BLOCKING: (list each blocking issue in short form — mark each RESOLVED or UNRESOLVED)\n` +
+        `IMPORTANT: (significant concerns — mark each RESOLVED or UNRESOLVED)\n` +
+        `MINOR: (small suggestions, brief)\n` +
+        `PLAN_DELTAS: (structural changes from prior round — constraints added/removed, steps added/removed/reordered)\n` +
+        `STATUS: (overall convergence direction — diverging | converging | converged)\n\n` +
+        `Rules:\n` +
+        `- ALL blocking issues must be preserved — do NOT omit or silently collapse any\n` +
+        `- Mark every issue RESOLVED or UNRESOLVED explicitly\n` +
+        `- Preserve any deferred items\n` +
+        `- Record structural plan changes between rounds under PLAN_DELTAS\n\n` +
+        content,
+    }], { maxTokens: SUMMARY_MAX_TOKENS });
+  } catch {
+    return `(critique round ${round} summary unavailable)`;
+  }
+}
+
+// ── Structural drift detection ────────────────────────────────────────────────
+// Measures how much a plan changed between critique rounds across 5 tracked fields.
+// Advisory only — never auto-stops the pipeline.
+
+/**
+ * Compute structural drift between two plan versions.
+ * Tracks: objective, constraints, step count, step descriptions, open_questions.
+ * Returns { score: number (0.0–1.0), deltas: string[] }
+ */
+function computePlanDrift(prevPlan, currentPlan) {
+  if (!prevPlan || !currentPlan) return { score: 0, deltas: [] };
+  const deltas = [];
+
+  // Objective text
+  const objA = (prevPlan.objective || "").trim();
+  const objB = (currentPlan.objective || "").trim();
+  if (objA !== objB) {
+    const longer = Math.max(objA.length, objB.length) || 1;
+    if (Math.abs(objA.length - objB.length) / longer > 0.2 || objA.split(" ")[0] !== objB.split(" ")[0]) {
+      deltas.push("objective");
+    }
+  }
+
+  // Constraints count/content
+  const cA = prevPlan.constraints || [];
+  const cB = currentPlan.constraints || [];
+  if (Math.abs(cA.length - cB.length) > 1) {
+    deltas.push("constraints count");
+  } else if (cA.length === cB.length && cA.some((c, i) => c !== cB[i])) {
+    deltas.push("constraints content");
+  }
+
+  // Step count
+  const sA = (prevPlan.steps || []).length;
+  const sB = (currentPlan.steps || []).length;
+  if (sA !== sB) deltas.push("step count");
+
+  // Step descriptions — ID-based comparison
+  if (Array.isArray(prevPlan.steps) && Array.isArray(currentPlan.steps)) {
+    const prevById = Object.fromEntries(prevPlan.steps.map(s => [s.id, s.description || ""]));
+    const changedDescs = currentPlan.steps.filter(s => {
+      const prev = prevById[s.id];
+      return prev !== undefined && prev !== (s.description || "");
+    });
+    if (changedDescs.length > 1) deltas.push(`${changedDescs.length} step descriptions changed`);
+  }
+
+  // Open questions count
+  const qA = (prevPlan.open_questions || []).length;
+  const qB = (currentPlan.open_questions || []).length;
+  if (Math.abs(qA - qB) > 1) deltas.push("open questions count");
+
+  return { score: deltas.length / 5, deltas };
+}
+
 // ── Plan JSON helpers ─────────────────────────────────────────────────────────
 // Models are instructed to output pure JSON but occasionally wrap it.
 // parsePlanJson() tries three extraction strategies before giving up.
@@ -1133,6 +1217,11 @@ async function runCritiquePhase(draftResult, taskContext) {
   let claudeAgreed = false;
   const claudeMsgs = [];     // kept for roundControls() summarisation
   let latestRoundSummary = draftSummary;
+  // B1: track previous round's plans for drift detection
+  let prevGptPlan    = null;
+  let prevClaudePlan = null;
+  // B3/C5: accumulate blocking items from all critique rounds for convergence validation
+  const collectedBlockingItems = [];
 
   console.log(""); console.log(hr("═"));
   console.log(bold(cyan(`\n  Phase 2 — Critique  ${dim(`(max ${MAX_CRITIQUE_ROUNDS} round(s))`)}\n`)));
@@ -1155,7 +1244,8 @@ async function runCritiquePhase(draftResult, taskContext) {
     const gptCritique = parsePlanJson(gptCritiqueRaw);
     DB.logMessage(state.proposalId, "gpt", gptCritiqueRaw, { phase: PHASE_CRITIQUE, round });
     if (gptCritique?.revised_plan) gptPlan = gptCritique.revised_plan;
-    gptAgreed = gptCritique?.converged === true || hasConverged(gptCritiqueRaw);
+    // B2: JSON-only convergence — phrase matching removed
+    gptAgreed = gptCritique?.converged === true;
 
     console.log(""); console.log(bold(yellow(`  ▶ GPT (${state.gptModel}) — Critique`))); console.log("");
     if (gptCritique?.critique) {
@@ -1184,7 +1274,8 @@ async function runCritiquePhase(draftResult, taskContext) {
     const claudeCritique = parsePlanJson(claudeCritiqueRaw);
     DB.logMessage(state.proposalId, "claude", claudeCritiqueRaw, { phase: PHASE_CRITIQUE, round });
     if (claudeCritique?.revised_plan) claudePlan = claudeCritique.revised_plan;
-    claudeAgreed = claudeCritique?.converged === true || hasConverged(claudeCritiqueRaw);
+    // B2: JSON-only convergence — phrase matching removed
+    claudeAgreed = claudeCritique?.converged === true;
 
     console.log(""); console.log(bold(blue(`  ▶ Claude (${state.claudeModel}) — Critique`))); console.log("");
     if (claudeCritique?.critique) {
@@ -1201,17 +1292,37 @@ async function runCritiquePhase(draftResult, taskContext) {
     }
     if (claudeAgreed) console.log(green("\n  ✔ Claude converged"));
 
-    // ── Compress round — pass only summary forward ────────────────────────────
-    latestRoundSummary = await compressPhaseSummary(
-      `critique round ${round}`,
+    // B3: Compress round with structured headers — preserves BLOCKING/IMPORTANT/MINOR/PLAN_DELTAS/STATUS
+    latestRoundSummary = await compressCritiqueRoundSummary(
+      round,
       `GPT critique:\n${gptCritiqueRaw}\n\nClaude critique:\n${claudeCritiqueRaw}`
     );
     DB.logPhaseSummary(state.proposalId, PHASE_CRITIQUE, round, latestRoundSummary, { gptPlan, claudePlan });
 
+    // B3/C5: Collect blocking items from this round for convergence validation
+    const gptBlocking    = gptCritique?.critique?.blocking    || [];
+    const claudeBlocking = claudeCritique?.critique?.blocking || [];
+    collectedBlockingItems.push(...gptBlocking, ...claudeBlocking);
+
+    // B1: Drift delta check — warn if plans are diverging significantly
+    if (prevGptPlan || prevClaudePlan) {
+      const gptDrift    = computePlanDrift(prevGptPlan,    gptPlan);
+      const claudeDrift = computePlanDrift(prevClaudePlan, claudePlan);
+      const maxScore    = Math.max(gptDrift.score, claudeDrift.score);
+      const allDeltas   = new Set([...gptDrift.deltas, ...claudeDrift.deltas]);
+      if (maxScore >= 0.4 || allDeltas.size >= 3) {
+        console.log(yellow("\n  ⚠ Plans are diverging significantly across rounds."));
+        console.log(yellow(`    Changed fields: ${[...allDeltas].join(", ")}`));
+        console.log(yellow("    Consider steering or synthesizing early.\n"));
+      }
+    }
+    prevGptPlan    = JSON.parse(JSON.stringify(gptPlan));
+    prevClaudePlan = JSON.parse(JSON.stringify(claudePlan));
+
     // ── Convergence check ─────────────────────────────────────────────────────
     if (gptAgreed && claudeAgreed) {
       console.log(green(`\n  ✅ Both models converged after ${round} critique round(s).\n`));
-      return { done: true, reason: "converged", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null };
+      return { done: true, reason: "converged", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null, blockingItems: collectedBlockingItems };
     }
 
     // ── Inter-round controls (only if another round remains) ─────────────────
@@ -1222,7 +1333,7 @@ async function runCritiquePhase(draftResult, taskContext) {
         currentPlan: formatPlanForDisplay(claudePlan),
       });
       if (ctrl.action === "accept") {
-        return { done: true, reason: "accepted", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null };
+        return { done: true, reason: "accepted", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null, blockingItems: collectedBlockingItems };
       }
       if (ctrl.action === "restart") return { done: false, newDirection: ctrl.newDirection };
       if (ctrl.steering) {
@@ -1261,11 +1372,11 @@ async function runCritiquePhase(draftResult, taskContext) {
 
   while (true) {
     const ans = (await ask("  ›")).trim();
-    if (ans === "1") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements };
-    if (ans === "2") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan: claudePlan, claudePlan, summary: latestRoundSummary, disagreements };
+    if (ans === "1") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements, blockingItems: collectedBlockingItems };
+    if (ans === "2") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan: claudePlan, claudePlan, summary: latestRoundSummary, disagreements, blockingItems: collectedBlockingItems };
     if (ans === "3") {
       const dir = await ask("\n  Synthesis direction:\n  ›");
-      return { done: true, reason: "escalated_directed", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements, synthesisDirection: dir.trim() };
+      return { done: true, reason: "escalated_directed", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements, synthesisDirection: dir.trim(), blockingItems: collectedBlockingItems };
     }
     if (ans === "4") {
       const d = await ask("\n  New direction:\n  ›");
@@ -1398,7 +1509,13 @@ async function synthesise(gptMsgs) {
 //   2. Claude has dispositioned every critique item (plan schema complete)
 //   3. open_questions are all marked "(requires user decision)" or "(addressed)"
 
-function checkSynthesisConvergence(plan) {
+/**
+ * Validate that synthesis convergence criteria are met.
+ * @param {object} plan - the synthesised plan JSON
+ * @param {string[]} [blockingItems] - blocking critique items collected across all rounds
+ * @returns {string[]} violations — empty array means converged
+ */
+function checkSynthesisConvergence(plan, blockingItems = []) {
   if (!plan) return ["Synthesis produced no valid JSON plan"];
   const violations = [];
 
@@ -1406,6 +1523,7 @@ function checkSynthesisConvergence(plan) {
   if (!plan.constraints?.length) violations.push("Plan has no constraints defined");
   if (!plan.steps?.length)       violations.push("Plan has no steps defined");
 
+  // C5: open_questions must start with "(requires user decision)" or "(addressed)"
   const unmarked = (plan.open_questions || []).filter(q =>
     !q.startsWith("(requires user decision)") && !q.startsWith("(addressed)")
   );
@@ -1415,6 +1533,7 @@ function checkSynthesisConvergence(plan) {
     );
   }
 
+  // C5: BLOCKING items may NOT appear in deferred_suggestions
   const deferredBlocking = (plan.deferred_suggestions || []).filter(s =>
     /severity:\s*blocking/i.test(s)
   );
@@ -1422,6 +1541,35 @@ function checkSynthesisConvergence(plan) {
     violations.push(
       `${deferredBlocking.length} BLOCKING item(s) incorrectly deferred — must be accepted or rejected`
     );
+  }
+
+  // C5: Deferred items MUST explicitly include "severity: important"
+  const deferredWithoutSeverity = (plan.deferred_suggestions || []).filter(s =>
+    !/severity:\s*important/i.test(s)
+  );
+  if (deferredWithoutSeverity.length) {
+    violations.push(
+      `${deferredWithoutSeverity.length} deferred suggestion(s) missing required "severity: important" label`
+    );
+  }
+
+  // C5: Every blocking critique item must appear in accepted_suggestions or rejected_suggestions
+  if (blockingItems.length) {
+    const addressed = [
+      ...(plan.accepted_suggestions || []),
+      ...(plan.rejected_suggestions || []),
+    ].join(" ").toLowerCase().replace(/[^a-z0-9\s]/g, "");
+
+    const unaddressed = blockingItems.filter(item => {
+      // Use first 40 meaningful chars as a fingerprint
+      const fp = item.slice(0, 60).toLowerCase().replace(/[^a-z0-9]/g, "");
+      return fp.length > 8 && !addressed.replace(/\s/g, "").includes(fp.replace(/\s/g, ""));
+    });
+    if (unaddressed.length) {
+      violations.push(
+        `${unaddressed.length} BLOCKING critique item(s) not found in accepted or rejected suggestions`
+      );
+    }
   }
 
   return violations;
@@ -1441,18 +1589,19 @@ async function runSynthesisPhase(draftResult, critiqueResult, taskContext) {
   console.log(dim("  Producing authoritative plan with accepted/rejected suggestions."));
   console.log("");
 
+  // C4: Clearly separated structured input blocks — no blending of sections
+  const unresolvedBlock = disagreements?.unresolved?.length
+    ? disagreements.unresolved.map((u, i) => `${i + 1}. ${u}`).join("\n")
+    : "(none)";
+
   const contextParts = [
-    `Task context:\n${taskContext}`,
-    `Draft phase summary:\n${draftSummary}`,
-    `Critique phase summary:\n${critiqueSummary}`,
-    `GPT's final plan:\n${JSON.stringify(gptPlan, null, 2)}`,
-    `Claude's final plan:\n${JSON.stringify(claudePlan, null, 2)}`,
-    disagreements?.unresolved?.length
-      ? `Unresolved points: ${disagreements.unresolved.join("; ")}`
-      : "",
-    synthesisDirection
-      ? `User direction for synthesis: ${synthesisDirection}`
-      : "",
+    `=== TASK CONTEXT ===\n${taskContext}`,
+    `=== DRAFT SUMMARY ===\n${draftSummary}`,
+    `=== CRITIQUE SUMMARY ===\n${critiqueSummary}`,
+    `=== GPT FINAL PLAN (JSON) ===\n${JSON.stringify(gptPlan, null, 2)}`,
+    `=== CLAUDE FINAL PLAN (JSON) ===\n${JSON.stringify(claudePlan, null, 2)}`,
+    `=== UNRESOLVED ISSUES ===\n${unresolvedBlock}`,
+    synthesisDirection ? `=== USER DIRECTION ===\n${synthesisDirection}` : null,
   ].filter(Boolean).join("\n\n");
 
   const synthesisSystem = `You are the SYNTHESIS stage of a structured planning pipeline. You are Claude and you own this decision.
@@ -1744,7 +1893,7 @@ async function proposalFlow(initialProposal) {
       console.log("");
     }
 
-    const convergenceViolations = checkSynthesisConvergence(synthesisResult.finalPlan);
+    const convergenceViolations = checkSynthesisConvergence(synthesisResult.finalPlan, critiqueResult.blockingItems || []);
     if (convergenceViolations.length) {
       console.log(hr("·"));
       console.log(bold(red(`\n  ⚠ Convergence issues (${convergenceViolations.length}):\n`)));
