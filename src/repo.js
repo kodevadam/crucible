@@ -10,8 +10,9 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { join, extname, relative }             from "path";
+import { createHash }                          from "crypto";
 import * as DB                                 from "./db.js";
-import { gitq }                                from "./safety.js";
+import { gitq, validateStagingPath }           from "./safety.js";
 import { getAnthropic }                        from "./providers.js";
 import { CLAUDE_FALLBACK }                     from "./models.js";
 
@@ -529,4 +530,79 @@ export function getChangeLog(repoPath, limit = 50) {
  */
 export function clearRepoKnowledge(repoPath) {
   DB.deleteRepoKnowledge(repoPath);
+}
+
+// ── Phase 1a — Targeted file context resolution ───────────────────────────────
+
+const CONTEXT_PACK_MAX_FILES = 6;      // Max files resolved per pack
+const CONTEXT_PACK_MAX_CHARS = 4_000;  // Max chars read per file (tail-truncated)
+
+// Hidden files/dirs are rejected unless the path exactly matches this set.
+const HIDDEN_FILE_ALLOWLIST = new Set([
+  ".env.example", ".eslintrc.js", ".eslintrc.json", ".eslintignore",
+  ".prettierrc", ".prettierrc.json", ".prettierignore",
+]);
+
+/**
+ * resolveContextPack(repoPath, requests, gitRev)
+ *
+ * Resolves a model's context requests against a specific git revision.
+ * Each file is read via `git show <rev>:<path>` — never from the working
+ * tree — so the pack content is deterministic and reproducible.
+ *
+ * Safety constraints applied before any file read:
+ *   - Path traversal, absolute paths, UNC paths → validateStagingPath()
+ *   - Hidden files/dirs (leading dot) → rejected unless in HIDDEN_FILE_ALLOWLIST
+ *   - Max CONTEXT_PACK_MAX_FILES files per pack
+ *   - Max CONTEXT_PACK_MAX_CHARS chars per file
+ *
+ * Returns:
+ *   { gitRev, files: [{path, reason, sha256, content, chars}  |
+ *                     {path, reason, error}] }
+ *
+ * Files that could not be read carry an `error` field and no `content`.
+ * Callers should filter to `f => !f.error` before injecting into prompts.
+ */
+export function resolveContextPack(repoPath, requests, gitRev) {
+  const seen  = new Set();
+  const files = [];
+
+  for (const req of requests) {
+    if (files.length >= CONTEXT_PACK_MAX_FILES) break;
+
+    const path   = (req?.path   || "").trim();
+    const reason = (req?.reason || "").trim();
+
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+
+    // Delegate traversal / absolute / UNC checks to the shared validator.
+    try {
+      validateStagingPath(repoPath, path);
+    } catch (err) {
+      files.push({ path, reason, error: `rejected: ${err.message}` });
+      continue;
+    }
+
+    // Reject hidden segments unless the full path is explicitly allowlisted.
+    const segments = path.replace(/\\/g, "/").split("/");
+    const hasHidden = segments.some(s => s.startsWith(".") && !HIDDEN_FILE_ALLOWLIST.has(path));
+    if (hasHidden) {
+      files.push({ path, reason, error: "rejected: hidden file/dir" });
+      continue;
+    }
+
+    // Read from the pinned revision — empty string means not found / binary.
+    const raw = gitq(repoPath, ["show", `${gitRev}:${path}`]);
+    if (!raw) {
+      files.push({ path, reason, error: "not found at this revision" });
+      continue;
+    }
+
+    const content = raw.slice(0, CONTEXT_PACK_MAX_CHARS);
+    const sha256  = createHash("sha256").update(content).digest("hex").slice(0, 16);
+    files.push({ path, reason, sha256, content, chars: content.length });
+  }
+
+  return { gitRev, files };
 }

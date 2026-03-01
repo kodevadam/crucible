@@ -19,7 +19,7 @@ import { join, resolve }        from "path";
 import { homedir }              from "os";
 import * as DB   from "./db.js";
 import { analyseRepo, getRepoSummary, getChangeLog, clearRepoKnowledge,
-         UNTRUSTED_REPO_BANNER }                                          from "./repo.js";
+         resolveContextPack, UNTRUSTED_REPO_BANNER }                      from "./repo.js";
 import { runStagingFlow, listStagedFiles, restageApproved, setInteractiveHelpers,
          INFER_MAX_TOKENS, GENERATE_MAX_TOKENS }                                   from "./staging.js";
 import { retrieveKey, storeKey, getKeySource, SERVICE_OPENAI, SERVICE_ANTHROPIC } from "./keys.js";
@@ -51,11 +51,12 @@ const CONVERGENCE_PHRASE = "I AGREE WITH THIS PLAN";
 // ── Structured planning phases ─────────────────────────────────────────────────
 // Each phase has a defined purpose, bounded token budget, and structured output.
 // Phase identifiers are stored in DB messages.phase for post-hoc analysis.
-const PHASE_CLARIFY   = "clarify";    // Phase 0 — Clarification & proposal refinement
-const PHASE_DRAFT     = "draft";      // Phase 1 — Independent structured plan drafts
-const PHASE_CRITIQUE  = "critique";   // Phase 2 — Cross-model critique & revision
-const PHASE_SYNTHESIS = "synthesis";  // Phase 3 — Authoritative final plan
-const PHASE_EXECUTE   = "execute";    // Phase 4 — Staging & implementation
+const PHASE_CLARIFY         = "clarify";          // Phase 0  — Clarification & proposal refinement
+const PHASE_CONTEXT_REQUEST = "context_request";  // Phase 1a — Pre-draft targeted file reads
+const PHASE_DRAFT           = "draft";            // Phase 1  — Independent structured plan drafts
+const PHASE_CRITIQUE        = "critique";         // Phase 2  — Cross-model critique & revision
+const PHASE_SYNTHESIS       = "synthesis";        // Phase 3  — Authoritative final plan
+const PHASE_EXECUTE         = "execute";          // Phase 4  — Staging & implementation
 
 // Per-phase hard token ceilings — changing any value changes the prompt hash.
 const DRAFT_MAX_TOKENS     = 2000;    // Each model's initial plan
@@ -751,7 +752,7 @@ async function setupRepo() {
 
 async function refineProposal(rawProposal) {
   const repoSection = state.repoContext
-    ? `\n\nRepo context:\n${state.repoContext.slice(0, 3000)}`
+    ? `\n\nRepo context:\n${state.repoContext}`
     : "";
   const projectLine = `Project: ${state.project || "unspecified"}`;
 
@@ -1134,14 +1135,130 @@ async function roundControls({ round, claudeMsgs, prevPlan, currentPlan }) {
   }
 }
 
+// ── Phase 1a — Context Requests ───────────────────────────────────────────────
+// Before drafting, each model independently selects specific files it wants to
+// read from the repo. The host resolves the requests against the current HEAD
+// revision. GPT and Claude receive separate packs — they never see each other's
+// file list, preserving epistemic independence.
+
+const CONTEXT_REQUEST_SCHEMA = `Output ONLY valid JSON:
+{
+  "context_requests": [
+    {"path": "relative/path/to/file", "reason": "brief reason"},
+    ...
+  ]
+}
+Max 6 files. Output {"context_requests": []} if no reads would help.
+No markdown fences, no preamble.`;
+
+/** Render a resolved context pack as a prompt-injectable string. */
+function formatContextPack(pack) {
+  if (!pack) return "";
+  const resolved = pack.files.filter(f => !f.error);
+  if (!resolved.length) return "";
+  const header = `\n\n${UNTRUSTED_REPO_BANNER}Context pack (git rev: ${(pack.gitRev || "").slice(0, 8)}):`;
+  const body = resolved.map(f =>
+    `\n--- ${f.path} (${f.chars} chars, sha256: ${f.sha256}) ---\n${f.content}`
+  ).join("\n");
+  return header + body;
+}
+
+/**
+ * runContextRequestStep(taskContext)
+ *
+ * Phase 1a: asks each model which files it needs, resolves them independently,
+ * displays the results, and returns { gptPack, claudePack } for use in drafts.
+ * Returns { gptPack: null, claudePack: null } when no repo is configured.
+ */
+async function runContextRequestStep(taskContext) {
+  if (!state.repoPath) return { gptPack: null, claudePack: null };
+
+  const gitRev = gitq(state.repoPath, ["rev-parse", "HEAD"]);
+  if (!gitRev) return { gptPack: null, claudePack: null };
+
+  console.log(""); console.log(hr("═"));
+  console.log(bold(cyan("\n  Phase 1a — Context Requests\n")));
+  console.log(dim("  Each model independently selects files to read before drafting."));
+  console.log(""); console.log(hr());
+
+  const requestPrompt =
+    `${taskContext}` +
+    (state.repoContext ? `\n\nRepo understanding:\n${state.repoContext}` : "") +
+    `\n\nBefore drafting your plan, select up to 6 repository files you need to read.` +
+    `\nChoose only files directly relevant to this task — their full content will be provided.\n` +
+    CONTEXT_REQUEST_SCHEMA;
+
+  process.stdout.write(dim("  Collecting file requests..."));
+  const [gptRequestRaw, claudeRequestRaw] = await Promise.all([
+    askGPT([
+      { role: "system", content: `You are ${state.gptModel} selecting files to read before planning. Output JSON only.` },
+      { role: "user",   content: requestPrompt },
+    ], { maxTokens: 512 }).catch(() => '{"context_requests":[]}'),
+    askClaude(
+      [{ role: "user", content:
+        `You are ${state.claudeModel} selecting files to read before planning. Output JSON only.\n\n${requestPrompt}` }],
+      { maxTokens: 512 }
+    ).catch(() => '{"context_requests":[]}'),
+  ]);
+  process.stdout.write("\r                              \r");
+
+  DB.logMessage(state.proposalId, "gpt",    gptRequestRaw,    { phase: PHASE_CONTEXT_REQUEST });
+  DB.logMessage(state.proposalId, "claude", claudeRequestRaw, { phase: PHASE_CONTEXT_REQUEST });
+
+  const gptRequests    = parsePlanJson(gptRequestRaw)?.context_requests    || [];
+  const claudeRequests = parsePlanJson(claudeRequestRaw)?.context_requests || [];
+
+  // Resolve each model's requests independently — separate packs
+  const gptPack    = resolveContextPack(state.repoPath, gptRequests,    gitRev);
+  const claudePack = resolveContextPack(state.repoPath, claudeRequests, gitRev);
+
+  // ── Display GPT's resolved pack ─────────────────────────────────────────────
+  console.log(""); console.log(bold(yellow(`  ▶ GPT (${state.gptModel}) — ${gptRequests.length} file(s) requested:`)));
+  if (!gptPack.files.length) {
+    console.log(dim("    (no files requested)"));
+  } else {
+    for (const f of gptPack.files) {
+      const mark   = f.error ? red("✗") : green("✓");
+      const detail = f.error ? dim(` — ${f.error}`) : dim(` (${f.chars} chars)`);
+      console.log(`    ${mark} ${f.path}${detail}`);
+    }
+  }
+
+  // ── Display Claude's resolved pack ──────────────────────────────────────────
+  console.log(""); console.log(bold(blue(`  ▶ Claude (${state.claudeModel}) — ${claudeRequests.length} file(s) requested:`)));
+  if (!claudePack.files.length) {
+    console.log(dim("    (no files requested)"));
+  } else {
+    for (const f of claudePack.files) {
+      const mark   = f.error ? red("✗") : green("✓");
+      const detail = f.error ? dim(` — ${f.error}`) : dim(` (${f.chars} chars)`);
+      console.log(`    ${mark} ${f.path}${detail}`);
+    }
+  }
+  console.log("");
+
+  // Persist packs for reproducibility audit — gitRev pins the exact content
+  DB.logMessage(state.proposalId, "host",
+    JSON.stringify({ gitRev, gptPack, claudePack }),
+    { phase: PHASE_CONTEXT_REQUEST }
+  );
+
+  return { gptPack, claudePack };
+}
+
 // ── Phase 1 — Draft ───────────────────────────────────────────────────────────
 // Each model independently produces a structured plan JSON.
 // No cross-model interaction — this establishes clean starting positions.
 
 async function runDraftPhase(taskContext) {
   const repoSection = state.repoContext
-    ? `\n\nRepo context:\n${state.repoContext.slice(0, 3000)}`
+    ? `\n\nRepo context:\n${state.repoContext}`
     : "";
+
+  // Phase 1a — each model independently selects files to read before drafting
+  const { gptPack, claudePack } = await runContextRequestStep(taskContext);
+  const gptPackSection    = formatContextPack(gptPack);
+  const claudePackSection = formatContextPack(claudePack);
 
   console.log(""); console.log(hr("═"));
   console.log(bold(cyan("\n  Phase 1 — Draft\n")));
@@ -1149,7 +1266,7 @@ async function runDraftPhase(taskContext) {
   console.log(""); console.log(hr());
 
   // ── GPT draft ────────────────────────────────────────────────────────────────
-  const gptDraftPrompt = `${taskContext}${repoSection}\n\nProduce an initial structured plan for the above task.\n${PLAN_SCHEMA_PROMPT}`;
+  const gptDraftPrompt = `${taskContext}${repoSection}${gptPackSection}\n\nProduce an initial structured plan for the above task.\n${PLAN_SCHEMA_PROMPT}`;
 
   process.stdout.write(dim("  GPT drafting..."));
   const gptRaw = await askGPT([
@@ -1166,7 +1283,7 @@ async function runDraftPhase(taskContext) {
   console.log("");
 
   // ── Claude draft ──────────────────────────────────────────────────────────────
-  const claudeDraftPrompt = `You are ${state.claudeModel} in the DRAFT phase of a structured planning pipeline.\nProduce a structured plan in JSON. No reasoning commentary — output only JSON.\n\n${taskContext}${repoSection}\n\nProduce an initial structured plan for the above task.\n${PLAN_SCHEMA_PROMPT}`;
+  const claudeDraftPrompt = `You are ${state.claudeModel} in the DRAFT phase of a structured planning pipeline.\nProduce a structured plan in JSON. No reasoning commentary — output only JSON.\n\n${taskContext}${repoSection}${claudePackSection}\n\nProduce an initial structured plan for the above task.\n${PLAN_SCHEMA_PROMPT}`;
 
   process.stdout.write(dim("  Claude drafting..."));
   const claudeRaw = await askClaude(
@@ -1220,7 +1337,7 @@ Output ONLY valid JSON. No markdown fences, no preamble.`;
 
 async function runCritiquePhase(draftResult, taskContext) {
   const repoSection = state.repoContext
-    ? `\n\nRepo context:\n${state.repoContext.slice(0, 3000)}`
+    ? `\n\nRepo context:\n${state.repoContext}`
     : "";
 
   let { gptPlan, claudePlan, summary: draftSummary } = draftResult;
@@ -1485,7 +1602,7 @@ async function runCritiquePhase(draftResult, taskContext) {
 
 async function runDebate(taskContext) {
   const repoSection = state.repoContext
-    ? `\n\nRepo context:\n${state.repoContext.slice(0, 3000)}`
+    ? `\n\nRepo context:\n${state.repoContext}`
     : "";
 
   const systemGPT = `You are ${state.gptModel}, collaborating with ${state.claudeModel} to produce the best possible technical plan.
