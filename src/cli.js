@@ -1179,6 +1179,7 @@ async function runContextRequestStep(taskContext) {
   console.log(""); console.log(hr("═"));
   console.log(bold(cyan("\n  Phase 1a — Context Requests\n")));
   console.log(dim("  Each model independently selects files to read before drafting."));
+  console.log(dim(`  Revision: ${gitRev.slice(0, 8)}`));
   console.log(""); console.log(hr());
 
   const requestPrompt =
@@ -1237,6 +1238,14 @@ async function runContextRequestStep(taskContext) {
       console.log(`    ${mark} ${f.path}${detail}`);
     }
   }
+  // ── Summary line ─────────────────────────────────────────────────────────────
+  const gptOk    = gptPack.files.filter(f => f.status === "ok").length;
+  const claudeOk = claudePack.files.filter(f => f.status === "ok").length;
+  const gptFail    = gptPack.files.length    - gptOk;
+  const claudeFail = claudePack.files.length - claudeOk;
+  const fmt = (req, ok, fail) =>
+    `${req} requested, ${ok} resolved` + (fail ? `, ${fail} failed` : "");
+  console.log(dim(`  Phase 1a — GPT: ${fmt(gptRequests.length, gptOk, gptFail)}  ·  Claude: ${fmt(claudeRequests.length, claudeOk, claudeFail)}`));
   console.log("");
 
   // Persist packs for reproducibility audit — gitRev pins the exact content
