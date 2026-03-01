@@ -1263,20 +1263,29 @@ async function runContextRequestStep(taskContext) {
   // These are queryable after N runs without re-parsing the raw packs.
   const gptPaths    = new Set(gptPack.files.filter(f => f.status === "ok").map(f => f.path));
   const claudePaths = new Set(claudePack.files.filter(f => f.status === "ok").map(f => f.path));
-  const intersect   = [...gptPaths].filter(p => claudePaths.has(p)).length;
-  const union       = new Set([...gptPaths, ...claudePaths]).size;
+  const overlapPaths   = [...gptPaths].filter(p => claudePaths.has(p));
+  const intersect      = overlapPaths.length;
+  const union          = new Set([...gptPaths, ...claudePaths]).size;
   const overlapRate    = union === 0 ? null : round2(intersect / union);
   const divergenceRate = overlapRate === null ? null : round2(1 - overlapRate);
+
+  // overlap_capped_count: files where both models grounded AND at least one hit the cap.
+  // These carry less evidential weight than uncapped overlap — shared truncation ≠ shared signal.
+  const gptCappedSet    = new Set(gptPack.files.filter(f => f.status === "ok" && f.capped).map(f => f.path));
+  const claudeCappedSet = new Set(claudePack.files.filter(f => f.status === "ok" && f.capped).map(f => f.path));
+  const overlapCapped   = overlapPaths.filter(p => gptCappedSet.has(p) || claudeCappedSet.has(p)).length;
 
   const groundingStats = {
     gpt_requested:    gptRequests.length,    gpt_resolved:    gptOk,    gpt_failed:    gptFail,    gpt_capped:    gptCapped,
     claude_requested: claudeRequests.length, claude_resolved: claudeOk, claude_failed: claudeFail, claude_capped: claudeCapped,
-    overlap_count:  intersect,
-    union_count:    union,
-    overlap_rate:   overlapRate,
-    divergence_rate: divergenceRate,
-    cap_hit_rate_gpt:    gptOk    ? round2(gptCapped    / gptOk)    : null,
-    cap_hit_rate_claude: claudeOk ? round2(claudeCapped / claudeOk) : null,
+    overlap_count:          intersect,
+    union_count:            union,
+    overlap_rate:           overlapRate,
+    divergence_rate:        divergenceRate,
+    cap_hit_rate_gpt:       gptOk    ? round2(gptCapped    / gptOk)    : null,
+    cap_hit_rate_claude:    claudeOk ? round2(claudeCapped / claudeOk) : null,
+    overlap_capped_count:   overlapCapped,
+    overlap_uncapped_count: intersect - overlapCapped,
   };
 
   // Persist packs + stats — gitRev pins the exact content; stats enable trend queries
@@ -1393,6 +1402,9 @@ async function runCritiquePhase(draftResult, taskContext) {
   let prevClaudePlan = null;
   // B3/C5: accumulate blocking items from all critique rounds for convergence validation
   const collectedBlockingItems = [];
+  // Track item counts across all rounds — emitted as critiqueFinalStats in each done:true return
+  let totalImportantMinted = 0;
+  let totalMinorMinted     = 0;
 
   console.log(""); console.log(hr("═"));
   console.log(bold(cyan(`\n  Phase 2 — Critique  ${dim(`(max ${MAX_CRITIQUE_ROUNDS} round(s))`)}\n`)));
@@ -1474,6 +1486,8 @@ async function runCritiquePhase(draftResult, taskContext) {
     const gptBlocking    = gptCritique?.critique?.blocking    || [];
     const claudeBlocking = claudeCritique?.critique?.blocking || [];
     collectedBlockingItems.push(...gptBlocking, ...claudeBlocking);
+    totalImportantMinted += (gptCritique?.critique?.important?.length || 0) + (claudeCritique?.critique?.important?.length || 0);
+    totalMinorMinted     += (gptCritique?.critique?.minor?.length     || 0) + (claudeCritique?.critique?.minor?.length     || 0);
 
     // ── Canonical critique item processing ────────────────────────────────────
     // Convert each model's structured blocking/important/minor arrays into
@@ -1574,7 +1588,8 @@ async function runCritiquePhase(draftResult, taskContext) {
     // ── Convergence check ─────────────────────────────────────────────────────
     if (gptAgreed && claudeAgreed) {
       console.log(green(`\n  ✅ Both models converged after ${round} critique round(s).\n`));
-      return { done: true, reason: "converged", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null, blockingItems: collectedBlockingItems };
+      return { done: true, reason: "converged", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null, blockingItems: collectedBlockingItems,
+        critiqueFinalStats: { rounds_completed: round, converged_naturally: true, reason: "converged", final_gpt_agreed: true, final_claude_agreed: true, blocking_minted: collectedBlockingItems.length, important_minted: totalImportantMinted, minor_minted: totalMinorMinted } };
     }
 
     // ── Inter-round controls (only if another round remains) ─────────────────
@@ -1585,7 +1600,8 @@ async function runCritiquePhase(draftResult, taskContext) {
         currentPlan: formatPlanForDisplay(claudePlan),
       });
       if (ctrl.action === "accept") {
-        return { done: true, reason: "accepted", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null, blockingItems: collectedBlockingItems };
+        return { done: true, reason: "accepted", round, gptPlan, claudePlan, summary: latestRoundSummary, disagreements: null, blockingItems: collectedBlockingItems,
+          critiqueFinalStats: { rounds_completed: round, converged_naturally: false, reason: "accepted", final_gpt_agreed: gptAgreed, final_claude_agreed: claudeAgreed, blocking_minted: collectedBlockingItems.length, important_minted: totalImportantMinted, minor_minted: totalMinorMinted } };
       }
       if (ctrl.action === "restart") return { done: false, newDirection: ctrl.newDirection };
       if (ctrl.steering) {
@@ -1622,13 +1638,18 @@ async function runCritiquePhase(draftResult, taskContext) {
   console.log(`  ${cyan("4")}  Restart with new direction`);
   console.log("");
 
+  const escalatedStats = { rounds_completed: MAX_CRITIQUE_ROUNDS, converged_naturally: false, final_gpt_agreed: gptAgreed, final_claude_agreed: claudeAgreed, blocking_minted: collectedBlockingItems.length, important_minted: totalImportantMinted, minor_minted: totalMinorMinted };
+
   while (true) {
     const ans = (await ask("  ›")).trim();
-    if (ans === "1") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements, blockingItems: collectedBlockingItems };
-    if (ans === "2") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan: claudePlan, claudePlan, summary: latestRoundSummary, disagreements, blockingItems: collectedBlockingItems };
+    if (ans === "1") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements, blockingItems: collectedBlockingItems,
+      critiqueFinalStats: { ...escalatedStats, reason: "escalated" } };
+    if (ans === "2") return { done: true, reason: "escalated", round: MAX_CRITIQUE_ROUNDS, gptPlan: claudePlan, claudePlan, summary: latestRoundSummary, disagreements, blockingItems: collectedBlockingItems,
+      critiqueFinalStats: { ...escalatedStats, reason: "escalated" } };
     if (ans === "3") {
       const dir = await ask("\n  Synthesis direction:\n  ›");
-      return { done: true, reason: "escalated_directed", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements, synthesisDirection: dir.trim(), blockingItems: collectedBlockingItems };
+      return { done: true, reason: "escalated_directed", round: MAX_CRITIQUE_ROUNDS, gptPlan, claudePlan, summary: latestRoundSummary, disagreements, synthesisDirection: dir.trim(), blockingItems: collectedBlockingItems,
+        critiqueFinalStats: { ...escalatedStats, reason: "escalated_directed" } };
     }
     if (ans === "4") {
       const d = await ask("\n  New direction:\n  ›");
@@ -2210,6 +2231,14 @@ async function proposalFlow(initialProposal) {
       continue;
     }
 
+    // Persist critique-phase outcome stats — the "Y" side for Phase 1a predictor queries
+    if (critiqueResult.critiqueFinalStats) {
+      DB.logMessage(state.proposalId, "host",
+        JSON.stringify(critiqueResult.critiqueFinalStats),
+        { phase: PHASE_CRITIQUE }
+      );
+    }
+
     // Phase 3 — Claude synthesises authoritative final plan from summaries
     const synthesisResult = await runSynthesisPhase(draftResult, critiqueResult, currentContext);
 
@@ -2250,6 +2279,19 @@ async function proposalFlow(initialProposal) {
       convergenceViolations.forEach(v => console.log(`    • ${v}`));
       console.log("");
     }
+
+    // Persist synthesis outcome stats — the "Y" that completes the experiment row
+    //   blocking_active_going_in:  how many canonical blocking items synthesis had to address
+    //   convergence_violations:    how many it failed to address (unresolved after synthesis)
+    //   deferred_count:            items explicitly deferred to future work
+    // Together with Phase 1a groundingStats and critiqueFinalStats, a full run is queryable.
+    DB.logMessage(state.proposalId, "host", JSON.stringify({
+      blocking_active_going_in:  canonicalCtx?.activeSet?.filter(i => i.severity === "blocking").length ?? null,
+      canonical_active_set_size: canonicalCtx?.activeSet?.length ?? null,
+      convergence_violations:    convergenceViolations.length,
+      deferred_count:            synthesisResult.finalPlan?.deferred_suggestions?.length || 0,
+      synthesis_steps:           synthesisResult.finalPlan?.steps?.length ?? null,
+    }), { phase: PHASE_SYNTHESIS });
 
     DB.updateProposal(state.proposalId, {
       finalPlan: synthesisResult.planText,
@@ -3022,6 +3064,12 @@ switch (cmd) {
       if (!critiqueResult.done) {
         context = `Task: ${arg}\n\nUser restarted: ${critiqueResult.newDirection}`;
         continue;
+      }
+      if (critiqueResult.critiqueFinalStats) {
+        DB.logMessage(state.proposalId, "host",
+          JSON.stringify(critiqueResult.critiqueFinalStats),
+          { phase: PHASE_CRITIQUE }
+        );
       }
       const synthesisResult = await runSynthesisPhase(draftResult, critiqueResult, context);
       console.log(hr("═")); console.log(bold(mag("\n  Final Plan\n")));
