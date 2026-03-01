@@ -258,3 +258,25 @@ export function getAnthropic() {
   }
   return _anthropic;
 }
+
+/**
+ * Override the Anthropic singleton with a test double.
+ * Pass null to clear the override so the next getAnthropic() call
+ * re-creates the real client from the stored key.
+ *
+ * ONLY for use in integration tests — never call from production code.
+ * Prefixed with _ as a naming convention for test-only exports.
+ */
+export function _setAnthropicForTest(mock) {
+  if (mock === null) {
+    // Clear the mock; next getAnthropic() call re-creates from the real key.
+    _anthropic    = null;
+    _anthropicKey = null;
+  } else {
+    // Inject the mock and synchronise _anthropicKey to the value getAnthropic()
+    // would compute right now.  Without this, getAnthropic() sees a key change
+    // (null !== "") and immediately overwrites the mock with a real client.
+    _anthropic    = mock;
+    _anthropicKey = retrieveKey(SERVICE_ANTHROPIC) || "";
+  }
+}
