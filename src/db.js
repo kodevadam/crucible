@@ -193,6 +193,8 @@ for (const col of [
   "ALTER TABLE sessions ADD COLUMN provider_claude TEXT",
   "ALTER TABLE sessions ADD COLUMN prompt_hash     TEXT",
   "ALTER TABLE sessions ADD COLUMN config_snapshot TEXT",
+  "ALTER TABLE sessions ADD COLUMN arm             TEXT",
+  "ALTER TABLE sessions ADD COLUMN task_class      TEXT",
 ]) {
   try { db.exec(col); } catch (e) {
     if (!e.message.includes("duplicate column")) throw e;
@@ -200,7 +202,7 @@ for (const col of [
 }
 
 const stmts = {
-  createSession:       db.prepare(`INSERT INTO sessions (project, repo_path, repo_url, gpt_model, claude_model, provider_gpt, provider_claude, prompt_hash, config_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+  createSession:       db.prepare(`INSERT INTO sessions (project, repo_path, repo_url, gpt_model, claude_model, provider_gpt, provider_claude, prompt_hash, config_snapshot, arm, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
   updateSession:       db.prepare(`UPDATE sessions SET project=?, repo_path=?, repo_url=?, gpt_model=?, claude_model=?, provider_gpt=?, provider_claude=?, prompt_hash=?, config_snapshot=?, ended_at=datetime('now') WHERE id=?`),
   endSession:          db.prepare(`UPDATE sessions SET ended_at=datetime('now') WHERE id=?`),
   getSession:          db.prepare(`SELECT * FROM sessions WHERE id=?`),
@@ -279,11 +281,13 @@ const stmts = {
 };
 
 export function createSession({ project, repoPath, repoUrl, gptModel, claudeModel,
-                                providerGpt, providerClaude, promptHash, configSnapshot } = {}) {
+                                providerGpt, providerClaude, promptHash, configSnapshot,
+                                arm, taskClass } = {}) {
   return stmts.createSession.run(
     project||null, repoPath||null, repoUrl||null, gptModel||null, claudeModel||null,
     providerGpt||null, providerClaude||null, promptHash||null,
-    configSnapshot ? JSON.stringify(configSnapshot) : null
+    configSnapshot ? JSON.stringify(configSnapshot) : null,
+    arm||null, taskClass||null
   ).lastInsertRowid;
 }
 export function updateSession(id, fields) {

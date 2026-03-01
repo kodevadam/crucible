@@ -192,14 +192,18 @@ function buildConfigSnapshot(gptModel, claudeModel) {
 // ── Session state ─────────────────────────────────────────────────────────────
 
 const state = {
-  sessionId:   null,
-  proposalId:  null,
-  project:     null,
-  repoPath:    null,
-  repoUrl:     null,
-  repoContext: null,
-  gptModel:    null,
-  claudeModel: null,
+  sessionId:    null,
+  proposalId:   null,
+  project:      null,
+  repoPath:     null,
+  repoUrl:      null,
+  repoContext:  null,
+  gptModel:     null,
+  claudeModel:  null,
+  arm:          null,       // experimental arm label (--arm flag); null = unlabelled run
+  taskClass:    null,       // task classification (--task-class flag); e.g. bugfix/refactor/design
+  currentPhase: null,       // set at the start of each phase; read by askGPT/askClaude
+  phaseTokens:  {},         // { [phase]: { gpt_in, gpt_out, claude_in, claude_out } }
 };
 
 // ── Colours ───────────────────────────────────────────────────────────────────
@@ -220,6 +224,18 @@ const red    = s => `${c.red}${s}${c.reset}`;
 const hr       = (ch="─", w=72) => dim(ch.repeat(w));
 const round2   = n => Math.round(n * 100) / 100;   // two-decimal precision for rates
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+// Return the token counts accumulated for a given phase as flat object fields,
+// or an empty object if nothing was recorded yet (safe to spread into logMessage JSON).
+function _phaseTokens(phase) {
+  const t = state.phaseTokens[phase] || {};
+  const r = {};
+  if (t.gpt_in    != null) r.tokens_gpt_in    = t.gpt_in;
+  if (t.gpt_out   != null) r.tokens_gpt_out   = t.gpt_out;
+  if (t.claude_in  != null) r.tokens_claude_in  = t.claude_in;
+  if (t.claude_out != null) r.tokens_claude_out = t.claude_out;
+  return r;
+}
 
 function box(lines) {
   const width = Math.max(...lines.map(l => stripAnsi(l).length)) + 6;
@@ -376,6 +392,20 @@ function _warnTokenCeiling(label, used, budget) {
   }
 }
 
+function _accumTokens(model, usage) {
+  if (!usage) return;
+  const ph = state.currentPhase || "unknown";
+  if (!state.phaseTokens[ph]) state.phaseTokens[ph] = {};
+  const b = state.phaseTokens[ph];
+  if (model === "gpt") {
+    b.gpt_in  = (b.gpt_in  || 0) + (usage.prompt_tokens     || 0);
+    b.gpt_out = (b.gpt_out || 0) + (usage.completion_tokens || 0);
+  } else {
+    b.claude_in  = (b.claude_in  || 0) + (usage.input_tokens  || 0);
+    b.claude_out = (b.claude_out || 0) + (usage.output_tokens || 0);
+  }
+}
+
 async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
   try {
     // Prefer max_completion_tokens (required by GPT-5+ / o-series models)
@@ -383,6 +413,7 @@ async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
       model: state.gptModel, messages, max_completion_tokens: maxTokens,
     });
     _warnTokenCeiling("GPT", res.usage?.completion_tokens, maxTokens);
+    _accumTokens("gpt", res.usage);
     return res.choices[0].message.content;
   } catch (err) {
     // Older models (gpt-4, gpt-4-turbo) reject max_completion_tokens — retry with max_tokens
@@ -391,6 +422,7 @@ async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
         model: state.gptModel, messages, max_tokens: maxTokens,
       });
       _warnTokenCeiling("GPT", res.usage?.completion_tokens, maxTokens);
+      _accumTokens("gpt", res.usage);
       return res.choices[0].message.content;
     }
     throw err;
@@ -400,6 +432,7 @@ async function askGPT(messages, { maxTokens = GPT_MAX_TOKENS } = {}) {
 async function askClaude(messages, { maxTokens = CLAUDE_MAX_TOKENS } = {}) {
   const res = await getAnthropic().messages.create({ model: state.claudeModel, max_tokens: maxTokens, messages });
   _warnTokenCeiling("Claude", res.usage?.output_tokens, maxTokens);
+  _accumTokens("claude", res.usage);
   return res.content[0].text;
 }
 
@@ -1289,9 +1322,15 @@ async function runContextRequestStep(taskContext) {
     overlap_uncapped_count: intersect - overlapCapped,
   };
 
-  // Persist packs + stats — gitRev pins the exact content; stats enable trend queries
+  // Persist packs + stats — gitRev pins the exact content; stats enable trend queries.
+  // arm and task_class are colocated here so Q1 can filter by arm without a sessions join.
+  // tokens_* are the Phase 1a+draft call totals accumulated up to this point.
   DB.logMessage(state.proposalId, "host",
-    JSON.stringify({ gitRev, groundingStats, gptPack, claudePack }),
+    JSON.stringify({
+      gitRev, groundingStats, gptPack, claudePack,
+      arm: state.arm, task_class: state.taskClass,
+      ..._phaseTokens(PHASE_DRAFT),
+    }),
     { phase: PHASE_CONTEXT_REQUEST }
   );
 
@@ -1303,6 +1342,7 @@ async function runContextRequestStep(taskContext) {
 // No cross-model interaction — this establishes clean starting positions.
 
 async function runDraftPhase(taskContext) {
+  state.currentPhase = PHASE_DRAFT;
   const repoSection = state.repoContext
     ? `\n\nRepo context:\n${state.repoContext}`
     : "";
@@ -1388,6 +1428,7 @@ Set "converged": true only if you genuinely agree with the other model's plan an
 Output ONLY valid JSON. No markdown fences, no preamble.`;
 
 async function runCritiquePhase(draftResult, taskContext) {
+  state.currentPhase = PHASE_CRITIQUE;
   const repoSection = state.repoContext
     ? `\n\nRepo context:\n${state.repoContext}`
     : "";
@@ -1894,6 +1935,7 @@ function buildRawItemsFromCritique(critique, round) {
 // Must explicitly list accepted and rejected suggestions.
 
 async function runSynthesisPhase(draftResult, critiqueResult, taskContext) {
+  state.currentPhase = PHASE_SYNTHESIS;
   const { summary: draftSummary } = draftResult;
   const { gptPlan, claudePlan, summary: critiqueSummary, disagreements, synthesisDirection, round: critiqueRound } = critiqueResult;
 
@@ -2235,7 +2277,10 @@ async function proposalFlow(initialProposal) {
     // Persist critique-phase outcome stats — the "Y" side for Phase 1a predictor queries
     if (critiqueResult.critiqueFinalStats) {
       DB.logMessage(state.proposalId, "host",
-        JSON.stringify(critiqueResult.critiqueFinalStats),
+        JSON.stringify({
+          ...critiqueResult.critiqueFinalStats,
+          ..._phaseTokens(PHASE_CRITIQUE),
+        }),
         { phase: PHASE_CRITIQUE }
       );
     }
@@ -2371,6 +2416,7 @@ async function proposalFlow(initialProposal) {
       convergence_violations:    convergenceViolations.length,
       deferred_count:            synthesisResult.finalPlan?.deferred_suggestions?.length || 0,
       synthesis_steps:           synthesisResult.finalPlan?.steps?.length ?? null,
+      ..._phaseTokens(PHASE_SYNTHESIS),
     }), { phase: PHASE_SYNTHESIS });
 
     DB.updateProposal(state.proposalId, {
@@ -2764,6 +2810,8 @@ async function interactiveSession() {
     providerClaude: "anthropic",
     promptHash:     _snap.prompt_hash,
     configSnapshot: _snap,
+    arm:            state.arm,
+    taskClass:      state.taskClass,
   });
 
   // Project name
@@ -3106,7 +3154,18 @@ function cmdHelp() {
 // ── Entry ─────────────────────────────────────────────────────────────────────
 
 const [,, cmd, ...rest] = process.argv;
-const arg = rest.join(" ");
+// Parse --arm <label> and --task-class <label> flags; remaining args become the task string.
+const _flags = {}, _positional = [];
+for (let i = 0; i < rest.length; i++) {
+  if (rest[i].startsWith("--") && i + 1 < rest.length && !rest[i + 1].startsWith("--")) {
+    _flags[rest[i].slice(2)] = rest[i + 1]; i++;
+  } else if (!rest[i].startsWith("--")) {
+    _positional.push(rest[i]);
+  }
+}
+const arg = _positional.join(" ");
+state.arm       = _flags["arm"]        || null;
+state.taskClass = _flags["task-class"] || null;
 
 async function main() {
 switch (cmd) {
@@ -3124,6 +3183,7 @@ switch (cmd) {
       gptModel: gm, claudeModel: cm, project: arg.slice(0,60),
       providerGpt: "openai", providerClaude: "anthropic",
       promptHash: _planSnap.prompt_hash, configSnapshot: _planSnap,
+      arm: state.arm, taskClass: state.taskClass,
     });
     state.proposalId = DB.createProposal(state.sessionId, arg.slice(0,60), null);
     // Phase 0 — Clarification: Claude asks focused questions, user answers
@@ -3173,6 +3233,7 @@ switch (cmd) {
       gptModel: gm, claudeModel: cm,
       providerGpt: "openai", providerClaude: "anthropic",
       promptHash: _debateSnap.prompt_hash, configSnapshot: _debateSnap,
+      arm: state.arm, taskClass: state.taskClass,
     });
     state.proposalId = DB.createProposal(state.sessionId, arg.slice(0,60), null);
     const result = await runDebate(`Task: ${arg}`);

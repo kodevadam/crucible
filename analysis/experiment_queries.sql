@@ -40,6 +40,13 @@ SELECT
   p.title,
   p.rounds,
   datetime(p.created_at)                                             AS created_at,
+  -- ── Experiment arm / stratification ────────────────────────────────────────
+  -- arm: set via --arm flag (e.g. "full", "single-model", "no-critique")
+  -- task_class: set via --task-class flag (e.g. "bugfix", "refactor", "design")
+  -- Both are stored on sessions AND colocated in the Phase 1a grounding message
+  -- to allow filtering without a sessions join.
+  ses.arm                                                            AS arm,
+  ses.task_class                                                     AS task_class,
   -- ── Phase 1a grounding predictors ──────────────────────────────────────────
   json_extract(g.content, '$.groundingStats.divergence_rate')        AS divergence_rate,
   json_extract(g.content, '$.groundingStats.overlap_uncapped_count') AS overlap_uncapped_count,
@@ -50,6 +57,11 @@ SELECT
   json_extract(g.content, '$.groundingStats.overlap_capped_count')   AS overlap_capped_count,
   json_extract(g.content, '$.groundingStats.gpt_capped')             AS gpt_capped,
   json_extract(g.content, '$.groundingStats.claude_capped')          AS claude_capped,
+  -- Phase 1 draft tokens (includes Phase 1a file-request calls)
+  json_extract(g.content, '$.tokens_gpt_in')                         AS draft_tokens_gpt_in,
+  json_extract(g.content, '$.tokens_gpt_out')                        AS draft_tokens_gpt_out,
+  json_extract(g.content, '$.tokens_claude_in')                      AS draft_tokens_claude_in,
+  json_extract(g.content, '$.tokens_claude_out')                     AS draft_tokens_claude_out,
   -- ── Phase 2 negotiation mediators ──────────────────────────────────────────
   json_extract(c.content, '$.rounds_completed')                      AS rounds_completed,
   json_extract(c.content, '$.converged_naturally')                   AS converged_naturally,
@@ -57,6 +69,11 @@ SELECT
   json_extract(c.content, '$.blocking_minted')                       AS blocking_minted_phase2,
   json_extract(c.content, '$.important_minted')                      AS important_minted,
   json_extract(c.content, '$.minor_minted')                          AS minor_minted,
+  -- Phase 2 critique tokens
+  json_extract(c.content, '$.tokens_gpt_in')                         AS critique_tokens_gpt_in,
+  json_extract(c.content, '$.tokens_gpt_out')                        AS critique_tokens_gpt_out,
+  json_extract(c.content, '$.tokens_claude_in')                      AS critique_tokens_claude_in,
+  json_extract(c.content, '$.tokens_claude_out')                     AS critique_tokens_claude_out,
   -- ── Phase 3 outcome ────────────────────────────────────────────────────────
   json_extract(s.content, '$.blocking_active_going_in')              AS blocking_active_going_in,
   json_extract(s.content, '$.blocking_resolved_count')               AS blocking_resolved_count,
@@ -72,6 +89,11 @@ SELECT
   json_extract(s.content, '$.convergence_violations')                AS convergence_violations,
   json_extract(s.content, '$.deferred_count')                        AS deferred_count,
   json_extract(s.content, '$.synthesis_steps')                       AS synthesis_steps,
+  -- Phase 3 synthesis tokens
+  json_extract(s.content, '$.tokens_gpt_in')                         AS synthesis_tokens_gpt_in,
+  json_extract(s.content, '$.tokens_gpt_out')                        AS synthesis_tokens_gpt_out,
+  json_extract(s.content, '$.tokens_claude_in')                      AS synthesis_tokens_claude_in,
+  json_extract(s.content, '$.tokens_claude_out')                     AS synthesis_tokens_claude_out,
   -- ── Derived outcomes ───────────────────────────────────────────────────────
   CASE
     WHEN json_extract(s.content, '$.blocking_active_going_in') > 0
@@ -86,8 +108,23 @@ SELECT
       json_extract(s.content, '$.blocking_active_going_in') * 1.0
       / json_extract(s.content, '$.blocking_minted_total'), 3)
     ELSE NULL
-  END                                                                AS computed_survival_rate
+  END                                                                AS computed_survival_rate,
+  -- Total token cost proxy per run (all phases combined, both models)
+  -- Multiply by per-model token price to get dollar cost.
+  COALESCE(json_extract(g.content, '$.tokens_gpt_in'),    0)
+  + COALESCE(json_extract(g.content, '$.tokens_gpt_out'),  0)
+  + COALESCE(json_extract(c.content, '$.tokens_gpt_in'),   0)
+  + COALESCE(json_extract(c.content, '$.tokens_gpt_out'),  0)
+  + COALESCE(json_extract(s.content, '$.tokens_gpt_in'),   0)
+  + COALESCE(json_extract(s.content, '$.tokens_gpt_out'),  0)                AS total_gpt_tokens,
+  COALESCE(json_extract(g.content, '$.tokens_claude_in'),  0)
+  + COALESCE(json_extract(g.content, '$.tokens_claude_out'),0)
+  + COALESCE(json_extract(c.content, '$.tokens_claude_in'), 0)
+  + COALESCE(json_extract(c.content, '$.tokens_claude_out'),0)
+  + COALESCE(json_extract(s.content, '$.tokens_claude_in'), 0)
+  + COALESCE(json_extract(s.content, '$.tokens_claude_out'),0)               AS total_claude_tokens
 FROM proposals p
+JOIN sessions ses ON ses.id = p.session_id
 -- One grounding message per proposal (Phase 1a fires once)
 JOIN messages g ON g.proposal_id = p.id
                AND g.phase = 'context_request'
@@ -101,6 +138,9 @@ JOIN messages s ON s.proposal_id = p.id
                AND s.phase = 'synthesis'
                AND s.role  = 'host'
 WHERE p.status = 'complete'
+-- To filter by arm: WHERE ses.arm = 'full'
+-- To filter by task class: WHERE ses.task_class = 'bugfix'
+-- To lock dataset: AND p.created_at >= '2026-01-01' AND p.created_at < '2026-02-01'
 ORDER BY p.created_at DESC;
 
 
