@@ -12,9 +12,11 @@
 
 import { test }                                           from "node:test";
 import assert                                             from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from "fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync,
+         readFileSync, mkdirSync }                        from "fs";
 import { join }                                           from "path";
 import { tmpdir }                                         from "os";
+import { spawnSync }                                      from "child_process";
 import { evaluateDelta, buildIterationContext,
          dispatchRepairTool, REPAIR_TOOLS,
          RUN_COMMAND_MAX_OUTPUT }                        from "../src/conductor.js";
@@ -427,5 +429,84 @@ test("dispatchRepairTool: run_command captures nonzero exit code correctly", () 
       `expected exit 42, got: ${result.slice(0, 40)}`);
   } finally {
     rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── Worktree reset proof ──────────────────────────────────────────────────────
+//
+// Conductor invariant #1: "Worktree created once; reset to HEAD before every iteration."
+// This test proves that the exact git commands the conductor uses
+// (`git reset --hard HEAD` + `git clean -fd`) actually restore worktree
+// contents to HEAD, eliminating cumulative drift across iterations.
+//
+// We don't run runRepairLoop (requires model API) but we directly exercise
+// the same two commands against a real git worktree.
+
+function git(cwd, args) {
+  return spawnSync(
+    "git",
+    ["-C", cwd,
+     "-c", "core.hooksPath=/dev/null",
+     "-c", "commit.gpgsign=false",  // disable signing; test env may require it
+     "-c", "tag.gpgsign=false",
+     ...args],
+    {
+      encoding: "utf8",
+      stdio:    ["ignore", "pipe", "pipe"],
+      shell:    false,
+      env:      { ...process.env },
+    }
+  );
+}
+
+test("worktree reset: git reset --hard HEAD + clean -fd restores to HEAD content", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "crucible-repo-"));
+  const wtDir   = mkdtempSync(join(tmpdir(), "crucible-wt-"));
+
+  try {
+    // ── 1. Create a minimal git repo with one committed file ──────────────────
+    git(repoDir, ["init", "--initial-branch=main"]);
+    git(repoDir, ["config", "user.email", "test@crucible"]);
+    git(repoDir, ["config", "user.name",  "Crucible Test"]);
+    writeFileSync(join(repoDir, "app.js"), "const version = 1;\n", "utf8");
+    git(repoDir, ["add", "app.js"]);
+    git(repoDir, ["commit", "-m", "initial commit"]);
+
+    // ── 2. Create a linked worktree (mirrors what conductor does) ─────────────
+    // Use a fresh tempdir path that doesn't exist yet as the worktree target
+    rmSync(wtDir, { recursive: true, force: true }); // worktree add creates it
+    git(repoDir, ["worktree", "add", "--detach", wtDir]);
+
+    // Verify the worktree has the committed content
+    assert.equal(readFileSync(join(wtDir, "app.js"), "utf8"), "const version = 1;\n",
+      "worktree should start at HEAD content");
+
+    // ── 3. Simulate "iteration 1 modified files" ──────────────────────────────
+    writeFileSync(join(wtDir, "app.js"), "const version = 99; // iteration 1 change\n", "utf8");
+    writeFileSync(join(wtDir, "new-file-from-iter1.js"), "// leftover\n", "utf8");
+
+    assert.equal(readFileSync(join(wtDir, "app.js"), "utf8"),
+      "const version = 99; // iteration 1 change\n",
+      "modification is in place before reset");
+
+    // ── 4. Apply the exact reset the conductor runs before each iteration ──────
+    git(wtDir, ["reset", "--hard", "HEAD"]);
+    git(wtDir, ["clean",  "-fd"]);
+
+    // ── 5. Verify: app.js is back to HEAD; untracked file is gone ─────────────
+    assert.equal(readFileSync(join(wtDir, "app.js"), "utf8"), "const version = 1;\n",
+      "app.js must be restored to HEAD after reset --hard");
+
+    let leftoverExists = false;
+    try { readFileSync(join(wtDir, "new-file-from-iter1.js")); leftoverExists = true; } catch {}
+    assert.equal(leftoverExists, false,
+      "untracked file from iteration 1 must be removed by git clean -fd");
+
+  } finally {
+    // Remove linked worktree before deleting its directory
+    git(repoDir, ["worktree", "remove", "--force", wtDir]);
+    rmSync(repoDir, { recursive: true, force: true });
+    // wtDir may already be removed by `worktree remove`; force:true handles that
+    try { rmSync(wtDir, { recursive: true, force: true }); } catch {}
   }
 });

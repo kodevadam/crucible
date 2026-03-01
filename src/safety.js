@@ -259,9 +259,10 @@ export function validateStagingPath(repoRoot, proposedPath) {
     throw new Error(`Path traversal rejected: ${proposedPath}`);
   }
 
-  // Reject .git directory access — no legitimate caller should target git internals
-  const norm = normalised.replace(/\\/g, "/");
-  if (norm === ".git" || norm.startsWith(".git/") || norm.includes("/.git/")) {
+  // Reject .git directory access — case-insensitive to cover macOS / case-insensitive FS
+  const norm      = normalised.replace(/\\/g, "/");
+  const normLower = norm.toLowerCase();
+  if (normLower === ".git" || normLower.startsWith(".git/") || normLower.includes("/.git/")) {
     throw new Error(`.git path rejected: ${proposedPath}`);
   }
 

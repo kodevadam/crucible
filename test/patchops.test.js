@@ -415,3 +415,107 @@ test("adversarial A5: duplicate create same path — last content wins", () => {
     rmSync(wt, { recursive: true, force: true });
   }
 });
+
+// ── 15. Nonexistent-create under symlinked parent (A6) ────────────────────────
+//
+// The race condition: if mkdirSync fires BEFORE the symlink check, and the
+// intermediate path component is a symlink pointing outward, mkdirSync creates
+// directories OUTSIDE the worktree before assertInsideWorktree ever runs.
+//
+// The fix: walk ancestors to the nearest existing dir and pre-check it.
+// Setup: wt/safe/ (real dir) + wt/safe/link -> external (symlink).
+// Attack: create("safe/link/newdir/newfile.txt") — newdir doesn't exist yet.
+// Expected: throw patch_symlink_escape AND nothing created in external.
+
+test("adversarial A6: create with nonexistent parent through symlink — pre-check blocks mkdirSync", () => {
+  const wt       = mkdtempSync(join(tmpdir(), "crucible-a6-"));
+  const external = mkdtempSync(join(tmpdir(), "crucible-a6ext-"));
+  try {
+    mkdirSync(join(wt, "safe"));
+    symlinkSync(external, join(wt, "safe", "link")); // wt/safe/link → external
+
+    assert.throws(
+      () => applyPatchOpsToWorktree(wt, [
+        // newdir and newfile do not yet exist; pre-check must fire before mkdirSync
+        { op: "create", path: "safe/link/newdir/newfile.txt", content: "bad\n" },
+      ]),
+      err => err.code === "patch_symlink_escape",
+      "pre-check must catch symlink escape before mkdirSync runs"
+    );
+
+    // Critical: newdir must NOT have been created in the external dir
+    let dirCreated = false;
+    try { statSync(join(external, "newdir")); dirCreated = true; } catch {}
+    assert.equal(dirCreated, false,
+      "mkdirSync must not have run: no directory created in external target");
+
+    // And nothing written outside the worktree
+    let fileCreated = false;
+    try { readFileSync(join(external, "newdir", "newfile.txt")); fileCreated = true; } catch {}
+    assert.equal(fileCreated, false, "no file must have been created outside worktree");
+  } finally {
+    rmSync(wt,       { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
+});
+
+// ── 16. Prefix-trick containment (A7): + sep guard ───────────────────────────
+//
+// Without the `+ sep` suffix in the prefix check, a worktree at /tmp/wt would
+// incorrectly ACCEPT a path resolving to /tmp/wt-evil/x because it
+// startsWith("/tmp/wt") without the separator.  This test documents the guard.
+
+test("adversarial A7: prefix-trick — sibling worktree path not accepted", () => {
+  const wt       = mkdtempSync(join(tmpdir(), "crucible-wt-"));
+  // Create a sibling directory whose name starts with the worktree name
+  // (simulating the /tmp/wt vs /tmp/wt-evil prefix confusion).
+  const sibling  = mkdtempSync(join(tmpdir(), "crucible-wt-")); // different suffix
+  try {
+    writeFileSync(join(sibling, "target.txt"), "sibling content\n", "utf8");
+    symlinkSync(sibling, join(wt, "evil")); // wt/evil → sibling (a dir whose path starts with wt's prefix)
+
+    // The symlink leads to a sibling directory — realpath(evil/target.txt)
+    // resolves to <sibling>/target.txt, which must NOT be accepted just because
+    // <sibling> happens to have a path that is a prefix-extension of <wt>.
+    assert.throws(
+      () => applyPatchOpsToWorktree(wt, [
+        { op: "replace", path: "evil/target.txt", old: "sibling content", new: "pwned" },
+      ]),
+      err => err.code === "patch_symlink_escape",
+      "sibling path must be rejected even if its name starts with the worktree prefix"
+    );
+    assert.equal(readFileSync(join(sibling, "target.txt"), "utf8"), "sibling content\n",
+      "sibling file must be unchanged");
+  } finally {
+    rmSync(wt,      { recursive: true, force: true });
+    rmSync(sibling, { recursive: true, force: true });
+  }
+});
+
+// ── 17. Case-insensitive .git rejection ───────────────────────────────────────
+//
+// On case-insensitive file systems (macOS, Windows) .GiT/config and .GIT/config
+// address the same .git directory.  The schema validator must reject these.
+// On Linux (case-sensitive FS) these are technically different paths, but we
+// still reject them to keep the invariant platform-independent.
+
+test("parsePatchOps: rejects .GiT/config (case-insensitive .git check)", () => {
+  const ops = [{ op: "replace", path: ".GiT/config", old: "x", new: "y" }];
+  try {
+    parsePatchOps(JSON.stringify(ops));
+    assert.fail("expected throw");
+  } catch (e) {
+    assert.equal(e.code, "patch_schema_invalid");
+    assert.ok(e.message.includes(".git"), `message should mention .git, got: ${e.message}`);
+  }
+});
+
+test("parsePatchOps: rejects .GIT/COMMIT_EDITMSG (case-insensitive .git check)", () => {
+  const ops = [{ op: "delete_file", path: ".GIT/COMMIT_EDITMSG" }];
+  try {
+    parsePatchOps(JSON.stringify(ops));
+    assert.fail("expected throw");
+  } catch (e) {
+    assert.equal(e.code, "patch_schema_invalid");
+  }
+});

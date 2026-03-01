@@ -64,8 +64,9 @@ function validateOpPath(relPath, opIndex) {
     throw err;
   }
 
-  // .git directory access
-  if (norm === ".git" || norm.startsWith(".git/") || norm.includes("/.git/")) {
+  // .git directory access — case-insensitive to cover macOS / case-insensitive FS
+  const normLower = norm.toLowerCase();
+  if (normLower === ".git" || normLower.startsWith(".git/") || normLower.includes("/.git/")) {
     const err = new Error(`Op[${opIndex}] "path" targets .git directory: ${relPath}`);
     err.code = "patch_schema_invalid";
     throw err;
@@ -292,10 +293,38 @@ export function applyPatchOpsToWorktree(worktreePath, ops) {
   // Content ops (replace/insert_after/delete) are then applied grouped by file.
   for (const op of ops) {
     if (op.op === "create") {
-      const absPath = join(worktreePath, op.path);
-      mkdirSync(dirname(absPath), { recursive: true });
-      // Check parent after creation — catches symlink dirs that already existed
-      assertInsideWorktree(dirname(absPath), "create op parent dir");
+      const absPath    = join(worktreePath, op.path);
+      const parentPath = dirname(absPath);
+
+      // Pre-check: walk up to the nearest existing ancestor and verify it is
+      // inside the worktree BEFORE calling mkdirSync.  If we called mkdirSync
+      // first, an intermediate symlink pointing outward could cause new
+      // directories to be created outside the worktree before the check fires.
+      let checkPath = parentPath;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        let realCheck;
+        try { realCheck = realpathSync(checkPath); }
+        catch (e) {
+          if (e.code === "ENOENT") {
+            const up = dirname(checkPath);
+            if (up === checkPath) break; // reached fs root — safe, let mkdirSync fail naturally
+            checkPath = up;
+            continue;
+          }
+          throw e;
+        }
+        // Nearest existing ancestor found — verify it is inside the worktree
+        if (realCheck !== realWt && !realCheck.startsWith(realWt + sep)) {
+          throw Object.assign(
+            new Error("create op parent dir escapes worktree via symlink"),
+            { code: "patch_symlink_escape" }
+          );
+        }
+        break;
+      }
+
+      mkdirSync(parentPath, { recursive: true });
       writeFileSync(absPath, op.content, "utf8");
     } else if (op.op === "delete_file") {
       const absPath = join(worktreePath, op.path);
