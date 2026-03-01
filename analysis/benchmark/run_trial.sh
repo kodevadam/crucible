@@ -37,6 +37,8 @@ SEED="${RANDOM}"
 DRY_RUN=false
 PRINT_RUN_PLAN=false
 
+ORIG_ARGS=("$@")
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tasks)          TASKS_JSON="$2"; shift 2 ;;
@@ -73,23 +75,31 @@ mapfile -t shuffled < <(printf '%s\n' "${pairs[@]}" | shuf --random-source=<(ope
 
 total="${#shuffled[@]}"
 
+# ── Shared metadata (used by both --print-run-plan and live run) ───────────────
+tasks_sha256_raw="$(sha256sum "${TASKS_JSON}" 2>/dev/null | cut -c1-16 \
+  || shasum -a 256 "${TASKS_JSON}" 2>/dev/null | cut -c1-16 \
+  || echo '?')"
+git_rev="$(git -C "${SCRIPT_DIR}" rev-parse HEAD 2>/dev/null || echo 'nogit')"
+max_id_before="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo 0)"
+win_lo=$((max_id_before + 1))
+win_hi=$((max_id_before + total))
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+RUN_ID="${RUN_TS}_seed${SEED}_${tasks_sha256_raw:0:8}_${git_rev:0:7}"
+
 # ── --print-run-plan: show metadata and exit ───────────────────────────────────
 if [[ "$PRINT_RUN_PLAN" == "true" ]]; then
-  max_id="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo '?')"
-  win_lo=$((max_id + 1))
-  win_hi=$((max_id + total))
-  git_rev="$(git -C "${SCRIPT_DIR}" rev-parse HEAD 2>/dev/null || echo 'not-a-git-repo')"
-  tasks_hash="$(sha256sum "${TASKS_JSON}" 2>/dev/null | cut -c1-16 || md5 -q "${TASKS_JSON}" 2>/dev/null | cut -c1-16 || echo '?')"
   echo "Run plan"
-  echo "  seed        : ${SEED}"
-  echo "  git_rev     : ${git_rev}"
-  echo "  tasks       : ${TASKS_JSON}"
-  echo "  tasks_hash  : ${tasks_hash}  (sha256 prefix — detects task edits since this plan was printed)"
-  echo "  arms        : ${ARMS}"
-  echo "  total runs  : ${total}"
-  echo "  output      : ${OUT}"
-  echo "  db          : ${DB}"
-  echo "  planned window: ${win_lo}–${win_hi}  (proposals with id > ${max_id})"
+  echo "  run_id           : ${RUN_ID}"
+  echo "  invocation       : $0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}"
+  echo "  seed             : ${SEED}"
+  echo "  git_rev          : ${git_rev}"
+  echo "  tasks            : ${TASKS_JSON}"
+  echo "  tasks_sha256_raw : ${tasks_sha256_raw}  (sha256 of raw bytes on disk — not parsed/canonicalized)"
+  echo "  arms             : ${ARMS}"
+  echo "  total runs       : ${total}"
+  echo "  output           : ${OUT}"
+  echo "  db               : ${DB}"
+  echo "  planned window   : ${win_lo}–${win_hi}  (proposals with id > ${max_id_before})"
   echo ""
   echo "  #   task_id              arm"
   echo "  ─────────────────────────────────────────"
@@ -104,28 +114,35 @@ if [[ "$PRINT_RUN_PLAN" == "true" ]]; then
   echo ""
   echo "  Verify completion after run (copy-paste into sqlite3):"
   echo ""
+  echo "    -- 1. Row-level status"
   echo "    SELECT id, status FROM proposals"
   echo "    WHERE id BETWEEN ${win_lo} AND ${win_hi} ORDER BY id;"
   echo ""
+  echo "    -- 2. Aggregate: counts + observed window (planned vs observed)"
   echo "    SELECT COUNT(*) AS rows, SUM(status='complete') AS complete,"
   echo "           MIN(id) AS observed_lo, MAX(id) AS observed_hi"
   echo "    FROM proposals WHERE id BETWEEN ${win_lo} AND ${win_hi};"
+  echo ""
+  echo "    -- 3. Task/arm breakdown — catches 'completed but wrong task set'"
+  echo "    SELECT task_id, arm, COUNT(*) AS n"
+  echo "    FROM proposals"
+  echo "    WHERE id BETWEEN ${win_lo} AND ${win_hi}"
+  echo "    GROUP BY task_id, arm ORDER BY task_id, arm;"
+  echo ""
+  echo "    -- 4. By run_id (requires: ALTER TABLE proposals ADD COLUMN run_id TEXT)"
+  echo "    SELECT id, status FROM proposals WHERE run_id = '${RUN_ID}' ORDER BY id;"
   exit 0
 fi
 
 # ── CSV header ─────────────────────────────────────────────────────────────────
-echo "task_id,arm,task_class,recall,recall_per_1k_tokens,total_gpt_tokens,total_claude_tokens,blocking_survival_rate,converged_naturally,rounds_completed,partition_residual,proposal_id" \
+echo "task_id,arm,task_class,recall,recall_per_1k_tokens,total_gpt_tokens,total_claude_tokens,blocking_survival_rate,converged_naturally,rounds_completed,partition_residual,proposal_id,run_id" \
   > "$OUT"
 
-echo "Trial: ${total} runs  |  arms: ${ARMS}  |  seed: ${SEED}  |  out: ${OUT}" >&2
+echo "Trial: ${total} runs  |  arms: ${ARMS}  |  seed: ${SEED}  |  run_id: ${RUN_ID}  |  out: ${OUT}" >&2
+echo "  invocation: $0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}" >&2
 echo "" >&2
 
 # ── Run loop ───────────────────────────────────────────────────────────────────
-# Snapshot proposal id ceiling before any run — used in failure breadcrumbs.
-max_id_start="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo 0)"
-win_lo=$((max_id_start + 1))
-win_hi=$((max_id_start + total))
-
 n=0
 failed=0
 for pair in "${shuffled[@]}"; do
@@ -141,7 +158,7 @@ for pair in "${shuffled[@]}"; do
 
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "  DRY RUN — would run: crucible plan \"${prompt:0:60}...\" --arm \"$arm\" --task-class \"$task_class\" --batch" >&2
-    echo "${task_id},${arm},${task_class},dry-run,dry-run,dry-run,dry-run,dry-run,dry-run,dry-run,dry-run,dry-run" >> "$OUT"
+    echo "${task_id},${arm},${task_class},dry-run,dry-run,dry-run,dry-run,dry-run,dry-run,dry-run,dry-run,dry-run,${RUN_ID}" >> "$OUT"
     continue
   fi
 
@@ -218,14 +235,15 @@ SELECT
   COALESCE(converged, 'null'),
   COALESCE(rounds, 'null'),
   residual,
-  pid
+  pid,
+  '${RUN_ID}'
 FROM rd;
 " 2>/dev/null)"
 
   if [[ -z "$metrics" ]]; then
     last_pid="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), "?") FROM proposals' 2>/dev/null || echo '?')"
     echo "  FAILED: no completed proposal found (run ${n}/${total}, proposal_id=${last_pid}, planned window ${win_lo}–${win_hi})" >&2
-    echo "${task_id},${arm},${task_class},no_proposal,no_proposal,0,0,null,null,null,null,null" >> "$OUT"
+    echo "${task_id},${arm},${task_class},no_proposal,no_proposal,0,0,null,null,null,null,null,${RUN_ID}" >> "$OUT"
     failed=$((failed + 1))
   else
     echo "$metrics" >> "$OUT"
