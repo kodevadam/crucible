@@ -131,6 +131,14 @@ if [[ "$PRINT_RUN_PLAN" == "true" ]]; then
   echo ""
   echo "    -- 4. By run_id (requires: ALTER TABLE proposals ADD COLUMN run_id TEXT)"
   echo "    SELECT id, status FROM proposals WHERE run_id = '${RUN_ID}' ORDER BY id;"
+  echo ""
+  echo "    -- 5. Trial registry header"
+  echo "    SELECT run_id, started_at, finished_at, total_runs, failed_runs"
+  echo "    FROM runs WHERE run_id = '${RUN_ID}';"
+  echo ""
+  echo "    -- 6. Per-attempt status (started → complete | failed)"
+  echo "    SELECT n, task_id, arm, status, proposal_id"
+  echo "    FROM run_attempts WHERE run_id = '${RUN_ID}' ORDER BY n;"
   exit 0
 fi
 
@@ -141,6 +149,50 @@ echo "task_id,arm,task_class,recall,recall_per_1k_tokens,total_gpt_tokens,total_
 echo "Trial: ${total} runs  |  arms: ${ARMS}  |  seed: ${SEED}  |  run_id: ${RUN_ID}  |  out: ${OUT}" >&2
 echo "  invocation: $0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}" >&2
 echo "" >&2
+
+# ── Trial registry ──────────────────────────────────────────────────────────────
+# Escape single quotes for SQL embedding (paths or arms could theoretically
+# contain them; invocation especially might from quoted flag values).
+_invocation="$0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}"
+_inv_sql="${_invocation//\'/\'\'}"
+_arms_sql="${ARMS//\'/\'\'}"
+_tasks_sql="${TASKS_JSON//\'/\'\'}"
+_out_sql="${OUT//\'/\'\'}"
+
+sqlite3 "$DB" "
+CREATE TABLE IF NOT EXISTS runs (
+  run_id           TEXT PRIMARY KEY,
+  started_at       TEXT,
+  finished_at      TEXT,
+  git_rev          TEXT,
+  tasks_sha256_raw TEXT,
+  seed             INTEGER,
+  arms             TEXT,
+  planned_lo       INTEGER,
+  planned_hi       INTEGER,
+  invocation       TEXT,
+  tasks_path       TEXT,
+  output_path      TEXT,
+  total_runs       INTEGER,
+  failed_runs      INTEGER
+);
+CREATE TABLE IF NOT EXISTS run_attempts (
+  run_id      TEXT,
+  n           INTEGER,
+  task_id     TEXT,
+  arm         TEXT,
+  proposal_id INTEGER,
+  status      TEXT,
+  PRIMARY KEY (run_id, n)
+);
+INSERT OR IGNORE INTO runs
+  (run_id, started_at, git_rev, tasks_sha256_raw, seed, arms,
+   planned_lo, planned_hi, invocation, tasks_path, output_path, total_runs)
+VALUES
+  ('${RUN_ID}', datetime('now'), '${git_rev}', '${tasks_sha256_raw}', ${SEED},
+   '${_arms_sql}', ${win_lo}, ${win_hi}, '${_inv_sql}', '${_tasks_sql}',
+   '${_out_sql}', ${total});
+" 2>/dev/null || true
 
 # ── Run loop ───────────────────────────────────────────────────────────────────
 n=0
@@ -164,6 +216,10 @@ for pair in "${shuffled[@]}"; do
 
   # Snapshot max proposal id before run so we can identify the new row exactly
   max_before="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo 0)"
+
+  # Register attempt as 'started' — distinguishable from 'never inserted' if we crash
+  sqlite3 "$DB" "INSERT OR REPLACE INTO run_attempts (run_id, n, task_id, arm, status)
+    VALUES ('${RUN_ID}', ${n}, '${task_id}', '${arm}', 'started');" 2>/dev/null || true
 
   # Execute — pipe /dev/null to handle any residual readline reads
   crucible plan "$prompt" --arm "$arm" --task-class "$task_class" --batch \
@@ -244,9 +300,14 @@ FROM rd;
     last_pid="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), "?") FROM proposals' 2>/dev/null || echo '?')"
     echo "  FAILED: no completed proposal found (run ${n}/${total}, proposal_id=${last_pid}, planned window ${win_lo}–${win_hi})" >&2
     echo "${task_id},${arm},${task_class},no_proposal,no_proposal,0,0,null,null,null,null,null,${RUN_ID}" >> "$OUT"
+    sqlite3 "$DB" "UPDATE run_attempts SET status='failed'
+      WHERE run_id='${RUN_ID}' AND n=${n};" 2>/dev/null || true
     failed=$((failed + 1))
   else
     echo "$metrics" >> "$OUT"
+    pid="$(echo "$metrics" | cut -d',' -f12)"
+    sqlite3 "$DB" "UPDATE run_attempts SET status='complete', proposal_id=${pid}
+      WHERE run_id='${RUN_ID}' AND n=${n};" 2>/dev/null || true
     # Surface non-zero residual as a warning (conservation law violation)
     residual="$(echo "$metrics" | cut -d',' -f11)"
     if [[ "$residual" != "0" && "$residual" != "null" ]]; then
@@ -258,6 +319,9 @@ FROM rd;
 done
 
 # ── Summary ────────────────────────────────────────────────────────────────────
+sqlite3 "$DB" "UPDATE runs SET finished_at=datetime('now'), failed_runs=${failed}
+  WHERE run_id='${RUN_ID}';" 2>/dev/null || true
+
 observed="$(sqlite3 -separator ' ' "$DB" \
   "SELECT COUNT(*), SUM(status='complete'), COALESCE(MIN(id),'—'), COALESCE(MAX(id),'—')
    FROM proposals WHERE id BETWEEN ${win_lo} AND ${win_hi};" 2>/dev/null || echo "? ? ? ?")"
@@ -267,6 +331,7 @@ echo "Done: ${total} runs, ${failed} failed  →  ${OUT}" >&2
 echo "" >&2
 echo "  planned window : ${win_lo}–${win_hi} (${total} rows expected)" >&2
 echo "  observed window: ${obs_lo}–${obs_hi} (${obs_rows} rows, ${obs_complete} complete)" >&2
+echo "  run_id         : ${RUN_ID}" >&2
 if [[ "$failed" -gt 0 ]]; then
   echo "" >&2
   echo "  Check failed rows (no_proposal) — crucible may have exited before synthesis." >&2
