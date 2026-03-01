@@ -1,56 +1,49 @@
 /**
  * test/integration/gauntlet.js — end-to-end conductor gauntlet
  *
- * The "real fix" scenario: the conductor must discover, plan, and apply a
- * multi-file refactor that requires all of:
+ * Three deterministic scenarios run always (no API key required).
+ * A live smoke run is appended when ANTHROPIC_API_KEY / keychain is present.
  *
- *   1. CREATE  src/core/precision.js   — new module with correct Math.round
- *   2. UPDATE  src/formatter.js        — re-point import to ./core/precision.js
- *   3. DELETE  src/numutils.js         — obsolete file removed
- *   4. Run typecheck and test commands  — two different run_command kinds
- *   5. Converge inside turn / tool budgets, stay in worktree, clean diff
- *   6. Approval writes exactly what the diff showed
+ *  Scenario 1 — happy path
+ *    Two-turn replay: read_file then submit correct ops.
+ *    Validates: worktree isolation, apply, diff, write-back, cleanup.
  *
- * Two modes — automatic selection:
+ *  Scenario 2 — stall then bail
+ *    Replay returns ops that apply cleanly but leave tests failing.
+ *    Iteration 2 sees delta="same" → bail_same.
+ *    Validates: multi-iteration loop, evaluate/bail events, "0"-abort path,
+ *               no write-back on abort, worktree cleanup on failure path.
  *
- *   REPLAY mode (no API key needed)
- *     A ReplayClient feeds the conductor a deterministic two-turn transcript:
- *       Turn 1 → read_file("src/formatter.js")  (exercises tool dispatch path)
- *       Turn 2 → submit_ops(REPLAY_OPS)          (correct three-op fix)
- *     Validates the entire pipeline (worktree, apply, diff, write-back,
- *     cleanup) without any network call or token spend.
- *     Runs automatically in CI.
- *
- *   LIVE mode (requires ANTHROPIC_API_KEY or crucible keychain entry)
- *     Uses model="claude-haiku-4-5-20251001".  Same 10 assertions as replay.
- *     Run to verify real model behaviour.
+ *  Scenario 3 — anchor mismatch → B1 regeneration
+ *    First call returns one bad-anchor replace op; applyPatchOpsToWorktree
+ *    throws patch_anchor_not_found; tryApplyWithRecovery fires B1, calls
+ *    generateMultiFileOps again; second call returns correct ops → tests pass.
+ *    Validates: anchor_retry event, B1 regen, recovery ladder, approval.
  *
  * Usage:
  *   node test/integration/gauntlet.js               # replay (always works)
- *   ANTHROPIC_API_KEY=sk-ant-... node test/integration/gauntlet.js  # live
+ *   ANTHROPIC_API_KEY=sk-ant-... node test/integration/gauntlet.js  # + live smoke
  */
 
-import { mkdtempSync, writeFileSync, readFileSync,
-         existsSync, rmSync, cpSync }                from "fs";
-import { join, dirname }                             from "path";
-import { fileURLToPath }                             from "url";
-import { tmpdir }                                    from "os";
-import { spawnSync }                                 from "child_process";
+import { mkdtempSync, readFileSync, existsSync, rmSync, cpSync } from "fs";
+import { join, dirname }                                          from "path";
+import { fileURLToPath }                                          from "url";
+import { tmpdir }                                                 from "os";
+import { spawnSync }                                              from "child_process";
 
 // ── Colour helpers ─────────────────────────────────────────────────────────────
 
-const BOLD   = "\x1b[1m";
-const DIM    = "\x1b[2m";
-const GREEN  = "\x1b[32m";
-const RED    = "\x1b[31m";
-const YELLOW = "\x1b[33m";
-const RESET  = "\x1b[0m";
+const BOLD  = "\x1b[1m";
+const DIM   = "\x1b[2m";
+const GREEN = "\x1b[32m";
+const RED   = "\x1b[31m";
+const RESET = "\x1b[0m";
 
 const bold   = s => `${BOLD}${s}${RESET}`;
 const dim    = s => `${DIM}${s}${RESET}`;
 const green  = s => `${GREEN}${s}${RESET}`;
 const red    = s => `${RED}${s}${RESET}`;
-const yellow = s => `${YELLOW}${s}${RESET}`;
+const yellow = s => `\x1b[33m${s}${RESET}`;
 const cyan   = s => `\x1b[36m${s}${RESET}`;
 
 // ── Paths ──────────────────────────────────────────────────────────────────────
@@ -59,7 +52,7 @@ const __dirname    = dirname(fileURLToPath(import.meta.url));
 const CRUCIBLE_SRC = join(__dirname, "..", "..", "src");
 const FIXTURE_DIR  = join(__dirname, "..", "fixtures", "gauntlet");
 
-// ── Git helper (no signing, no hooks) ─────────────────────────────────────────
+// ── Git helper ─────────────────────────────────────────────────────────────────
 
 function git(cwd, args) {
   const r = spawnSync(
@@ -90,106 +83,7 @@ function createFixtureRepo() {
   return repoDir;
 }
 
-// ── ReplayClient ───────────────────────────────────────────────────────────────
-//
-// Implements the same interface the conductor calls on the Anthropic SDK client:
-//   client.messages.create({ model, max_tokens, tools, messages })
-//
-// Returns a fixed two-turn transcript:
-//   Turn 1: read_file("src/formatter.js")  — exercises the tool dispatch path
-//   Turn 2: submit_ops(<correct three ops>) — terminal action
-//
-// The correct ops are computed from the known fixture content, so they apply
-// cleanly without any anchor-mismatch recovery.
-
-const REPLAY_OPS = [
-  {
-    op:      "create",
-    path:    "src/core/precision.js",
-    content: "/**\n * precision.js — correct rounding utility\n *\n * Replaces numutils.js. Uses Math.round (round-half-up) instead of Math.trunc.\n */\n\nexport function roundTo(value, decimals) {\n  const factor = 10 ** decimals;\n  return Math.round(value * factor) / factor;\n}\n",
-  },
-  {
-    op:  "replace",
-    path: "src/formatter.js",
-    // Exact text from test/fixtures/gauntlet/src/formatter.js
-    old: "import { roundTo } from \"./numutils.js\";",
-    new: "import { roundTo } from \"./core/precision.js\";",
-  },
-  {
-    op:   "delete_file",
-    path: "src/numutils.js",
-  },
-];
-
-// Two-turn transcript: read_file first (realistic), then submit_ops.
-const REPLAY_TURNS = [
-  {
-    // Turn 1: model reads formatter.js to get the exact import text
-    stop_reason: "tool_use",
-    content: [
-      {
-        type:  "tool_use",
-        id:    "replay_read_1",
-        name:  "read_file",
-        input: { path: "src/formatter.js" },
-      },
-    ],
-  },
-  {
-    // Turn 2: model submits the correct ops
-    stop_reason: "tool_use",
-    content: [
-      {
-        type:  "tool_use",
-        id:    "replay_submit_2",
-        name:  "submit_ops",
-        input: { ops: REPLAY_OPS },
-      },
-    ],
-  },
-];
-
-class ReplayClient {
-  constructor(turns) {
-    this.turns = turns;
-    this.idx   = 0;
-  }
-
-  get messages() {
-    const self = this;
-    return {
-      async create(params) {
-        // rewriteFullFile (Phase B2) calls messages.create without tools.
-        // If we hit it, the replay ops have an anchor bug — fail loudly.
-        if (!params.tools) {
-          throw new Error(
-            "[ReplayClient] unexpected non-tool call (B2 rewrite path triggered). " +
-            "Check that REPLAY_OPS match the fixture content exactly."
-          );
-        }
-        if (self.idx >= self.turns.length) {
-          throw new Error(
-            `[ReplayClient] call ${self.idx + 1} exceeds the ${self.turns.length}-turn script. ` +
-            "The conductor made more model calls than expected."
-          );
-        }
-        return self.turns[self.idx++];
-      },
-    };
-  }
-}
-
-// ── Assertion helper ──────────────────────────────────────────────────────────
-
-function assert(condition, message) {
-  if (!condition) {
-    console.error(red(`  ✗ FAIL: ${message}`));
-    throw new Error(`Assertion failed: ${message}`);
-  }
-  console.log(green(`  ✔ ${message}`));
-}
-
-// ── Plan ──────────────────────────────────────────────────────────────────────
+// ── Shared plan ────────────────────────────────────────────────────────────────
 
 const PLAN = `\
 Refactor the number-formatting utility to fix a rounding bug.
@@ -216,71 +110,149 @@ Required changes (three ops, one iteration)
      import { roundTo } from "./core/precision.js";
 
 3. DELETE src/numutils.js — it is now obsolete; no other files import it.
-
-Verification
-------------
-After applying your ops:
-  - run_command(kind="typecheck") to confirm formatter.js syntax is clean
-  - run_command(kind="test") to verify all three tests pass
 `;
 
-// ── Main ───────────────────────────────────────────────────────────────────────
+const AFFECTED_FILES = [
+  { path: "src/formatter.js",      action: "modify",
+    note: "Change import: ./numutils.js → ./core/precision.js" },
+  { path: "src/core/precision.js", action: "create",
+    note: "New file — export roundTo using Math.round (correct rounding)" },
+  { path: "src/numutils.js",       action: "modify",
+    note: "DELETE this file; it is obsolete once precision.js is in place" },
+];
 
-async function main() {
-  console.log(bold("\n╔══════════════════════════════════════════════════════════╗"));
-  console.log(bold(  "║         crucible — end-to-end gauntlet                  ║"));
-  console.log(bold(  "╚══════════════════════════════════════════════════════════╝\n"));
+// ── Ops constants ──────────────────────────────────────────────────────────────
 
-  // ── Mode selection ─────────────────────────────────────────────────────────
-  let liveKey = process.env.ANTHROPIC_API_KEY || null;
-  if (!liveKey) {
-    try {
-      const { retrieveKey, SERVICE_ANTHROPIC } = await import(`${CRUCIBLE_SRC}/keys.js`);
-      liveKey = retrieveKey(SERVICE_ANTHROPIC) || null;
-    } catch { /* keys.js unavailable — use replay */ }
+// The three ops that produce a correct, passing state.
+const CORRECT_OPS = [
+  {
+    op:      "create",
+    path:    "src/core/precision.js",
+    content:
+      "/**\n * precision.js — correct rounding utility\n *\n" +
+      " * Replaces numutils.js. Uses Math.round (round-half-up) instead of Math.trunc.\n */\n\n" +
+      "export function roundTo(value, decimals) {\n" +
+      "  const factor = 10 ** decimals;\n" +
+      "  return Math.round(value * factor) / factor;\n}\n",
+  },
+  {
+    op:  "replace",
+    path: "src/formatter.js",
+    // Exact text from test/fixtures/gauntlet/src/formatter.js
+    old: "import { roundTo } from \"./numutils.js\";",
+    new: "import { roundTo } from \"./core/precision.js\";",
+  },
+  {
+    op:   "delete_file",
+    path: "src/numutils.js",
+  },
+];
+
+// Ops that apply cleanly but leave the bug intact (Math.trunc still used).
+const STALL_OPS = [
+  {
+    op:      "create",
+    path:    "src/core/precision.js",
+    content:
+      "// precision.js — NOTE: still uses Math.trunc (bug not fixed)\n" +
+      "export function roundTo(value, decimals) {\n" +
+      "  const factor = 10 ** decimals;\n" +
+      "  return Math.trunc(value * factor) / factor;\n}\n",
+  },
+  {
+    op:  "replace",
+    path: "src/formatter.js",
+    old: "import { roundTo } from \"./numutils.js\";",
+    new: "import { roundTo } from \"./core/precision.js\";",
+  },
+  {
+    op:   "delete_file",
+    path: "src/numutils.js",
+  },
+];
+
+// Single op with a bad anchor — triggers patch_anchor_not_found on first apply.
+// Has no create/delete_file so the worktree is unmodified when B1 fires.
+const BAD_ANCHOR_OPS = [
+  {
+    op:  "replace",
+    path: "src/formatter.js",
+    // This text does NOT appear in the file — deliberate anchor mismatch.
+    old: "import { roundTo } from \"./wrong-file-that-does-not-exist.js\";",
+    new: "import { roundTo } from \"./core/precision.js\";",
+  },
+];
+
+// ── ReplayClient ───────────────────────────────────────────────────────────────
+//
+// Implements the client interface the conductor calls:
+//   client.messages.create({ model, max_tokens, tools, messages })
+//
+// Returns turns in declaration order.  Throws loudly when:
+//   - all turns are exhausted (unexpected extra call)
+//   - called without `tools` (unexpected B2 rewrite path)
+
+class ReplayClient {
+  constructor(turns) {
+    this.turns = turns;
+    this.idx   = 0;
   }
 
-  const mode = liveKey ? "live" : "replay";
-  console.log(dim(`  Mode: ${mode === "live" ? "LIVE (real model)" : "REPLAY (deterministic, no API key needed)"}\n`));
-
-  // ── Create fixture repo ────────────────────────────────────────────────────
-  let repoDir;
-  try {
-    repoDir = createFixtureRepo();
-    console.log(dim(`  Fixture repo: ${repoDir}\n`));
-  } catch (e) {
-    console.error(red(`  ✗ Failed to create fixture repo: ${e.message}`));
-    process.exit(1);
+  get messages() {
+    const self = this;
+    return {
+      async create(params) {
+        if (!params.tools) {
+          throw new Error(
+            "[ReplayClient] unexpected non-tool call (B2 rewrite path triggered). " +
+            "Check that replay ops have correct anchors or that BAD_ANCHOR_OPS has no " +
+            "preceding create/delete_file ops that leave the worktree partially modified."
+          );
+        }
+        if (self.idx >= self.turns.length) {
+          throw new Error(
+            `[ReplayClient] call ${self.idx + 1} exceeds the ${self.turns.length}-turn script.`
+          );
+        }
+        return self.turns[self.idx++];
+      },
+    };
   }
+}
 
-  // ── Verify fixture is broken (pre-flight) ─────────────────────────────────
-  const preRun = spawnSync("node", ["--test", "test/formatter.test.js"],
-    { cwd: repoDir, encoding: "utf8", stdio: "pipe" });
-  if (preRun.status === 0) {
-    console.error(red("  ✗ Fixture tests unexpectedly PASS before the fix — check fixture files."));
-    rmSync(repoDir, { recursive: true, force: true });
-    process.exit(1);
+// ── Assertion helper ──────────────────────────────────────────────────────────
+
+let _assertionCount = 0;
+
+function assert(condition, message) {
+  _assertionCount++;
+  if (!condition) {
+    console.error(red(`    ✗ FAIL [${_assertionCount}]: ${message}`));
+    throw new Error(`Assertion failed: ${message}`);
   }
-  console.log(dim("  Pre-flight: fixture fails correctly (2 of 3 tests fail before fix).\n"));
+  console.log(green(`    ✔ [${_assertionCount}] ${message}`));
+}
 
-  // ── Load conductor + providers ─────────────────────────────────────────────
-  const [{ runConductor }, { _setAnthropicForTest }] = await Promise.all([
-    import(`${CRUCIBLE_SRC}/conductor.js`),
-    import(`${CRUCIBLE_SRC}/providers.js`),
-  ]);
+// ── Scenario runner ───────────────────────────────────────────────────────────
 
-  // ── Inject ReplayClient when no live key ──────────────────────────────────
-  if (mode === "replay") {
-    _setAnthropicForTest(new ReplayClient(REPLAY_TURNS));
-  }
+async function runScenario(label, {
+  replayTurns,
+  maxIterations = 3,
+  assertFn,
+  _setAnthropicForTest,
+  runConductor,
+}) {
+  console.log(bold(`\n  ▶ ${label}\n`));
 
-  // ── Event / diff capture ───────────────────────────────────────────────────
-  const events       = [];
-  let   diffCaptured = "";
-  let   loopPassed   = false; // set from diff_ready event, used by ask()
+  const repoDir = createFixtureRepo();
+  console.log(dim(`    Fixture repo: ${repoDir}`));
 
-  // ── Run conductor ──────────────────────────────────────────────────────────
-  console.log(bold("  Running conductor…\n"));
+  _setAnthropicForTest(new ReplayClient(replayTurns));
+
+  const events     = [];
+  let diffCaptured = "";
+  let loopPassed   = false;
+
   let result;
   try {
     result = await runConductor({
@@ -288,20 +260,10 @@ async function main() {
       plan:          PLAN,
       testCmd:       "node --test test/formatter.test.js",
       model:         "claude-haiku-4-5-20251001",
-      maxIterations: 3,
-      affectedFiles: [
-        { path: "src/formatter.js",      action: "modify",
-          note: "Change import: ./numutils.js → ./core/precision.js" },
-        { path: "src/core/precision.js", action: "create",
-          note: "New file — export roundTo using Math.round (correct rounding)" },
-        { path: "src/numutils.js",       action: "modify",
-          note: "DELETE this file; it is obsolete once precision.js is in place" },
-      ],
-      // Auto-approve only when loop passed and there are files to write.
-      // Return "0" (abort) if the loop bailed — otherwise the conductor loops
-      // forever asking for "y" with modifiedPaths === [].
-      ask:     async () => loopPassed ? "y" : "0",
-      colours: { bold, green, red, yellow, dim, cyan },
+      maxIterations,
+      affectedFiles: AFFECTED_FILES,
+      ask:           async () => loopPassed ? "y" : "0",
+      colours:       { bold, green, red, yellow, dim, cyan },
       onEvent: ev => {
         events.push(ev);
         if (ev.type === "diff_ready") {
@@ -311,92 +273,346 @@ async function main() {
       },
     });
   } catch (e) {
-    console.error(red(`\n  ✗ runConductor threw: ${e.message}`));
-    if (e.stack) console.error(dim(e.stack));
+    _setAnthropicForTest(null);
     rmSync(repoDir, { recursive: true, force: true });
-    process.exit(1);
-  } finally {
-    // Always reset the singleton so live tests after replay don't see the mock
-    if (mode === "replay") _setAnthropicForTest(null);
+    console.error(red(`\n    ✗ runConductor threw: ${e.message}`));
+    if (e.stack) console.error(dim(e.stack));
+    throw e;
   }
 
-  // ── 10 assertions ─────────────────────────────────────────────────────────
-  console.log(bold("\n  Assertions\n  ─────────────────────────────────────────\n"));
+  _setAnthropicForTest(null);
 
-  // 1. Outcome
+  try {
+    await assertFn({ result, events, diffCaptured, repoDir });
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+  }
+
+  console.log(bold(green(`\n    ✔ "${label}" passed.\n`)));
+}
+
+// ── Scenario 1: happy path ─────────────────────────────────────────────────────
+
+// Turn 1: model reads formatter.js to get exact import text.
+// Turn 2: model submits the three correct ops.
+const HAPPY_TURNS = [
+  {
+    stop_reason: "tool_use",
+    content: [{
+      type: "tool_use", id: "h1_read", name: "read_file",
+      input: { path: "src/formatter.js" },
+    }],
+  },
+  {
+    stop_reason: "tool_use",
+    content: [{
+      type: "tool_use", id: "h2_ops", name: "submit_ops",
+      input: { ops: CORRECT_OPS },
+    }],
+  },
+];
+
+async function assertHappyPath({ result, events, diffCaptured, repoDir }) {
+  console.log(dim("    Assertions:"));
+
   assert(result.outcome === "approved",
     `outcome === "approved" (got "${result.outcome}")`);
-
-  // 2. Budget
   assert(result.iterations <= 3,
     `converged in ≤ 3 iterations (used ${result.iterations})`);
 
-  // 3. All three paths returned
   const ap = result.approvedPaths;
-  assert(ap.includes("src/formatter.js"),
-    `approvedPaths includes src/formatter.js`);
-  assert(ap.includes("src/core/precision.js"),
-    `approvedPaths includes src/core/precision.js (created)`);
-  assert(ap.includes("src/numutils.js"),
-    `approvedPaths includes src/numutils.js (deleted)`);
+  assert(ap.includes("src/formatter.js"),      `approvedPaths includes src/formatter.js`);
+  assert(ap.includes("src/core/precision.js"), `approvedPaths includes src/core/precision.js`);
+  assert(ap.includes("src/numutils.js"),       `approvedPaths includes src/numutils.js`);
 
-  // 4–5. formatter.js import updated
   const formatterSrc = readFileSync(join(repoDir, "src/formatter.js"), "utf8");
-  assert(formatterSrc.includes("./core/precision.js"),
-    `formatter.js now imports from ./core/precision.js`);
-  assert(!formatterSrc.includes("./numutils.js"),
-    `formatter.js no longer imports ./numutils.js`);
+  assert( formatterSrc.includes("./core/precision.js"), `formatter.js imports ./core/precision.js`);
+  assert(!formatterSrc.includes("./numutils.js"),       `formatter.js no longer imports ./numutils.js`);
 
-  // 6. precision.js exists and uses Math.round
   assert(existsSync(join(repoDir, "src/core/precision.js")),
     `src/core/precision.js was created`);
-  const precisionSrc = readFileSync(join(repoDir, "src/core/precision.js"), "utf8");
-  assert(precisionSrc.includes("Math.round"),
-    `precision.js uses Math.round (not Math.trunc)`);
+  const precSrc = readFileSync(join(repoDir, "src/core/precision.js"), "utf8");
+  assert(precSrc.includes("Math.round"), `precision.js uses Math.round (not Math.trunc)`);
 
-  // 7. numutils.js is gone
-  assert(!existsSync(join(repoDir, "src/numutils.js")),
-    `src/numutils.js was deleted`);
+  assert(!existsSync(join(repoDir, "src/numutils.js")), `src/numutils.js was deleted`);
 
-  // 8. Diff is real (non-empty, has hunk headers)
-  assert(diffCaptured.length > 0,
-    `unified diff is non-empty`);
-  assert(diffCaptured.includes("@@"),
-    `unified diff contains @@ hunk headers`);
+  assert(diffCaptured.length > 0,           `unified diff is non-empty`);
+  assert(diffCaptured.includes("@@"),       `unified diff contains @@ hunk headers`);
 
-  // 9. Tests pass in the approved state
-  const postRun = spawnSync("node", ["--test", "test/formatter.test.js"],
-    { cwd: repoDir, encoding: "utf8", stdio: "pipe" });
-  assert(postRun.status === 0,
-    `all tests pass in approved state (exit 0)`);
+  const postRun = spawnSync(
+    "node", ["--test", "test/formatter.test.js"],
+    { cwd: repoDir, encoding: "utf8", stdio: "pipe" }
+  );
+  assert(postRun.status === 0, `all tests pass in approved state`);
 
-  // 10. Worktree cleaned up
   const wtList = git(repoDir, ["worktree", "list"]).stdout;
-  assert(!wtList.includes(".crucible"),
-    `worktree cleaned up (no .crucible entry)`);
+  assert(!wtList.includes(".crucible"), `worktree cleaned up`);
 
-  // ── Mode-specific bonus check ──────────────────────────────────────────────
-  if (mode === "replay") {
-    // Verify the ReplayClient was called the expected number of times
-    // (events: ops_generated fires once per iteration, tests_complete once per iteration)
-    const opsGenerated    = events.filter(e => e.type === "ops_generated").length;
-    const testsCompleted  = events.filter(e => e.type === "tests_complete").length;
-    assert(opsGenerated   >= 1, `ops_generated event fired (${opsGenerated} time(s))`);
-    assert(testsCompleted >= 1, `tests_complete event fired (${testsCompleted} time(s))`);
+  const opsGen     = events.filter(e => e.type === "ops_generated").length;
+  const testsDone  = events.filter(e => e.type === "tests_complete").length;
+  assert(opsGen  >= 1, `ops_generated event fired (${opsGen}×)`);
+  assert(testsDone >= 1, `tests_complete event fired (${testsDone}×)`);
+}
+
+// ── Scenario 2: stall then bail ───────────────────────────────────────────────
+
+// Iteration 1: submit_ops → STALL_OPS (apply OK, tests still fail)
+// Iteration 2: submit_ops → STALL_OPS again (same result, bail_same)
+const STALL_TURNS = [
+  {
+    stop_reason: "tool_use",
+    content: [{
+      type: "tool_use", id: "st_iter1", name: "submit_ops",
+      input: { ops: STALL_OPS },
+    }],
+  },
+  {
+    stop_reason: "tool_use",
+    content: [{
+      type: "tool_use", id: "st_iter2", name: "submit_ops",
+      input: { ops: STALL_OPS },
+    }],
+  },
+];
+
+async function assertStallBail({ result, events, diffCaptured, repoDir }) {
+  console.log(dim("    Assertions:"));
+
+  // Outcome: ask() returned "0" because loopPassed = false
+  assert(result.outcome === "aborted",
+    `outcome === "aborted" (got "${result.outcome}")`);
+  assert(result.iterations === 2,
+    `used exactly 2 iterations (got ${result.iterations})`);
+
+  // evaluate event shows bail_same
+  const evalEv = events.find(e => e.type === "evaluate" && e.decision === "bail_same");
+  assert(evalEv !== undefined,
+    `evaluate event with decision="bail_same" fired`);
+  assert(evalEv.delta === "same",
+    `delta === "same" (got "${evalEv.delta}")`);
+
+  // bail event
+  const bailEv = events.find(e => e.type === "bail");
+  assert(bailEv !== undefined, `bail event fired`);
+  assert(bailEv.reason === "bail_same",
+    `bail reason === "bail_same" (got "${bailEv.reason}")`);
+
+  // Both iterations ran ops generation and tests
+  const opsGen    = events.filter(e => e.type === "ops_generated");
+  const testsDone = events.filter(e => e.type === "tests_complete");
+  assert(opsGen.length === 2,    `ops_generated fired 2× (once per iteration)`);
+  assert(testsDone.length === 2, `tests_complete fired 2× (once per iteration)`);
+  assert(testsDone.every(e => e.result.exitCode !== 0),
+    `both test runs failed (bug not fixed by stall ops)`);
+
+  // Partial diff exists (ops were applied in last iteration) but nothing written back
+  assert(diffCaptured.length > 0,     `partial diff is non-empty (stall ops produced changes)`);
+  assert(diffCaptured.includes("@@"), `partial diff has @@ hunk headers`);
+
+  // Nothing written back to main tree (aborted)
+  assert(existsSync(join(repoDir, "src/numutils.js")),
+    `numutils.js still present in main tree (not written back after abort)`);
+  assert(!existsSync(join(repoDir, "src/core/precision.js")),
+    `precision.js not in main tree (not written back after abort)`);
+
+  // Worktree cleaned up even though loop bailed
+  const wtList = git(repoDir, ["worktree", "list"]).stdout;
+  assert(!wtList.includes(".crucible"), `worktree cleaned up despite bail`);
+}
+
+// ── Scenario 3: anchor mismatch → B1 regeneration ────────────────────────────
+
+// Call 1 (initial generateMultiFileOps, iteration 1):
+//   submit_ops with a single bad-anchor replace.
+//   applyPatchOpsToWorktree throws patch_anchor_not_found.
+//   BAD_ANCHOR_OPS has no create/delete_file, so worktree stays at HEAD.
+//
+// Call 2 (B1 inside tryApplyWithRecovery, same iteration 1):
+//   submit_ops with correct three ops.
+//   B1 succeeds; tests pass.
+const ANCHOR_TURNS = [
+  {
+    stop_reason: "tool_use",
+    content: [{
+      type: "tool_use", id: "an_bad", name: "submit_ops",
+      input: { ops: BAD_ANCHOR_OPS },
+    }],
+  },
+  {
+    stop_reason: "tool_use",
+    content: [{
+      type: "tool_use", id: "an_good", name: "submit_ops",
+      input: { ops: CORRECT_OPS },
+    }],
+  },
+];
+
+async function assertAnchorRecovery({ result, events, diffCaptured, repoDir }) {
+  console.log(dim("    Assertions:"));
+
+  assert(result.outcome === "approved",
+    `outcome === "approved" (got "${result.outcome}")`);
+  assert(result.iterations === 1,
+    `converged in 1 iteration (B1 recovery is within the same iteration)`);
+
+  // anchor_retry event (B1 triggered)
+  const retryEv = events.find(e => e.type === "anchor_retry");
+  assert(retryEv !== undefined, `anchor_retry event fired (B1 triggered)`);
+  assert(retryEv.attempt === 1,
+    `B1 retry attempt=1 (got ${retryEv.attempt})`);
+  assert(retryEv.path === "src/formatter.js",
+    `anchor failure on src/formatter.js (got "${retryEv.path}")`);
+
+  // apply_complete after B1
+  const applyEv = events.find(e => e.type === "apply_complete");
+  assert(applyEv !== undefined, `apply_complete event fired (B1 ops applied)`);
+
+  // Tests passed on first iteration
+  const testsDone = events.filter(e => e.type === "tests_complete");
+  assert(testsDone.length === 1, `tests_complete fired once`);
+  assert(testsDone[0].result.exitCode === 0,
+    `tests passed after B1 recovery (exitCode 0)`);
+
+  // Final state in main tree
+  const ap = result.approvedPaths;
+  assert(ap.includes("src/formatter.js"),      `approvedPaths includes src/formatter.js`);
+  assert(ap.includes("src/core/precision.js"), `approvedPaths includes src/core/precision.js`);
+  assert(ap.includes("src/numutils.js"),       `approvedPaths includes src/numutils.js`);
+
+  const formatterSrc = readFileSync(join(repoDir, "src/formatter.js"), "utf8");
+  assert( formatterSrc.includes("./core/precision.js"), `formatter.js imports ./core/precision.js`);
+  assert(!formatterSrc.includes("./numutils.js"),       `formatter.js no longer imports ./numutils.js`);
+
+  assert(existsSync(join(repoDir, "src/core/precision.js")),
+    `src/core/precision.js was created`);
+  const precSrc = readFileSync(join(repoDir, "src/core/precision.js"), "utf8");
+  assert(precSrc.includes("Math.round"), `precision.js uses Math.round`);
+
+  assert(!existsSync(join(repoDir, "src/numutils.js")), `src/numutils.js was deleted`);
+
+  const postRun = spawnSync(
+    "node", ["--test", "test/formatter.test.js"],
+    { cwd: repoDir, encoding: "utf8", stdio: "pipe" }
+  );
+  assert(postRun.status === 0, `all tests pass in approved state`);
+
+  const wtList = git(repoDir, ["worktree", "list"]).stdout;
+  assert(!wtList.includes(".crucible"), `worktree cleaned up`);
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log(bold("\n╔══════════════════════════════════════════════════════════╗"));
+  console.log(bold(  "║         crucible — end-to-end gauntlet (3 scenarios)    ║"));
+  console.log(bold(  "╚══════════════════════════════════════════════════════════╝"));
+
+  // ── Load conductor + providers ─────────────────────────────────────────────
+  const [{ runConductor }, { _setAnthropicForTest }] = await Promise.all([
+    import(`${CRUCIBLE_SRC}/conductor.js`),
+    import(`${CRUCIBLE_SRC}/providers.js`),
+  ]);
+
+  const shared = { _setAnthropicForTest, runConductor };
+
+  // ── Pre-flight: confirm fixture is broken ──────────────────────────────────
+  {
+    const tmp = createFixtureRepo();
+    const pre = spawnSync("node", ["--test", "test/formatter.test.js"],
+      { cwd: tmp, encoding: "utf8", stdio: "pipe" });
+    rmSync(tmp, { recursive: true, force: true });
+    if (pre.status === 0) {
+      console.error(red("\n  ✗ Fixture tests unexpectedly PASS — check fixture files."));
+      process.exit(1);
+    }
+    console.log(dim("\n  Pre-flight: fixture fails correctly before any fix.\n"));
+  }
+
+  const startCount = _assertionCount;
+
+  // ── Scenario 1: happy path ─────────────────────────────────────────────────
+  await runScenario("Scenario 1 — happy path (replay)", {
+    replayTurns:  HAPPY_TURNS,
+    maxIterations: 3,
+    assertFn:     assertHappyPath,
+    ...shared,
+  });
+
+  // ── Scenario 2: stall then bail ────────────────────────────────────────────
+  await runScenario("Scenario 2 — stall then bail (replay)", {
+    replayTurns:  STALL_TURNS,
+    maxIterations: 3,
+    assertFn:     assertStallBail,
+    ...shared,
+  });
+
+  // ── Scenario 3: anchor mismatch → B1 recovery ─────────────────────────────
+  await runScenario("Scenario 3 — anchor mismatch → B1 recovery (replay)", {
+    replayTurns:  ANCHOR_TURNS,
+    maxIterations: 3,
+    assertFn:     assertAnchorRecovery,
+    ...shared,
+  });
+
+  const replayAssertions = _assertionCount - startCount;
+
+  // ── Live smoke (optional) ──────────────────────────────────────────────────
+  let liveKey = process.env.ANTHROPIC_API_KEY || null;
+  if (!liveKey) {
+    try {
+      const { retrieveKey, SERVICE_ANTHROPIC } = await import(`${CRUCIBLE_SRC}/keys.js`);
+      liveKey = retrieveKey(SERVICE_ANTHROPIC) || null;
+    } catch { /* keys.js unavailable */ }
+  }
+
+  if (liveKey) {
+    console.log(bold("\n  ▶ Scenario 1 — happy path (LIVE model)\n"));
+    console.log(dim("    (No ReplayClient — uses real Anthropic API)\n"));
+
+    const liveStartCount = _assertionCount;
+    const liveRepoDir = createFixtureRepo();
+    const liveEvents  = [];
+    let liveDiff      = "";
+    let livePassed    = false;
+
+    try {
+      const liveResult = await runConductor({
+        repoPath:      liveRepoDir,
+        plan:          PLAN,
+        testCmd:       "node --test test/formatter.test.js",
+        model:         "claude-haiku-4-5-20251001",
+        maxIterations: 3,
+        affectedFiles: AFFECTED_FILES,
+        ask:           async () => livePassed ? "y" : "0",
+        colours:       { bold, green, red, yellow, dim, cyan },
+        onEvent: ev => {
+          liveEvents.push(ev);
+          if (ev.type === "diff_ready") { liveDiff = ev.diff ?? ""; livePassed = ev.pass; }
+        },
+      });
+      await assertHappyPath({
+        result: liveResult, events: liveEvents,
+        diffCaptured: liveDiff, repoDir: liveRepoDir,
+      });
+      console.log(bold(green(`\n    ✔ "Scenario 1 — happy path (LIVE)" passed.\n`)));
+    } catch (e) {
+      rmSync(liveRepoDir, { recursive: true, force: true });
+      console.error(red(`\n    ✗ Live smoke failed: ${e.message}`));
+      process.exit(1);
+    }
+    rmSync(liveRepoDir, { recursive: true, force: true });
+
+    const liveAssertions = _assertionCount - liveStartCount;
+    console.log(dim(`    Live assertions: ${liveAssertions}`));
   }
 
   // ── Summary ────────────────────────────────────────────────────────────────
-  const modeLabel = mode === "replay" ? " (replay — deterministic)" : " (live model)";
-  console.log(bold(`\n${"═".repeat(60)}`));
-  console.log(green(bold(`  ✔ GAUNTLET PASSED${modeLabel}`)));
-  console.log(dim(`    iterations   : ${result.iterations}`));
-  console.log(dim(`    approvedPaths: ${ap.join(", ")}`));
-  console.log(dim(`    diff lines   : ${diffCaptured.split("\n").length}`));
-  console.log(bold(`${"═".repeat(60)}\n`));
-
-  // ── Cleanup ────────────────────────────────────────────────────────────────
-  rmSync(repoDir, { recursive: true, force: true });
-  process.exit(0);
+  const liveNote = liveKey ? " + live smoke" : " (replay only — set ANTHROPIC_API_KEY for live smoke)";
+  console.log(bold(`\n${"═".repeat(62)}`));
+  console.log(green(bold(`  ✔ ALL GAUNTLET SCENARIOS PASSED${liveNote}`)));
+  console.log(dim(`    replay assertions : ${replayAssertions}`));
+  console.log(dim(`    scenarios         : 3 (happy path · stall-bail · anchor-B1)`));
+  console.log(bold(`${"═".repeat(62)}\n`));
 }
 
 main().catch(e => {
