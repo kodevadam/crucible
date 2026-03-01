@@ -18,8 +18,8 @@
 
 import { randomBytes }                             from "crypto";
 import { spawnSync }                               from "child_process";
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
-import { join, normalize, isAbsolute, dirname }               from "path";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, realpathSync } from "fs";
+import { join, normalize, isAbsolute, dirname, sep }                        from "path";
 import { tmpdir }                                  from "os";
 import { safeEnv }                                 from "./safety.js";
 
@@ -271,15 +271,36 @@ export function applyPatchOpsToContent(content, ops) {
  * @param {Array}  ops          - Validated ops (may span multiple files)
  */
 export function applyPatchOpsToWorktree(worktreePath, ops) {
+  const realWt = realpathSync(worktreePath);
+
+  // Resolve real path (following symlinks) and verify it stays inside the worktree.
+  // String-level path checks cannot catch committed symlinks; realpath is required.
+  // Returns silently on ENOENT so the caller's own I/O produces the natural error.
+  function assertInsideWorktree(absPath, label) {
+    let real;
+    try { real = realpathSync(absPath); }
+    catch (e) { if (e.code === "ENOENT") return; throw e; }
+    if (real !== realWt && !real.startsWith(realWt + sep)) {
+      throw Object.assign(
+        new Error(`${label} escapes worktree via symlink`),
+        { code: "patch_symlink_escape" }
+      );
+    }
+  }
+
   // File-system ops (create/delete_file) are applied first in declaration order.
   // Content ops (replace/insert_after/delete) are then applied grouped by file.
   for (const op of ops) {
     if (op.op === "create") {
       const absPath = join(worktreePath, op.path);
       mkdirSync(dirname(absPath), { recursive: true });
+      // Check parent after creation — catches symlink dirs that already existed
+      assertInsideWorktree(dirname(absPath), "create op parent dir");
       writeFileSync(absPath, op.content, "utf8");
     } else if (op.op === "delete_file") {
-      unlinkSync(join(worktreePath, op.path));
+      const absPath = join(worktreePath, op.path);
+      assertInsideWorktree(absPath, "delete_file op");
+      unlinkSync(absPath);
     }
   }
 
@@ -292,6 +313,7 @@ export function applyPatchOpsToWorktree(worktreePath, ops) {
 
   for (const [relPath, fileOps] of byFile) {
     const absPath = join(worktreePath, relPath);
+    assertInsideWorktree(absPath, "content op");
     let content = readFileSync(absPath, "utf8");
     for (let i = 0; i < fileOps.length; i++) {
       content = applyOp(content, fileOps[i], i);

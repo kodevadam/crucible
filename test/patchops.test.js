@@ -7,7 +7,8 @@
 
 import { test }                                           from "node:test";
 import assert                                             from "node:assert/strict";
-import { writeFileSync, readFileSync, mkdtempSync, rmSync } from "fs";
+import { writeFileSync, readFileSync, mkdtempSync, rmSync,
+         symlinkSync, statSync, mkdirSync }                  from "fs";
 import { join }                                           from "path";
 import { tmpdir }                                         from "os";
 import {
@@ -225,13 +226,20 @@ test("applyPatchOpsToWorktree: writes only to files inside worktree path", () =>
 
 // ── 11. Adversarial op combinations ──────────────────────────────────────────
 //
-// These cover the six cases from the post-ship robustness audit:
+// Post-ship robustness audit (original 6 cases):
 //   1. create then delete_file same path → file absent (net no-op)
-//   2. delete_file then replace same path → throws (file gone, readFileSync fails)
+//   2. delete_file then replace same path → throws (ENOENT, not silenced)
 //   3. create in deeply nested new directory
-//   4. run_command target path attacks → see conductor.test.js (case 4)
-//   5. output cap → see conductor.test.js (case 5)
+//   4. run_command target path attacks → see conductor.test.js
+//   5. output cap → see conductor.test.js
 //   6. signature stability → see testloop.test.js
+//
+// Extended adversarial audit (symlink + filesystem edge cases):
+//   A1. Symlink dir escape via content op (replace) → patch_symlink_escape
+//   A2. Symlink dir escape via create op → patch_symlink_escape
+//   A3. Symlink dir escape via delete_file op → patch_symlink_escape
+//   A4. delete_file on a directory → EISDIR (no silent rm -rf)
+//   A5. Duplicate create same path → last content wins (documented behavior)
 
 test("adversarial: create then delete_file same path leaves file absent", () => {
   const wt = mkdtempSync(join(tmpdir(), "crucible-adv-"));
@@ -295,5 +303,115 @@ test("adversarial: parsePatchOps rejects delete_file with .git path", () => {
     assert.fail("expected throw");
   } catch (e) {
     assert.equal(e.code, "patch_schema_invalid");
+  }
+});
+
+// ── 12. Symlink escape (A1–A3): real filesystem symlinks defeat string-level checks ──
+//
+// All three op types that write or read through a symlinked directory must be
+// blocked. The fix uses realpathSync after mkdirSync/before I/O to detect escape.
+
+test("adversarial A1: symlink dir escape blocked in content op (replace)", () => {
+  const wt       = mkdtempSync(join(tmpdir(), "crucible-sym-"));
+  const external = mkdtempSync(join(tmpdir(), "crucible-ext-"));
+  try {
+    writeFileSync(join(external, "secret.txt"), "SECRET\n", "utf8");
+    symlinkSync(external, join(wt, "evil")); // wt/evil → external dir
+
+    assert.throws(
+      () => applyPatchOpsToWorktree(wt, [
+        { op: "replace", path: "evil/secret.txt", old: "SECRET", new: "pwned" },
+      ]),
+      err => err.code === "patch_symlink_escape",
+      "content op through symlink dir must be blocked"
+    );
+    assert.equal(readFileSync(join(external, "secret.txt"), "utf8"), "SECRET\n",
+      "external file must be unchanged");
+  } finally {
+    rmSync(wt,       { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
+});
+
+test("adversarial A2: symlink dir escape blocked in create op", () => {
+  const wt       = mkdtempSync(join(tmpdir(), "crucible-sym-"));
+  const external = mkdtempSync(join(tmpdir(), "crucible-ext-"));
+  try {
+    symlinkSync(external, join(wt, "evil"));
+
+    assert.throws(
+      () => applyPatchOpsToWorktree(wt, [
+        { op: "create", path: "evil/new.js", content: "bad\n" },
+      ]),
+      err => err.code === "patch_symlink_escape",
+      "create op through symlink dir must be blocked"
+    );
+    // Verify the external dir was not written to
+    let written = false;
+    try { readFileSync(join(external, "new.js")); written = true; } catch {}
+    assert.equal(written, false, "must not have written to external dir");
+  } finally {
+    rmSync(wt,       { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
+});
+
+test("adversarial A3: symlink dir escape blocked in delete_file op", () => {
+  const wt       = mkdtempSync(join(tmpdir(), "crucible-sym-"));
+  const external = mkdtempSync(join(tmpdir(), "crucible-ext-"));
+  try {
+    writeFileSync(join(external, "victim.txt"), "safe\n", "utf8");
+    symlinkSync(external, join(wt, "evil"));
+
+    assert.throws(
+      () => applyPatchOpsToWorktree(wt, [
+        { op: "delete_file", path: "evil/victim.txt" },
+      ]),
+      err => err.code === "patch_symlink_escape",
+      "delete_file through symlink dir must be blocked"
+    );
+    assert.equal(readFileSync(join(external, "victim.txt"), "utf8"), "safe\n",
+      "external file must survive");
+  } finally {
+    rmSync(wt,       { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
+});
+
+// ── 13. Directory delete (A4): delete_file must not rm -rf ───────────────────
+
+test("adversarial A4: delete_file on a directory throws EISDIR, not rm -rf", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-adv-"));
+  try {
+    mkdirSync(join(wt, "subdir"));
+    writeFileSync(join(wt, "subdir", "child.js"), "keep\n", "utf8");
+
+    assert.throws(
+      () => applyPatchOpsToWorktree(wt, [
+        { op: "delete_file", path: "subdir" },
+      ]),
+      err => err.code === "EISDIR" || err.code === "EPERM",
+      "unlinkSync on a directory must throw, not silently recurse"
+    );
+    assert.ok(statSync(join(wt, "subdir")).isDirectory(), "subdir must survive");
+    assert.equal(readFileSync(join(wt, "subdir", "child.js"), "utf8"), "keep\n");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── 14. Duplicate create (A5): last content wins (documented behavior) ────────
+
+test("adversarial A5: duplicate create same path — last content wins", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-adv-"));
+  try {
+    applyPatchOpsToWorktree(wt, [
+      { op: "create", path: "dup.js", content: "first\n"  },
+      { op: "create", path: "dup.js", content: "second\n" },
+    ]);
+    assert.equal(readFileSync(join(wt, "dup.js"), "utf8"), "second\n",
+      "second create must overwrite first");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
   }
 });

@@ -23,8 +23,8 @@
  *   7. Worktree always removed in finally — never left as garbage.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs";
-import { join, dirname }                                     from "path";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, realpathSync } from "fs";
+import { join, dirname, sep }                                               from "path";
 import { spawnSync }                                         from "child_process";
 import { worktreeCreate, worktreeRemove }                    from "./worktree.js";
 import { parsePatchOps, applyPatchOpsToWorktree,
@@ -239,9 +239,20 @@ export function dispatchRepairTool(name, input, wtPath, opts = {}) {
       return `[path rejected: ${e.message}]`;
     }
 
+    // Symlink escape: resolve the real path and verify it stays inside the worktree.
+    // validateStagingPath does string-level checks only; it cannot catch committed symlinks.
+    const absPath = join(wtPath, relPath);
+    let realAbs;
+    try { realAbs = realpathSync(absPath); }
+    catch { return `[file not found: ${relPath}]`; }
+    const realWt = realpathSync(wtPath);
+    if (realAbs !== realWt && !realAbs.startsWith(realWt + sep)) {
+      return `[path rejected: symlink escapes worktree: ${relPath}]`;
+    }
+
     let content;
     try {
-      content = readFileSync(join(wtPath, relPath), "utf8");
+      content = readFileSync(realAbs, "utf8");
     } catch {
       return `[file not found: ${relPath}]`;
     }

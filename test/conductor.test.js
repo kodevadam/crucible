@@ -12,7 +12,7 @@
 
 import { test }                                           from "node:test";
 import assert                                             from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync }             from "fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from "fs";
 import { join }                                           from "path";
 import { tmpdir }                                         from "os";
 import { evaluateDelta, buildIterationContext,
@@ -374,6 +374,57 @@ test("dispatchRepairTool: run_command caps output at RUN_COMMAND_MAX_OUTPUT char
     // Total length must not far exceed the cap
     assert.ok(result.length < RUN_COMMAND_MAX_OUTPUT + 200,
       `response too long: ${result.length} chars`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── Extended adversarial audit: symlink + shell safety + exit codes ───────────
+
+test("dispatchRepairTool: read_file blocked on symlink-escape path", () => {
+  const wt       = mkdtempSync(join(tmpdir(), "crucible-sym-"));
+  const external = mkdtempSync(join(tmpdir(), "crucible-ext-"));
+  try {
+    writeFileSync(join(external, "secret.txt"), "SENSITIVE\n", "utf8");
+    symlinkSync(external, join(wt, "evil")); // wt/evil → external dir
+
+    const result = dispatchRepairTool("read_file", { path: "evil/secret.txt" }, wt);
+    assert.ok(result.startsWith("[path rejected:"),
+      `should be rejected, got: ${result.slice(0, 80)}`);
+    assert.ok(!result.includes("SENSITIVE"), "sensitive content must not be returned");
+  } finally {
+    rmSync(wt,       { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: run_command target is single arg — shell metacharacters not interpreted", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    // If shell: false is ever accidentally removed, "echo INJECTED" would run.
+    // With shell: false, "nonexistent; echo INJECTED" is one literal path argument.
+    const result = dispatchRepairTool(
+      "run_command",
+      { kind: "git_diff", target: "nonexistent; echo INJECTED" },
+      wt
+    );
+    assert.ok(result.startsWith("exit "), "should have exit line");
+    assert.ok(!result.includes("INJECTED"), "semicolon must not be shell-interpreted");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: run_command captures nonzero exit code correctly", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    writeFileSync(join(wt, "fail.js"), "process.exit(42);\n", "utf8");
+    const result = dispatchRepairTool(
+      "run_command", { kind: "test" }, wt,
+      { testCmd: "node fail.js" }
+    );
+    assert.ok(result.startsWith("exit 42"),
+      `expected exit 42, got: ${result.slice(0, 40)}`);
   } finally {
     rmSync(wt, { recursive: true, force: true });
   }
