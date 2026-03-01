@@ -121,6 +121,67 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_phase_summaries_proposal ON phase_summaries(proposal_id);
+
+  CREATE TABLE IF NOT EXISTS critique_items (
+    id                          TEXT    NOT NULL,
+    display_id                  TEXT    NOT NULL,
+    proposal_id                 INTEGER NOT NULL REFERENCES proposals(id),
+    role                        TEXT    NOT NULL,
+    round                       INTEGER NOT NULL,
+    severity                    TEXT    NOT NULL,
+    title                       TEXT    NOT NULL,
+    detail                      TEXT    NOT NULL DEFAULT '',
+    normalized_text             TEXT    NOT NULL,
+    normalization_spec_version  TEXT    NOT NULL,
+    derived_from_json           TEXT,
+    root_ids_json               TEXT    NOT NULL,
+    root_severity               TEXT,
+    similarity_warn_json        TEXT,
+    minted_at                   TEXT    NOT NULL,
+    minted_by                   TEXT    NOT NULL DEFAULT 'host',
+    PRIMARY KEY (proposal_id, id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_critique_items_proposal_round ON critique_items(proposal_id, round);
+  CREATE INDEX IF NOT EXISTS idx_critique_items_proposal_role  ON critique_items(proposal_id, role, round);
+
+  CREATE TABLE IF NOT EXISTS dispositions (
+    disposition_id    TEXT    NOT NULL,
+    proposal_id       INTEGER NOT NULL REFERENCES proposals(id),
+    item_id           TEXT    NOT NULL,
+    round             INTEGER NOT NULL,
+    decided_by        TEXT    NOT NULL,
+    decision          TEXT    NOT NULL,
+    rationale         TEXT    NOT NULL DEFAULT '',
+    transformation_json TEXT,
+    proposed_at       TEXT    NOT NULL,
+    terminal_at       TEXT,
+    PRIMARY KEY (disposition_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_dispositions_proposal_item ON dispositions(proposal_id, item_id);
+  CREATE INDEX IF NOT EXISTS idx_dispositions_proposal_round ON dispositions(proposal_id, round);
+
+  CREATE TABLE IF NOT EXISTS round_artifacts (
+    proposal_id               INTEGER NOT NULL REFERENCES proposals(id),
+    round                     INTEGER NOT NULL,
+    artifact_id               TEXT    NOT NULL,
+    produced_at               TEXT    NOT NULL,
+    gpt_plan                  TEXT    NOT NULL DEFAULT '',
+    claude_plan               TEXT    NOT NULL DEFAULT '',
+    gpt_critique_ids_json     TEXT    NOT NULL DEFAULT '[]',
+    claude_critique_ids_json  TEXT    NOT NULL DEFAULT '[]',
+    dispositions_json         TEXT    NOT NULL DEFAULT '{}',
+    normalization_spec_version TEXT   NOT NULL,
+    active_set_json           TEXT    NOT NULL DEFAULT '[]',
+    pending_flags_json        TEXT    NOT NULL DEFAULT '[]',
+    convergence_state         TEXT    NOT NULL DEFAULT 'open',
+    dag_validated             INTEGER NOT NULL DEFAULT 0,
+    dag_validated_at          TEXT,
+    PRIMARY KEY (proposal_id, round)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_round_artifacts_proposal ON round_artifacts(proposal_id);
 `);
 
 // ── Schema migrations — idempotent ALTER TABLE additions ──────────────────────
@@ -169,6 +230,52 @@ const stmts = {
   getChatTurns:        db.prepare(`SELECT * FROM chat_turns WHERE session_id=? ORDER BY turn_num ASC`),
   addPhaseSummary:     db.prepare(`INSERT INTO phase_summaries (proposal_id, phase, round, summary, structured_output) VALUES (?, ?, ?, ?, ?)`),
   getPhaseSummaries:   db.prepare(`SELECT * FROM phase_summaries WHERE proposal_id=? ORDER BY created_at ASC`),
+
+  // ── critique_items ──────────────────────────────────────────────────────────
+  insertCritiqueItem:  db.prepare(`
+    INSERT OR IGNORE INTO critique_items
+      (id, display_id, proposal_id, role, round, severity, title, detail,
+       normalized_text, normalization_spec_version,
+       derived_from_json, root_ids_json, root_severity, similarity_warn_json,
+       minted_at, minted_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+  getCritiqueItems:    db.prepare(`SELECT * FROM critique_items WHERE proposal_id=? ORDER BY round ASC, minted_at ASC`),
+  getCritiqueItemsByRound: db.prepare(`SELECT * FROM critique_items WHERE proposal_id=? AND round=?`),
+
+  // ── dispositions ────────────────────────────────────────────────────────────
+  insertDisposition:   db.prepare(`
+    INSERT INTO dispositions
+      (disposition_id, proposal_id, item_id, round, decided_by, decision,
+       rationale, transformation_json, proposed_at, terminal_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`),
+  getDispositionsForProposal: db.prepare(`
+    SELECT * FROM dispositions WHERE proposal_id=? ORDER BY proposed_at ASC`),
+  getDispositionsUpToRound: db.prepare(`
+    SELECT * FROM dispositions WHERE proposal_id=? AND round<=? ORDER BY proposed_at ASC`),
+  getDispositionsForItem: db.prepare(`
+    SELECT * FROM dispositions WHERE proposal_id=? AND item_id=? ORDER BY proposed_at ASC`),
+
+  // ── round_artifacts ─────────────────────────────────────────────────────────
+  upsertRoundArtifact: db.prepare(`
+    INSERT INTO round_artifacts
+      (proposal_id, round, artifact_id, produced_at, gpt_plan, claude_plan,
+       gpt_critique_ids_json, claude_critique_ids_json, dispositions_json,
+       normalization_spec_version, active_set_json, pending_flags_json,
+       convergence_state, dag_validated, dag_validated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(proposal_id, round) DO UPDATE SET
+      artifact_id=excluded.artifact_id, produced_at=excluded.produced_at,
+      gpt_plan=excluded.gpt_plan, claude_plan=excluded.claude_plan,
+      gpt_critique_ids_json=excluded.gpt_critique_ids_json,
+      claude_critique_ids_json=excluded.claude_critique_ids_json,
+      dispositions_json=excluded.dispositions_json,
+      normalization_spec_version=excluded.normalization_spec_version,
+      active_set_json=excluded.active_set_json,
+      pending_flags_json=excluded.pending_flags_json,
+      convergence_state=excluded.convergence_state,
+      dag_validated=excluded.dag_validated,
+      dag_validated_at=excluded.dag_validated_at`),
+  getRoundArtifact:    db.prepare(`SELECT * FROM round_artifacts WHERE proposal_id=? AND round=?`),
 };
 
 export function createSession({ project, repoPath, repoUrl, gptModel, claudeModel,
@@ -282,4 +389,127 @@ export function logPhaseSummary(proposalId, phase, round, summary, structuredOut
 }
 export function getPhaseSummaries(proposalId) {
   return stmts.getPhaseSummaries.all(proposalId);
+}
+
+// ── Critique items ─────────────────────────────────────────────────────────────
+
+export function insertCritiqueItems(proposalId, items) {
+  const insert = db.transaction(() => {
+    for (const item of items) {
+      stmts.insertCritiqueItem.run(
+        item.id,
+        item.display_id,
+        proposalId,
+        item.role,
+        item.round,
+        item.severity,
+        item.title,
+        item.detail || "",
+        item.normalized_text,
+        item.normalization_spec_version,
+        item.derived_from   ? JSON.stringify(item.derived_from)   : null,
+        JSON.stringify(item.root_ids),
+        item.root_severity  || null,
+        item.similarity_warn ? JSON.stringify(item.similarity_warn) : null,
+        item.minted_at,
+        item.minted_by || "host"
+      );
+    }
+  });
+  insert();
+}
+
+/** Returns Map<id, CritiqueItem> with JSON fields parsed. */
+export function getCritiqueItemStore(proposalId) {
+  const rows = stmts.getCritiqueItems.all(proposalId);
+  const store = new Map();
+  for (const row of rows) {
+    store.set(row.id, {
+      ...row,
+      derived_from:   row.derived_from_json   ? JSON.parse(row.derived_from_json)   : null,
+      root_ids:       JSON.parse(row.root_ids_json),
+      similarity_warn: row.similarity_warn_json ? JSON.parse(row.similarity_warn_json) : null,
+    });
+  }
+  return store;
+}
+
+// ── Dispositions ───────────────────────────────────────────────────────────────
+
+export function insertDispositions(proposalId, records) {
+  const insert = db.transaction(() => {
+    for (const r of records) {
+      stmts.insertDisposition.run(
+        r.disposition_id,
+        proposalId,
+        r.item_id,
+        r.round,
+        r.decided_by,
+        r.decision,
+        r.rationale || "",
+        r.transformation ? JSON.stringify(r.transformation) : null,
+        r.proposed_at,
+        r.terminal_at || null
+      );
+    }
+  });
+  insert();
+}
+
+/** Returns Map<itemId, DispositionRecord[]> with JSON fields parsed, up to round. */
+export function getDispositionStore(proposalId, upToRound = 9999) {
+  const rows = stmts.getDispositionsUpToRound.all(proposalId, upToRound);
+  const store = new Map();
+  for (const row of rows) {
+    const record = {
+      ...row,
+      transformation: row.transformation_json ? JSON.parse(row.transformation_json) : null,
+    };
+    if (!store.has(row.item_id)) store.set(row.item_id, []);
+    store.get(row.item_id).push(record);
+  }
+  return store;
+}
+
+export function getDispositionsForItem(proposalId, itemId) {
+  return stmts.getDispositionsForItem.all(proposalId, itemId).map(row => ({
+    ...row,
+    transformation: row.transformation_json ? JSON.parse(row.transformation_json) : null,
+  }));
+}
+
+// ── Round artifacts ────────────────────────────────────────────────────────────
+
+export function upsertRoundArtifact(proposalId, round, artifact) {
+  stmts.upsertRoundArtifact.run(
+    proposalId,
+    round,
+    artifact.artifact_id,
+    artifact.produced_at,
+    artifact.gpt_plan   || "",
+    artifact.claude_plan || "",
+    JSON.stringify(artifact.gpt_critique_ids   || []),
+    JSON.stringify(artifact.claude_critique_ids || []),
+    JSON.stringify(artifact.dispositions        || {}),
+    artifact.normalization_spec_version,
+    JSON.stringify(artifact.active_set          || []),
+    JSON.stringify(artifact.pending_flags       || []),
+    artifact.convergence_state || "open",
+    artifact.dag_validated ? 1 : 0,
+    artifact.dag_validated_at || null
+  );
+}
+
+export function getRoundArtifact(proposalId, round) {
+  const row = stmts.getRoundArtifact.get(proposalId, round);
+  if (!row) return null;
+  return {
+    ...row,
+    gpt_critique_ids:    JSON.parse(row.gpt_critique_ids_json    || "[]"),
+    claude_critique_ids: JSON.parse(row.claude_critique_ids_json || "[]"),
+    dispositions:        JSON.parse(row.dispositions_json        || "{}"),
+    active_set:          JSON.parse(row.active_set_json          || "[]"),
+    pending_flags:       JSON.parse(row.pending_flags_json       || "[]"),
+    dag_validated:       !!row.dag_validated,
+  };
 }

@@ -31,6 +31,17 @@ import { runChatSession }                                             from "./ch
 import { selectBestGPTModel, selectBestClaudeModel,
          OPENAI_FALLBACK, CLAUDE_FALLBACK }               from "./models.js";
 import { getOpenAI, getAnthropic }                        from "./providers.js";
+import { randomUUID }                                     from "crypto";
+import { NORMALIZATION_VERSION }                          from "./normalization.js";
+import {
+  processCritiqueRound,
+  validateDag,
+  computeActiveSet,
+  computeConvergenceState,
+  computePendingFlags,
+  buildLineageCards,
+  buildChildrenMap,
+} from "./phase_integrity.js";
 
 
 const MAX_ROUNDS         = parseInt(process.env.MAX_ROUNDS || "10");
@@ -1304,6 +1315,87 @@ async function runCritiquePhase(draftResult, taskContext) {
     const claudeBlocking = claudeCritique?.critique?.blocking || [];
     collectedBlockingItems.push(...gptBlocking, ...claudeBlocking);
 
+    // ── Canonical critique item processing ────────────────────────────────────
+    // Convert each model's structured blocking/important/minor arrays into
+    // CritiqueItem records, mint IDs, and persist to the canonical store.
+    // Dispositions embedded in the critique JSON are also extracted and stored.
+    {
+      const itemStore       = DB.getCritiqueItemStore(state.proposalId);
+      const dispositionStore = DB.getDispositionStore(state.proposalId, round);
+
+      // Build raw items for GPT's critique
+      const gptRawItems = buildRawItemsFromCritique(gptCritique?.critique, round);
+      if (gptRawItems.length) {
+        const result = processCritiqueRound({
+          proposalId:        state.proposalId,
+          role:              "gpt",
+          round,
+          rawItems:          gptRawItems,
+          itemStore,
+          dispositionStore,
+          closedItems:       [...itemStore.values()].filter(i =>
+            (dispositionStore.get(i.id) || []).some(d => d.terminal_at)),
+          insertItems:       items => DB.insertCritiqueItems(state.proposalId, items),
+          insertDispositions: recs => DB.insertDispositions(state.proposalId, recs),
+        });
+        if (result.warnings.length) result.warnings.forEach(w => console.log(dim(`    ⚠ ${w}`)));
+        if (result.errors.length)   result.errors.forEach(e =>   console.log(red(`    ✗ ${e}`)));
+      }
+
+      // Build raw items for Claude's critique
+      const claudeRawItems = buildRawItemsFromCritique(claudeCritique?.critique, round);
+      if (claudeRawItems.length) {
+        const freshStore = DB.getCritiqueItemStore(state.proposalId);
+        const result = processCritiqueRound({
+          proposalId:        state.proposalId,
+          role:              "claude",
+          round,
+          rawItems:          claudeRawItems,
+          itemStore:         freshStore,
+          dispositionStore:  DB.getDispositionStore(state.proposalId, round),
+          closedItems:       [...freshStore.values()].filter(i =>
+            (DB.getDispositionsForItem(state.proposalId, i.id) || []).some(d => d.terminal_at)),
+          insertItems:       items => DB.insertCritiqueItems(state.proposalId, items),
+          insertDispositions: recs => DB.insertDispositions(state.proposalId, recs),
+        });
+        if (result.warnings.length) result.warnings.forEach(w => console.log(dim(`    ⚠ ${w}`)));
+        if (result.errors.length)   result.errors.forEach(e =>   console.log(red(`    ✗ ${e}`)));
+      }
+
+      // Compute and persist round artifact
+      const finalItemStore       = DB.getCritiqueItemStore(state.proposalId);
+      const finalDispositionStore = DB.getDispositionStore(state.proposalId, round);
+      const childrenMap          = buildChildrenMap(finalItemStore);
+      const dagResult            = validateDag(finalItemStore);
+      const activeSet            = computeActiveSet(finalItemStore, finalDispositionStore, childrenMap);
+      const pendingFlags         = computePendingFlags(finalDispositionStore);
+      const convergenceState     = computeConvergenceState(activeSet, finalItemStore);
+
+      DB.upsertRoundArtifact(state.proposalId, round, {
+        artifact_id:               randomUUID(),
+        produced_at:               new Date().toISOString(),
+        gpt_plan:                  JSON.stringify(gptPlan),
+        claude_plan:               JSON.stringify(claudePlan),
+        gpt_critique_ids:          gptRawItems.map(r => r._minted_id).filter(Boolean),
+        claude_critique_ids:       claudeRawItems.map(r => r._minted_id).filter(Boolean),
+        dispositions:              {},
+        normalization_spec_version: NORMALIZATION_VERSION,
+        active_set:                activeSet,
+        pending_flags:             pendingFlags,
+        convergence_state:         convergenceState,
+        dag_validated:             dagResult.valid,
+        dag_validated_at:          dagResult.valid ? new Date().toISOString() : null,
+      });
+
+      if (!dagResult.valid) {
+        console.log(red(`\n  ✗ DAG cycle detected in critique items: ${dagResult.cycle?.slice(0,3).map(id=>id.slice(0,12)).join(" → ")}\n`));
+      }
+
+      if (pendingFlags.length) {
+        console.log(yellow(`\n  ⚑ ${pendingFlags.length} item(s) require host resolution before synthesis can proceed.\n`));
+      }
+    }
+
     // B1: Drift delta check — warn if plans are diverging significantly
     if (prevGptPlan || prevClaudePlan) {
       const gptDrift    = computePlanDrift(prevGptPlan,    gptPlan);
@@ -1575,6 +1667,30 @@ function checkSynthesisConvergence(plan, blockingItems = []) {
   return violations;
 }
 
+// ── Critique item flattening helper ───────────────────────────────────────────
+// Converts the structured {blocking, important, minor} critique from a model
+// into a flat array of raw items for processCritiqueRound().
+
+function buildRawItemsFromCritique(critique, round) {
+  if (!critique) return [];
+  const items = [];
+  const severities = [
+    { key: "blocking",  sev: "blocking"  },
+    { key: "important", sev: "important" },
+    { key: "minor",     sev: "minor"     },
+  ];
+  for (const { key, sev } of severities) {
+    for (const text of (critique[key] || [])) {
+      if (!text?.trim()) continue;
+      // Support both plain string and object forms from model output
+      const title  = typeof text === "string" ? text.trim() : (text.title || String(text)).trim();
+      const detail = typeof text === "object"  ? (text.detail || text.description || "") : "";
+      items.push({ severity: sev, title, detail });
+    }
+  }
+  return items;
+}
+
 // ── Phase 3 — Synthesis ───────────────────────────────────────────────────────
 // Produces the authoritative final plan from compressed phase summaries.
 // Receives ONLY summaries + structured plans — NOT raw debate transcripts.
@@ -1582,17 +1698,58 @@ function checkSynthesisConvergence(plan, blockingItems = []) {
 
 async function runSynthesisPhase(draftResult, critiqueResult, taskContext) {
   const { summary: draftSummary } = draftResult;
-  const { gptPlan, claudePlan, summary: critiqueSummary, disagreements, synthesisDirection } = critiqueResult;
+  const { gptPlan, claudePlan, summary: critiqueSummary, disagreements, synthesisDirection, round: critiqueRound } = critiqueResult;
 
   console.log(""); console.log(hr("═"));
   console.log(bold(cyan("\n  Phase 3 — Synthesis\n")));
   console.log(dim("  Producing authoritative plan with accepted/rejected suggestions."));
   console.log("");
 
+  // ── Pending-flags gate ────────────────────────────────────────────────────
+  // Synthesis is blocked if any items have an open ⚑ (pending_transformation).
+  // These require host/user resolution before the model can synthesise.
+  {
+    const finalItemStore        = DB.getCritiqueItemStore(state.proposalId);
+    const finalDispositionStore = DB.getDispositionStore(state.proposalId, critiqueRound || 99);
+    const pendingFlags          = computePendingFlags(finalDispositionStore);
+    if (pendingFlags.length) {
+      console.log(bold(red(`\n  ⚑ Synthesis blocked — ${pendingFlags.length} item(s) with open flags require resolution:\n`)));
+      for (const id of pendingFlags) {
+        const item = finalItemStore.get(id);
+        console.log(red(`    • ${item?.display_id || id.slice(0,12)}  ${item?.title || ""}`));
+      }
+      console.log(dim("\n  Resolve these items (accept/reject the proposed severity change) before synthesis.\n"));
+      return { finalPlan: null, planText: "(synthesis blocked — pending flags)", summary: "" };
+    }
+  }
+
   // C4: Clearly separated structured input blocks — no blending of sections
   const unresolvedBlock = disagreements?.unresolved?.length
     ? disagreements.unresolved.map((u, i) => `${i + 1}. ${u}`).join("\n")
     : "(none)";
+
+  // ── Lineage cards — canonical active-set view ─────────────────────────────
+  // Built from canonical stores (not summaries). Gives synthesis an
+  // authority-precedence-aware, superseded-labeled view of every open item.
+  let lineageBlock = "";
+  try {
+    const liItemStore  = DB.getCritiqueItemStore(state.proposalId);
+    const liDispStore  = DB.getDispositionStore(state.proposalId, critiqueRound || 99);
+    const liChildren   = buildChildrenMap(liItemStore);
+    const liActive     = computeActiveSet(liItemStore, liDispStore, liChildren);
+    if (liActive.length) {
+      const cards = buildLineageCards({
+        proposalId: state.proposalId,
+        round:      critiqueRound || 1,
+        activeSet:  liActive,
+        itemStore:  liItemStore,
+        dispositions: liDispStore,
+      });
+      lineageBlock = JSON.stringify(cards, null, 2);
+    }
+  } catch {
+    lineageBlock = "(lineage cards unavailable)";
+  }
 
   const contextParts = [
     `=== TASK CONTEXT ===\n${taskContext}`,
@@ -1601,6 +1758,7 @@ async function runSynthesisPhase(draftResult, critiqueResult, taskContext) {
     `=== GPT FINAL PLAN (JSON) ===\n${JSON.stringify(gptPlan, null, 2)}`,
     `=== CLAUDE FINAL PLAN (JSON) ===\n${JSON.stringify(claudePlan, null, 2)}`,
     `=== UNRESOLVED ISSUES ===\n${unresolvedBlock}`,
+    lineageBlock ? `=== OPEN CRITIQUE ITEMS (canonical, authority-precedence ordered) ===\n${lineageBlock}` : null,
     synthesisDirection ? `=== USER DIRECTION ===\n${synthesisDirection}` : null,
   ].filter(Boolean).join("\n\n");
 
