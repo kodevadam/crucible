@@ -557,11 +557,20 @@ const HIDDEN_FILE_ALLOWLIST = new Set([
  *   - Max CONTEXT_PACK_MAX_CHARS chars per file
  *
  * Returns:
- *   { gitRev, files: [{path, reason, sha256, content, chars}  |
- *                     {path, reason, error}] }
+ *   { gitRev, files: Array<ContextPackFile> }
  *
- * Files that could not be read carry an `error` field and no `content`.
- * Callers should filter to `f => !f.error` before injecting into prompts.
+ * ContextPackFile shape:
+ *   On success:  { path, reason, status: "ok",              sha256, content, chars }
+ *   On failure:  { path, reason, status: <error status>,    detail: string }
+ *
+ * Error statuses (machine-queryable):
+ *   "rejected_path"   — validateStagingPath rejected the path (traversal, absolute, UNC)
+ *   "rejected_hidden" — path contains a hidden segment not in the allowlist
+ *   "not_found"       — git show returned nothing at this revision (missing or binary)
+ *
+ * Callers should filter to `f => f.status === "ok"` before injecting into prompts.
+ * Non-ok entries are still included in the returned pack so the full resolution
+ * record is available for audit without silent host decisions.
  */
 export function resolveContextPack(repoPath, requests, gitRev) {
   const seen  = new Set();
@@ -580,7 +589,7 @@ export function resolveContextPack(repoPath, requests, gitRev) {
     try {
       validateStagingPath(repoPath, path);
     } catch (err) {
-      files.push({ path, reason, error: `rejected: ${err.message}` });
+      files.push({ path, reason, status: "rejected_path", detail: err.message });
       continue;
     }
 
@@ -588,20 +597,20 @@ export function resolveContextPack(repoPath, requests, gitRev) {
     const segments = path.replace(/\\/g, "/").split("/");
     const hasHidden = segments.some(s => s.startsWith(".") && !HIDDEN_FILE_ALLOWLIST.has(path));
     if (hasHidden) {
-      files.push({ path, reason, error: "rejected: hidden file/dir" });
+      files.push({ path, reason, status: "rejected_hidden", detail: "path contains hidden segment" });
       continue;
     }
 
     // Read from the pinned revision — empty string means not found / binary.
     const raw = gitq(repoPath, ["show", `${gitRev}:${path}`]);
     if (!raw) {
-      files.push({ path, reason, error: "not found at this revision" });
+      files.push({ path, reason, status: "not_found", detail: `not found at revision ${gitRev.slice(0, 8)}` });
       continue;
     }
 
     const content = raw.slice(0, CONTEXT_PACK_MAX_CHARS);
     const sha256  = createHash("sha256").update(content).digest("hex").slice(0, 16);
-    files.push({ path, reason, sha256, content, chars: content.length });
+    files.push({ path, reason, status: "ok", sha256, content, chars: content.length });
   }
 
   return { gitRev, files };

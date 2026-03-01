@@ -1154,7 +1154,7 @@ No markdown fences, no preamble.`;
 /** Render a resolved context pack as a prompt-injectable string. */
 function formatContextPack(pack) {
   if (!pack) return "";
-  const resolved = pack.files.filter(f => !f.error);
+  const resolved = pack.files.filter(f => f.status === "ok");
   if (!resolved.length) return "";
   const header = `\n\n${UNTRUSTED_REPO_BANNER}Context pack (git rev: ${(pack.gitRev || "").slice(0, 8)}):`;
   const body = resolved.map(f =>
@@ -1218,8 +1218,9 @@ async function runContextRequestStep(taskContext) {
     console.log(dim("    (no files requested)"));
   } else {
     for (const f of gptPack.files) {
-      const mark   = f.error ? red("✗") : green("✓");
-      const detail = f.error ? dim(` — ${f.error}`) : dim(` (${f.chars} chars)`);
+      const ok     = f.status === "ok";
+      const mark   = ok ? green("✓") : red("✗");
+      const detail = ok ? dim(` (${f.chars} chars)`) : dim(` — ${f.status}: ${f.detail}`);
       console.log(`    ${mark} ${f.path}${detail}`);
     }
   }
@@ -1230,8 +1231,9 @@ async function runContextRequestStep(taskContext) {
     console.log(dim("    (no files requested)"));
   } else {
     for (const f of claudePack.files) {
-      const mark   = f.error ? red("✗") : green("✓");
-      const detail = f.error ? dim(` — ${f.error}`) : dim(` (${f.chars} chars)`);
+      const ok     = f.status === "ok";
+      const mark   = ok ? green("✓") : red("✗");
+      const detail = ok ? dim(` (${f.chars} chars)`) : dim(` — ${f.status}: ${f.detail}`);
       console.log(`    ${mark} ${f.path}${detail}`);
     }
   }
