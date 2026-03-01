@@ -345,10 +345,16 @@ export function gitq(repoPath, args) {
  *
  * Equivalent to the old sh(`git -C "..." <args>`) pattern but without
  * shell interpolation.  safeEnv() ensures API keys are not forwarded.
- * core.hooksPath=/dev/null prevents hook execution in untrusted repos.
+ *
+ * By default, core.hooksPath=/dev/null prevents hook execution in untrusted
+ * repos.  Pass { allowHooks: true } for mutating operations (git commit,
+ * git merge) where pre-commit and commit-msg hooks are quality gates that
+ * must fire.  Read-only operations (git log, git show, git diff-tree) never
+ * trigger hooks regardless of this flag.
  */
-export function gitExec(repoPath, args) {
-  const r = spawnSync("git", ["-C", repoPath, ...NO_HOOKS, ...args], {
+export function gitExec(repoPath, args, { allowHooks = false } = {}) {
+  const hookArgs = allowHooks ? [] : NO_HOOKS;
+  const r = spawnSync("git", ["-C", repoPath, ...hookArgs, ...args], {
     stdio:  "inherit",
     shell:  false,
     env:    safeEnv(),

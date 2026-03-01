@@ -2089,7 +2089,7 @@ async function offerCommitSpec(task, finalPlan, round) {
   }
 
   gitExec(state.repoPath, ["add", fname]);
-  gitExec(state.repoPath, ["commit", "-m", `spec: ${task.slice(0,72)}`]);
+  gitExec(state.repoPath, ["commit", "-m", `spec: ${task.slice(0,72)}`], { allowHooks: true });
   DB.executeAction(actionId);
   console.log(green(`  ✔ Committed: ${fname}`));
 
@@ -2141,7 +2141,7 @@ async function offerMergeToMain() {
   } else {
     gitExec(state.repoPath, ["checkout", "main"]);
     gitExec(state.repoPath, ["merge", "--squash", branch]);
-    gitExec(state.repoPath, ["commit", "-m", `Merge ${branch}`]);
+    gitExec(state.repoPath, ["commit", "-m", `Merge ${branch}`], { allowHooks: true });
     DB.logAction(state.proposalId, state.sessionId, "merge", `Merged ${branch} → main`, { branch, base:"main" });
     console.log(green(`  ✔ Merged locally. Push main when ready.`));
   }
@@ -2177,7 +2177,7 @@ async function commitStagedFiles(title, stagedPaths, rounds) {
 
   const msg = `feat: ${title.slice(0, 72)}`;
   const actionId = DB.logAction(state.proposalId, state.sessionId, "commit", msg, { files: stagedPaths });
-  gitExec(state.repoPath, ["commit", "-m", msg]);
+  gitExec(state.repoPath, ["commit", "-m", msg], { allowHooks: true });
   DB.executeAction(actionId);
   console.log(green(`  ✔ Committed ${stagedPaths.length} file(s)`));
 
@@ -3072,9 +3072,10 @@ function cmdDoctor() {
     info("Set CRUCIBLE_PARANOID_ENV=1 for a strict allowlist on all child process environments.");
   }
 
-  // ── 3. Git hook suppression ────────────────────────────────────────────────
-  console.log(`\n  ${bold("Git hook suppression:")}`);
-  ok("core.hooksPath=/dev/null applied to all Crucible git calls (hooks never fire)");
+  // ── 3. Git hook policy ────────────────────────────────────────────────────
+  console.log(`\n  ${bold("Git hook policy:")}`);
+  ok("git commit runs with hooks enabled — pre-commit and commit-msg hooks fire normally");
+  ok("Read-only operations (git log, git show, git diff-tree) retain core.hooksPath=/dev/null (they do not trigger hooks)");
 
   // ── 4. API key storage ─────────────────────────────────────────────────────
   console.log(`\n  ${bold("API key storage:")}`);
