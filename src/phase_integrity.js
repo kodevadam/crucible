@@ -368,7 +368,7 @@ export function processCritiqueRound({
           const eff = getEffectiveDisposition(dispositionStore.get(parentId) || []);
           errors.push(
             `Item "${dispId}": derived_from "${parentId.slice(0,12)}" is already resolved` +
-            ` (${eff?.decision || "terminal"}) — mint a new root item if the concern re-emerges`
+            ` (${eff?.decision || "terminal"} at round ${eff?.round ?? "?"}) — mint a new root item if the concern re-emerges`
           );
           continue;
         }

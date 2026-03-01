@@ -697,7 +697,7 @@ describe("processCritiqueRound — closed ID re-activation guard", () => {
     // Pre-populate dispositionStore: item is accepted (terminal)
     const now = "2024-01-01T00:00:00Z";
     const dispositionStore = new Map([[terminalId, [
-      { decided_by: "gpt", decision: "accepted", proposed_at: now, terminal_at: now },
+      { round: 1, decided_by: "gpt", decision: "accepted", proposed_at: now, terminal_at: now },
     ]]]);
 
     const result = processCritiqueRound({
@@ -716,6 +716,7 @@ describe("processCritiqueRound — closed ID re-activation guard", () => {
 
     assert.ok(result.errors.length > 0);
     assert.ok(result.errors.some(e => e.includes("already resolved")));
+    assert.ok(result.errors.some(e => e.includes("round 1")));
     assert.ok(result.errors.some(e => e.includes("mint a new root item")));
   });
 
@@ -767,7 +768,7 @@ describe("processCritiqueRound — closed ID re-activation guard", () => {
 
     const now = "2024-01-01T00:00:00Z";
     const dispositionStore = new Map([[rejectedId, [
-      { decided_by: "claude", decision: "rejected", proposed_at: now, terminal_at: now },
+      { round: 1, decided_by: "claude", decision: "rejected", proposed_at: now, terminal_at: now },
     ]]]);
 
     const result = processCritiqueRound({
@@ -786,7 +787,8 @@ describe("processCritiqueRound — closed ID re-activation guard", () => {
     });
 
     assert.ok(result.errors.length > 0);
-    assert.ok(result.errors.some(e => e.includes("already resolved") || e.includes("rejected")));
+    assert.ok(result.errors.some(e => e.includes("already resolved")));
+    assert.ok(result.errors.some(e => e.includes("round 1")));
   });
 });
 
@@ -1009,9 +1011,9 @@ describe("adversarial A — closed-ID guard respects D3 (host overrides pending_
     const t2 = "2024-01-02T00:00:00Z";
     const dispositionStore = new Map([[itemId, [
       // Round 1 — model proposes severity downgrade → pending_transformation
-      { decided_by: "gpt",  decision: "pending_transformation", proposed_at: t1, terminal_at: null },
+      { round: 1, decided_by: "gpt",  decision: "pending_transformation", proposed_at: t1, terminal_at: null },
       // Round 2 — host resolves the ⚑ by accepting the concern at original severity
-      { decided_by: "host", decision: "accepted",               proposed_at: t2, terminal_at: t2  },
+      { round: 2, decided_by: "host", decision: "accepted",               proposed_at: t2, terminal_at: t2  },
     ]]]);
 
     const result = processCritiqueRound({
@@ -1033,6 +1035,7 @@ describe("adversarial A — closed-ID guard respects D3 (host overrides pending_
 
     assert.ok(result.errors.length > 0, "expected hard error for host-accepted parent");
     assert.ok(result.errors.some(e => e.includes("already resolved")));
+    assert.ok(result.errors.some(e => e.includes("round 2")), "error must include terminal round");
   });
 });
 
@@ -1101,9 +1104,9 @@ describe("adversarial C — closed-ID guard: transformed parent transitively ter
 
     const now = "2024-01-01T00:00:00Z";
     const dispositionStore = new Map([
-      [parentId, [{ decided_by: "gpt", decision: "transformed",   proposed_at: now, terminal_at: null }]],
-      [child1Id, [{ decided_by: "gpt", decision: "accepted",      proposed_at: now, terminal_at: now  }]],
-      [child2Id, [{ decided_by: "gpt", decision: "accepted",      proposed_at: now, terminal_at: now  }]],
+      [parentId, [{ round: 1, decided_by: "gpt", decision: "transformed",   proposed_at: now, terminal_at: null }]],
+      [child1Id, [{ round: 1, decided_by: "gpt", decision: "accepted",      proposed_at: now, terminal_at: now  }]],
+      [child2Id, [{ round: 1, decided_by: "gpt", decision: "accepted",      proposed_at: now, terminal_at: now  }]],
     ]);
 
     // Round 3: another model tries to derive from the (now terminal) parent
@@ -1126,6 +1129,7 @@ describe("adversarial C — closed-ID guard: transformed parent transitively ter
 
     assert.ok(result.errors.length > 0, "expected hard error for terminal transformed parent");
     assert.ok(result.errors.some(e => e.includes("already resolved")));
+    assert.ok(result.errors.some(e => e.includes("round 1")), "error must include terminal round");
   });
 
   test("transformed parent with ONE child still active: re-derive NOT blocked", () => {
