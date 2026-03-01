@@ -42,6 +42,7 @@ import {
   computeSynthesisGaps,
   buildLineageCards,
   buildChildrenMap,
+  getEffectiveDisposition,
 } from "./phase_integrity.js";
 
 
@@ -2265,6 +2266,7 @@ async function proposalFlow(initialProposal) {
       canonicalCtx = {
         activeSet: computeActiveSet(csItemStore, csDispStore, csChildren),
         itemStore: csItemStore,
+        dispStore: csDispStore,
       };
     } catch { /* non-fatal — falls back to legacy path */ }
 
@@ -2312,12 +2314,59 @@ async function proposalFlow(initialProposal) {
       ? round2(blockingGoingIn / blockingMinted)
       : null;
 
+    // Fate distribution — where did minted blocking items go before reaching synthesis?
+    //
+    //   blocking_minted_total
+    //     └─ blocking_collapsed_dedup     never registered (dedup/normalisation collapsed them)
+    //     └─ blocking_registered          reached the canonical item store
+    //           └─ blocking_active_going_in    survived to synthesis (= existing field)
+    //           └─ blocking_pre_accepted       accepted and closed during critique
+    //           └─ blocking_pre_rejected       rejected and closed during critique
+    //           └─ blocking_pre_deferred       deferred and closed during critique
+    //           └─ blocking_downgraded         severity reduced; item transformed during critique
+    //
+    // Conservation law (no gold set needed):
+    //   blocking_minted_total = blocking_collapsed_dedup
+    //                         + blocking_pre_accepted + blocking_pre_rejected
+    //                         + blocking_pre_deferred + blocking_downgraded
+    //                         + blocking_active_going_in
+    let blockingRegistered  = 0;
+    let blockingPreAccepted = 0;  // accepted and closed during critique (resolved before synthesis)
+    let blockingPreRejected = 0;  // rejected and closed during critique (dismissed as invalid)
+    let blockingPreDeferred = 0;  // deferred during critique
+    let blockingDowngraded  = 0;  // severity lowered; no longer blocking by synthesis time
+    if (canonicalCtx?.itemStore && canonicalCtx?.dispStore) {
+      const activeIds = new Set((canonicalCtx.activeSet || []).map(i => i.id));
+      for (const [id, item] of canonicalCtx.itemStore) {
+        if (item.severity !== "blocking") continue;
+        blockingRegistered++;
+        if (activeIds.has(id)) continue;  // survived → counted in blockingGoingIn
+        const eff = getEffectiveDisposition(canonicalCtx.dispStore.get(id) || []);
+        switch (eff?.decision) {
+          case "accepted":    blockingPreAccepted++; break;
+          case "rejected":    blockingPreRejected++; break;
+          case "deferred":    blockingPreDeferred++; break;
+          case "transformed": blockingDowngraded++;  break;
+          default: break;
+        }
+      }
+    }
+    const blockingCollapsedDedup = (blockingMinted !== null)
+      ? blockingMinted - blockingRegistered
+      : null;
+
     DB.logMessage(state.proposalId, "host", JSON.stringify({
       blocking_active_going_in:  blockingGoingIn,
       blocking_resolved_count:   blockingResolved,
       blocking_unresolved_count: blockingUnresolved,
       blocking_minted_total:     blockingMinted,
       blocking_survival_rate:    blockingSurvivalRate,
+      blocking_registered:       blockingRegistered       || null,
+      blocking_collapsed_dedup:  blockingCollapsedDedup,
+      blocking_pre_accepted:     blockingPreAccepted      || null,
+      blocking_pre_rejected:     blockingPreRejected      || null,
+      blocking_pre_deferred:     blockingPreDeferred      || null,
+      blocking_downgraded:       blockingDowngraded       || null,
       canonical_active_set_size: canonicalCtx?.activeSet?.length ?? null,
       convergence_violations:    convergenceViolations.length,
       deferred_count:            synthesisResult.finalPlan?.deferred_suggestions?.length || 0,
