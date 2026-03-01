@@ -176,6 +176,166 @@
         "type":    "test_pass",
         "command": "npm test"
       }
+    },
+
+    {
+      "id":      "exec-layer-001",
+      "class":   "governance",
+      "title":   "Remove hook suppression from git commit path and surface hook failures",
+      "prompt":  "safety.js defines const NO_HOOKS = [\"-c\", \"core.hooksPath=/dev/null\"] at line 321 and applies it unconditionally in both gitq() and gitExec(). This means every git commit Crucible makes (cli.js lines 2092, 2144, 2180) bypasses pre-commit and commit-msg hooks. Hooks are how repos enforce quality gates (lint, type-check, secret scanning). Fix this so that git commit calls run with hooks enabled. Hook failures must surface as legible errors, not be swallowed. Read-only git operations (git log, git show, git diff-tree) may retain hook suppression as a defence-in-depth measure since those operations do not trigger hooks anyway. Update the security audit output in cli.js:3077 to reflect the new behaviour.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "fedf7a3b5984249a5c9c9023dcd31aea3a2c05ef",
+      "gold_blocking": [
+        {
+          "id":        "gb-exec-001-001",
+          "title":     "NO_HOOKS must not be deleted from gitq() — only gitExec() commit calls need the change",
+          "rationale": "gitq() is used for read-only operations (git show, git log, git diff-tree) which do not trigger hooks; removing NO_HOOKS from gitq is harmless but deleting it from gitExec entirely breaks the security rationale for non-commit calls like git worktree or git branch"
+        },
+        {
+          "id":        "gb-exec-001-002",
+          "title":     "A new gitExecWithHooks() or a withHooks parameter must be added to gitExec() — not a blanket removal of NO_HOOKS",
+          "rationale": "Three call sites in cli.js use gitExec for commit; a blanket removal changes all gitExec call sites including non-commit ones; surgical change requires either a parameter flag or a separate function"
+        },
+        {
+          "id":        "gb-exec-001-003",
+          "title":     "Hook stderr output must be captured and re-emitted on failure, not silently discarded",
+          "rationale": "gitExec currently uses stdio:'inherit' which passes hook output to the terminal; if changed to pipe for capture, the caller must explicitly re-emit the hook output so the user sees what failed"
+        },
+        {
+          "id":        "gb-exec-001-004",
+          "title":     "cli.js:3077 reports 'hooks never fire' as a positive security status — this log line must be updated",
+          "rationale": "After the fix, hooks DO fire on commit; leaving the old log line would misinform users running crucible security-check"
+        }
+      ],
+      "success_check": {
+        "type":    "manual",
+        "note":    "In a repo with a failing pre-commit hook (e.g. a script that exits 1), run crucible plan and approve staging through to commit. Verify: (1) the commit is rejected, (2) the hook's stderr is printed to the user, (3) crucible security-check no longer reports 'hooks never fire' as an unconditional positive"
+      }
+    },
+
+    {
+      "id":      "exec-layer-002",
+      "class":   "design",
+      "title":   "Implement git worktree isolation for all staging and gate execution",
+      "prompt":  "staging.js currently writes approved file content directly to the user's working tree and runs git add against it. This means any error during file generation or gate execution corrupts the user's working state. Implement git worktree isolation: all patch application and test gate execution must happen inside a dedicated git worktree at .crucible/worktrees/<run_id>. The user's working tree must not be mutated until the user explicitly approves the final diff at the commit gate. The worktree must be cleaned up after the run completes or is cancelled. This is a first-class invariant, not an implementation detail — it must be documented in the function JSDoc.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "fedf7a3b5984249a5c9c9023dcd31aea3a2c05ef",
+      "gold_blocking": [
+        {
+          "id":        "gb-exec-002-001",
+          "title":     "git worktree add requires a branch or commit ref — creating it on the current branch fails if the branch has uncommitted changes",
+          "rationale": "git will refuse to check out a branch in a worktree if that branch is already checked out in the main worktree; the worktree must use a detached HEAD at the current HEAD SHA or a short-lived throwaway branch"
+        },
+        {
+          "id":        "gb-exec-002-002",
+          "title":     ".crucible/worktrees/ must be added to .gitignore or each worktree directory appears as an untracked file",
+          "rationale": "git worktree add creates a directory in the repo root; without .gitignore coverage, git status shows it as untracked and git add -A would accidentally stage it"
+        },
+        {
+          "id":        "gb-exec-002-003",
+          "title":     "Cleanup must use git worktree remove, not rm -rf",
+          "rationale": "rm -rf removes the directory but leaves the worktree registered in .git/worktrees/; subsequent git worktree list shows stale entries and git worktree add may refuse to reuse the path"
+        },
+        {
+          "id":        "gb-exec-002-004",
+          "title":     "validateStagingPath() in staging.js uses repoPath as the root — with worktrees, the validation root must switch to the worktree path for all file writes inside it",
+          "rationale": "If validateStagingPath is called with the main repoPath but the write target is the worktree path, the boundary check will reject valid paths or accept invalid ones depending on the path relationship"
+        },
+        {
+          "id":        "gb-exec-002-005",
+          "title":     "The worktree must be removed even if the run throws — cleanup must be in a try/finally block",
+          "rationale": "If staging or gate execution throws, the worktree remains on disk and is registered in git; without finally-cleanup, abandoned worktrees accumulate across failed runs"
+        }
+      ],
+      "success_check": {
+        "type":    "manual",
+        "note":    "Run a full staging flow. Verify: (1) during generation, git status in the main repo shows no changes, (2) .crucible/worktrees/<run_id>/ exists and contains the proposed changes, (3) after approval and commit, the worktree directory is gone, (4) git worktree list shows no stale entries, (5) if the flow is cancelled mid-run, the worktree is still removed"
+      }
+    },
+
+    {
+      "id":      "exec-layer-003",
+      "class":   "design",
+      "title":   "Replace full-file generation with surgical patch operations and unified diff",
+      "prompt":  "staging.js:generateFileContent() generates and writes complete file replacements. This is high-noise: a one-line fix rewrites 400 lines, making review impractical and introducing unintended changes. Replace the generation model with structured patch operations. The model emits a JSON array of ops: replace(file, old_text, new_text, occurrence?), insert_after(file, anchor_text, new_text), delete_range(file, start_line, end_line). Crucible applies the ops in order to produce the modified file, then generates a git-style unified diff. The review UI in staging.js shows hunks for approval, not full file content. The existing diffPreview() function at staging.js:192 produces a simplified added/removed line list — it must be replaced with or supplemented by a proper hunk-based diff.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "fedf7a3b5984249a5c9c9023dcd31aea3a2c05ef",
+      "gold_blocking": [
+        {
+          "id":        "gb-exec-003-001",
+          "title":     "replace() must fail with a clear error if old_text is not found in the file — a silent no-op would produce a diff that omits the intended change",
+          "rationale": "Models hallucinate exact text; if old_text doesn't match, applying the op silently succeeds but the change is never made; the caller must know the op failed"
+        },
+        {
+          "id":        "gb-exec-003-002",
+          "title":     "Multiple ops on the same file must be applied sequentially to the evolving content, not all applied to the original file",
+          "rationale": "If op 1 inserts lines before op 2's anchor, the line numbers in op 2 shift; applying all ops to the original content and merging produces conflicts"
+        },
+        {
+          "id":        "gb-exec-003-003",
+          "title":     "delete_range uses line numbers that become stale after earlier ops shift content — line-number ops must either be applied before text-anchor ops or recomputed after each op",
+          "rationale": "A delete_range(file, 10, 15) is invalid after an insert_after at line 8 adds 3 lines; the implementation must define and enforce an application order"
+        },
+        {
+          "id":        "gb-exec-003-004",
+          "title":     "The unified diff must be computed from the final modified content vs the original, not reconstructed from the ops list",
+          "rationale": "Reconstructing a diff from ops descriptions produces incorrect context lines and hunk headers; the correct approach is diff(original_content, final_content)"
+        },
+        {
+          "id":        "gb-exec-003-005",
+          "title":     "GENERATE_MAX_TOKENS in staging.js is set for full-file output (4000 tokens) — patch op output is smaller but the model prompt must be updated to elicit JSON op arrays instead of raw file content",
+          "rationale": "The existing prompt at staging.js:160 instructs the model to 'Return ONLY the raw file content'; sending the same prompt will produce file content, not patch ops"
+        }
+      ],
+      "success_check": {
+        "type":    "manual",
+        "note":    "Run a staging flow for a single-function change. Verify: (1) the model output is a JSON array of patch ops, not raw file content, (2) the ops are applied and produce the correct modified file, (3) the review UI shows a unified diff with hunk boundaries, (4) approving a subset of hunks applies only those hunks"
+      }
+    },
+
+    {
+      "id":      "exec-layer-004",
+      "class":   "design",
+      "title":   "Implement bounded test iteration loop with failure signature and regression detection",
+      "prompt":  "After patch ops are applied in the worktree, Crucible currently stops and waits for manual commit. Add a test iteration loop: apply the current patch set in the worktree, run configured gates (hooks, lint, build, tests via config.gates or npm test as default), and if all gates pass proceed to the commit gate. If gates fail, compute a failure_signature = hash(failing_test_file + test_name + error_type + normalized_error_location) and feed the failure output back to a repair agent that emits refined patch ops. Stop conditions: (1) all gates pass, (2) the same failure_signature appears in two consecutive iterations — escalate to human with current diff and logs, (3) failures(n) > failures(n-1) for two consecutive iterations — escalate with reason=regression, (4) iteration count exceeds config.repair_max_iters (default 8). normalized_error_location derives from the first stack frame inside the repo: keep repo-relative file path, function name, error class; strip line/col numbers, timestamps, memory addresses, and worktree path prefix.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "fedf7a3b5984249a5c9c9023dcd31aea3a2c05ef",
+      "gold_blocking": [
+        {
+          "id":        "gb-exec-004-001",
+          "title":     "Failure signature parsing requires test-runner-specific logic — a single regex over raw stderr cannot reliably extract test_name and error_class from Jest, pytest, mocha, and go test output",
+          "rationale": "Each runner has a different output format; a generic regex will silently misparse many failures, producing wrong signatures and causing the stall-detection to miss repeated failures"
+        },
+        {
+          "id":        "gb-exec-004-002",
+          "title":     "The same failure_signature repeating twice requires comparing iteration N to iteration N-1, not checking against all-time history",
+          "rationale": "A failure that appears in iteration 1, disappears in iteration 2 (repair introduced a different bug), and reappears in iteration 3 is a different situation from iteration 2 repeating iteration 1; comparing to all-time history would incorrectly escalate the iteration-3 case"
+        },
+        {
+          "id":        "gb-exec-004-003",
+          "title":     "failures_per_iteration must count distinct failing test cases, not lines of stderr — stderr line count is not a stable proxy for test failures",
+          "rationale": "A verbose runner may emit 50 lines for a single test failure; the regression detector comparing failures(n) > failures(n-1) must compare test-case counts or file counts, not output sizes"
+        },
+        {
+          "id":        "gb-exec-004-004",
+          "title":     "The repair agent receives 'relevant evidence pack excerpts' — the selection rule must be deterministic: include files touched by the current diff, files in failing stack frames, and the failing test files; without a defined rule, implementations dump the full evidence pack and exceed context limits",
+          "rationale": "Evidence packs can be large; an undefined selection rule leads to either context overflow (dump everything) or under-specification (send nothing useful); the rule must be explicit and priority-ordered"
+        },
+        {
+          "id":        "gb-exec-004-005",
+          "title":     "Network isolation (--network=none) is Linux-specific and unavailable in many CI environments — the loop must not hard-fail on missing network namespace support; it must warn and continue",
+          "rationale": "Docker --network=none and Linux unshare are not available on macOS or bare CI runners without container support; making network isolation mandatory would break the loop on valid developer machines"
+        },
+        {
+          "id":        "gb-exec-004-006",
+          "title":     "The worktree state must be reset between iterations — each repair cycle must apply ops to the original file content, not to the previous iteration's partially-applied content",
+          "rationale": "If iteration 1 applies ops A+B and iteration 2 applies ops A+B+C to the iteration-1 worktree, ops A and B are applied twice; each iteration must start from the original content at HEAD"
+        }
+      ],
+      "success_check": {
+        "type":    "manual",
+        "note":    "Configure a repo where npm test fails with a known assertion error. Run the execution loop. Verify: (1) the loop runs up to repair_max_iters iterations, (2) on a repeated failure_signature the loop stops and escalates with the diff and gate output, (3) if a repair makes more tests fail than the previous iteration for two consecutive rounds, the loop escalates with reason=regression, (4) failures_per_iteration is logged for each iteration"
+      }
     }
   ]
 }
