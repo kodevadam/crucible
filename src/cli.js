@@ -2281,18 +2281,24 @@ async function proposalFlow(initialProposal) {
     }
 
     // Persist synthesis outcome stats — the "Y" that completes the experiment row
-    //   blocking_active_going_in:   canonical blocking items synthesis had to address
-    //   blocking_resolved_count:    items explicitly accepted or rejected (recall numerator)
-    //   blocking_unresolved_count:  items synthesis left unaddressed (recall denominator gap)
-    //   convergence_violations:     total structural violations (superset — includes non-blocking)
-    //   deferred_count:             items explicitly deferred to future work
     //
-    // blocking_resolved + blocking_unresolved = blocking_active_going_in (exact partition)
-    // recall = blocking_resolved / blocking_active_going_in  (queryable directly)
+    // Recall (computable now, no gold set needed):
+    //   recall = blocking_resolved_count / blocking_active_going_in
     //
-    // Note: blocking_unresolved_count uses computeSynthesisGaps (same as checkSynthesisConvergence
-    // canonical path) so it counts only true blocking gaps, not structural violations like
-    // "no objective defined" — keeping it a clean complement to blocking_resolved_count.
+    // Precision (computable later, once a gold set labels true vs false blocking items):
+    //   precision = true_positive_blocking / blocking_minted_total
+    //   F1        = 2 * precision * recall / (precision + recall)
+    //
+    // blocking_minted_total is colocated here (from critiqueFinalStats) so the synthesis
+    // artifact is self-contained — no join needed when gold labels arrive.
+    //
+    // blocking_survival_rate = blocking_active_going_in / blocking_minted_total
+    //   High: models raised substantive items, few were noise/duplicates
+    //   Low:  high churn — many raised items collapsed during canonicalisation
+    //
+    // blocking_unresolved_count uses computeSynthesisGaps (same canonical path as
+    // checkSynthesisConvergence) — counts only true blocking gaps, not structural
+    // violations like "no objective defined". Keeps recall signal clean.
     const synthGaps          = (canonicalCtx?.activeSet && canonicalCtx?.itemStore)
       ? computeSynthesisGaps(canonicalCtx.activeSet, canonicalCtx.itemStore, synthesisResult.finalPlan)
       : null;
@@ -2301,11 +2307,17 @@ async function proposalFlow(initialProposal) {
     const blockingResolved   = (blockingGoingIn !== null && blockingUnresolved !== null)
       ? blockingGoingIn - blockingUnresolved
       : null;
+    const blockingMinted       = critiqueResult.critiqueFinalStats?.blocking_minted ?? null;
+    const blockingSurvivalRate = (blockingMinted && blockingGoingIn !== null)
+      ? round2(blockingGoingIn / blockingMinted)
+      : null;
 
     DB.logMessage(state.proposalId, "host", JSON.stringify({
       blocking_active_going_in:  blockingGoingIn,
       blocking_resolved_count:   blockingResolved,
       blocking_unresolved_count: blockingUnresolved,
+      blocking_minted_total:     blockingMinted,
+      blocking_survival_rate:    blockingSurvivalRate,
       canonical_active_set_size: canonicalCtx?.activeSet?.length ?? null,
       convergence_violations:    convergenceViolations.length,
       deferred_count:            synthesisResult.finalPlan?.deferred_suggestions?.length || 0,
