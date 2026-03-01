@@ -2281,12 +2281,31 @@ async function proposalFlow(initialProposal) {
     }
 
     // Persist synthesis outcome stats — the "Y" that completes the experiment row
-    //   blocking_active_going_in:  how many canonical blocking items synthesis had to address
-    //   convergence_violations:    how many it failed to address (unresolved after synthesis)
-    //   deferred_count:            items explicitly deferred to future work
-    // Together with Phase 1a groundingStats and critiqueFinalStats, a full run is queryable.
+    //   blocking_active_going_in:   canonical blocking items synthesis had to address
+    //   blocking_resolved_count:    items explicitly accepted or rejected (recall numerator)
+    //   blocking_unresolved_count:  items synthesis left unaddressed (recall denominator gap)
+    //   convergence_violations:     total structural violations (superset — includes non-blocking)
+    //   deferred_count:             items explicitly deferred to future work
+    //
+    // blocking_resolved + blocking_unresolved = blocking_active_going_in (exact partition)
+    // recall = blocking_resolved / blocking_active_going_in  (queryable directly)
+    //
+    // Note: blocking_unresolved_count uses computeSynthesisGaps (same as checkSynthesisConvergence
+    // canonical path) so it counts only true blocking gaps, not structural violations like
+    // "no objective defined" — keeping it a clean complement to blocking_resolved_count.
+    const synthGaps          = (canonicalCtx?.activeSet && canonicalCtx?.itemStore)
+      ? computeSynthesisGaps(canonicalCtx.activeSet, canonicalCtx.itemStore, synthesisResult.finalPlan)
+      : null;
+    const blockingGoingIn    = canonicalCtx?.activeSet?.filter(i => i.severity === "blocking").length ?? null;
+    const blockingUnresolved = synthGaps?.length ?? null;
+    const blockingResolved   = (blockingGoingIn !== null && blockingUnresolved !== null)
+      ? blockingGoingIn - blockingUnresolved
+      : null;
+
     DB.logMessage(state.proposalId, "host", JSON.stringify({
-      blocking_active_going_in:  canonicalCtx?.activeSet?.filter(i => i.severity === "blocking").length ?? null,
+      blocking_active_going_in:  blockingGoingIn,
+      blocking_resolved_count:   blockingResolved,
+      blocking_unresolved_count: blockingUnresolved,
       canonical_active_set_size: canonicalCtx?.activeSet?.length ?? null,
       convergence_violations:    convergenceViolations.length,
       deferred_count:            synthesisResult.finalPlan?.deferred_suggestions?.length || 0,
