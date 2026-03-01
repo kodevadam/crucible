@@ -1,0 +1,181 @@
+{
+  "_schema": {
+    "version": "1",
+    "fields": {
+      "id":            "stable task identifier — never reuse across benchmark versions",
+      "class":         "bugfix | refactor | design | governance | partial-context",
+      "title":         "short description (≤80 chars)",
+      "prompt":        "the natural-language task string passed to crucible plan / debate",
+      "repo_url":      "git remote URL — pins which codebase this task applies to",
+      "git_rev":       "full SHA that was HEAD when the gold items were authored",
+      "gold_blocking": [
+        {
+          "id":        "gb-<task-id>-NNN — stable within a task",
+          "title":     "the blocking item a correct plan MUST surface (for recall scoring)",
+          "rationale": "why this is genuinely blocking, not just important"
+        }
+      ],
+      "success_check": {
+        "type":    "test_pass | lint_pass | snapshot | manual",
+        "command": "shell command to run after the plan is executed (test_pass / lint_pass)",
+        "note":    "human instruction for manual checks"
+      }
+    },
+    "scoring": {
+      "gold_recall":         "fraction of gold_blocking items that appear in canonical blocking set (semantic match)",
+      "false_blocking_rate": "fraction of minted blocking items marked invalid by human reviewer",
+      "success":             "bool from success_check"
+    },
+    "notes": [
+      "Add new tasks by appending to the tasks array — never mutate existing task ids.",
+      "gold_blocking items should be things the plan MUST acknowledge, not merely nice-to-haves.",
+      "Use the same repo_url + git_rev across all arms of the same run for comparability.",
+      "One task should be run per proposal; set --task-class to match the class field."
+    ]
+  },
+
+  "primary_metric":    "recall",
+  "secondary_metrics": ["recall_per_1k_tokens", "pct_converged_naturally"],
+
+  "tasks": [
+    {
+      "id":      "refactor-001",
+      "class":   "refactor",
+      "title":   "Extract blocking-fate distribution into a standalone function",
+      "prompt":  "The blocking-item fate distribution computation (collapsed_dedup, pre_accepted, pre_rejected, pre_deferred, downgraded) is currently inlined in the synthesis outcome block of cli.js. Extract it into a standalone computeBlockingFateDist(itemStore, dispStore, activeSet) function in phase_integrity.js and update the call site. The conservation law (minted = collapsed + all fates + active) must still hold in all tests.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "f6e21917797ff119ce8232558160f39d8c9f6678",
+      "gold_blocking": [
+        {
+          "id":        "gb-refactor-001-001",
+          "title":     "getEffectiveDisposition must remain importable from phase_integrity.js",
+          "rationale": "The new function calls it; if moved it breaks the existing import in cli.js"
+        },
+        {
+          "id":        "gb-refactor-001-002",
+          "title":     "computeBlockingFateDist must be exported from phase_integrity.js and imported in cli.js",
+          "rationale": "Without the export/import pair the call site cannot compile"
+        },
+        {
+          "id":        "gb-refactor-001-003",
+          "title":     "The function signature must receive dispStore explicitly, not read state.phaseTokens",
+          "rationale": "phase_integrity.js has no access to cli.js module-level state; hidden dependency would break tests"
+        }
+      ],
+      "success_check": {
+        "type":    "test_pass",
+        "command": "npm test"
+      }
+    },
+
+    {
+      "id":      "bugfix-001",
+      "class":   "bugfix",
+      "title":   "Fix race condition: token accumulator resets mid-proposal on restart",
+      "prompt":  "When a user restarts the debate loop (ctrl+action === 'restart' in runCritiquePhase), the phase token accumulator for PHASE_CRITIQUE continues from the previous attempt's totals rather than resetting. Fix this so each attempt starts a clean token slate for the critique phase, while preserving draft-phase tokens already accumulated.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "f6e21917797ff119ce8232558160f39d8c9f6678",
+      "gold_blocking": [
+        {
+          "id":        "gb-bugfix-001-001",
+          "title":     "state.phaseTokens[PHASE_CRITIQUE] must be cleared on restart, not all of state.phaseTokens",
+          "rationale": "Clearing all phases would also reset draft-phase tokens, corrupting cost attribution"
+        },
+        {
+          "id":        "gb-bugfix-001-002",
+          "title":     "The reset must happen before runCritiquePhase re-executes, not inside it",
+          "rationale": "If reset is inside the function, draft-phase currentPhase assignment overwrites it"
+        }
+      ],
+      "success_check": {
+        "type":    "test_pass",
+        "command": "npm test"
+      }
+    },
+
+    {
+      "id":      "design-001",
+      "class":   "design",
+      "title":   "Add a structured migration registry to replace the raw ALTER TABLE loop",
+      "prompt":  "The current schema migration in db.js iterates a plain array of ALTER TABLE strings and silently swallows 'duplicate column' errors. Design and implement a versioned migration registry: each migration has a numeric version, a description, and an up() function. The registry must be idempotent, log applied migrations to a new schema_migrations table, and never re-apply a migration that already ran. Existing migrations must be preserved with correct version numbers.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "f6e21917797ff119ce8232558160f39d8c9f6678",
+      "gold_blocking": [
+        {
+          "id":        "gb-design-001-001",
+          "title":     "schema_migrations table must itself be created idempotently before any migration runs",
+          "rationale": "Bootstrapping problem: if the table doesn't exist, reading applied versions fails"
+        },
+        {
+          "id":        "gb-design-001-002",
+          "title":     "All 6 existing ALTER TABLE migrations must appear as version 1–6 in the registry",
+          "rationale": "Skipping them would re-apply on first run against a fully-migrated database, causing errors"
+        },
+        {
+          "id":        "gb-design-001-003",
+          "title":     "Migration must run inside a transaction so a partial failure doesn't leave the DB half-migrated",
+          "rationale": "better-sqlite3 supports synchronous transactions; not using one is a data-safety regression"
+        }
+      ],
+      "success_check": {
+        "type":    "test_pass",
+        "command": "npm test"
+      }
+    },
+
+    {
+      "id":      "governance-001",
+      "class":   "governance",
+      "title":   "Add --dry-run flag that validates a plan without writing to the DB",
+      "prompt":  "Add a --dry-run flag to the crucible plan and crucible debate commands. When active, the full Phase 1a–3 pipeline runs normally (including all model calls and convergence checks), but no DB writes occur: no session, no proposal, no messages, no critique items, no dispositions. At the end, print a summary of what would have been written. The flag must be parsed before session creation so it can suppress DB.createSession.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "f6e21917797ff119ce8232558160f39d8c9f6678",
+      "gold_blocking": [
+        {
+          "id":        "gb-governance-001-001",
+          "title":     "DB.createSession must not be called in dry-run mode",
+          "rationale": "All subsequent DB calls use state.proposalId; if session is created, isolation fails"
+        },
+        {
+          "id":        "gb-governance-001-002",
+          "title":     "processCritiqueRound calls DB.insertCritiqueItem internally; those must also be suppressed",
+          "rationale": "A stub/no-op DB layer or a dry-run flag must reach into phase_integrity.js"
+        },
+        {
+          "id":        "gb-governance-001-003",
+          "title":     "The --dry-run flag must be parsed before the argv arm/task-class parsing to avoid positional shift",
+          "rationale": "Inserting a boolean flag mid-parse can shift positional args and corrupt the task string"
+        }
+      ],
+      "success_check": {
+        "type":    "manual",
+        "note":    "Run `crucible plan 'add auth' --dry-run` and verify: (1) no rows in sessions/proposals after run, (2) summary printed to stdout, (3) model calls still executed"
+      }
+    },
+
+    {
+      "id":      "partial-context-001",
+      "class":   "partial-context",
+      "title":   "Fix token accumulator to handle missing usage fields from provider stubs",
+      "prompt":  "The _accumTokens function in cli.js assumes res.usage is always present. In test environments and provider stubs, usage is undefined. This causes NaN to accumulate in state.phaseTokens, which then serialises as null in JSON and corrupts the token columns in the synthesis logMessage. Fix this defensively so missing usage fields are treated as 0 and never produce NaN or null in an otherwise-valid token bucket.",
+      "repo_url": "https://github.com/kodevadam/crucible",
+      "git_rev":  "f6e21917797ff119ce8232558160f39d8c9f6678",
+      "gold_blocking": [
+        {
+          "id":        "gb-partial-001-001",
+          "title":     "The guard must be inside _accumTokens, not at every call site",
+          "rationale": "Guarding at call sites is fragile; new callers will miss it"
+        },
+        {
+          "id":        "gb-partial-001-002",
+          "title":     "Existing token buckets must not be set to 0 if usage is missing — they should be left unchanged",
+          "rationale": "A missing usage response mid-phase must not reset the accumulated total from prior calls"
+        }
+      ],
+      "success_check": {
+        "type":    "test_pass",
+        "command": "npm test"
+      }
+    }
+  ]
+}

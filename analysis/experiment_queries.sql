@@ -31,117 +31,116 @@
 -- One row per completed proposal with every predictor and outcome field.
 -- Paste into pandas / R for regression; filter by arm label when A/B testing.
 --
+-- recall_per_1k_tokens is the Pareto axis: quality / cost.
+-- Computed via CTE so it can reference recall and the token sums cleanly.
+--
 -- Usage:
 --   sqlite3 ~/.crucible/crucible.db ".mode csv" ".headers on" \
 --     ".read analysis/experiment_queries.sql" | head -n 1   -- just Q1 headers
 
+WITH run_data AS (
+  SELECT
+    p.id                                                               AS proposal_id,
+    p.title,
+    p.rounds,
+    datetime(p.created_at)                                             AS created_at,
+    -- ── Experiment arm / stratification ──────────────────────────────────────
+    ses.arm                                                            AS arm,
+    ses.task_class                                                     AS task_class,
+    -- ── Phase 1a grounding predictors ────────────────────────────────────────
+    json_extract(g.content, '$.groundingStats.divergence_rate')        AS divergence_rate,
+    json_extract(g.content, '$.groundingStats.overlap_uncapped_count') AS overlap_uncapped_count,
+    json_extract(g.content, '$.groundingStats.overlap_rate')           AS overlap_rate,
+    json_extract(g.content, '$.groundingStats.cap_hit_rate_gpt')       AS cap_hit_rate_gpt,
+    json_extract(g.content, '$.groundingStats.cap_hit_rate_claude')    AS cap_hit_rate_claude,
+    json_extract(g.content, '$.groundingStats.union_count')            AS union_count,
+    json_extract(g.content, '$.groundingStats.overlap_capped_count')   AS overlap_capped_count,
+    json_extract(g.content, '$.groundingStats.gpt_capped')             AS gpt_capped,
+    json_extract(g.content, '$.groundingStats.claude_capped')          AS claude_capped,
+    json_extract(g.content, '$.tokens_gpt_in')                         AS draft_tokens_gpt_in,
+    json_extract(g.content, '$.tokens_gpt_out')                        AS draft_tokens_gpt_out,
+    json_extract(g.content, '$.tokens_claude_in')                      AS draft_tokens_claude_in,
+    json_extract(g.content, '$.tokens_claude_out')                     AS draft_tokens_claude_out,
+    -- ── Phase 2 negotiation mediators ────────────────────────────────────────
+    json_extract(c.content, '$.rounds_completed')                      AS rounds_completed,
+    json_extract(c.content, '$.converged_naturally')                   AS converged_naturally,
+    json_extract(c.content, '$.reason')                                AS convergence_reason,
+    json_extract(c.content, '$.blocking_minted')                       AS blocking_minted_phase2,
+    json_extract(c.content, '$.important_minted')                      AS important_minted,
+    json_extract(c.content, '$.minor_minted')                          AS minor_minted,
+    json_extract(c.content, '$.tokens_gpt_in')                         AS critique_tokens_gpt_in,
+    json_extract(c.content, '$.tokens_gpt_out')                        AS critique_tokens_gpt_out,
+    json_extract(c.content, '$.tokens_claude_in')                      AS critique_tokens_claude_in,
+    json_extract(c.content, '$.tokens_claude_out')                     AS critique_tokens_claude_out,
+    -- ── Phase 3 outcome ──────────────────────────────────────────────────────
+    json_extract(s.content, '$.blocking_active_going_in')              AS blocking_active_going_in,
+    json_extract(s.content, '$.blocking_resolved_count')               AS blocking_resolved_count,
+    json_extract(s.content, '$.blocking_unresolved_count')             AS blocking_unresolved_count,
+    json_extract(s.content, '$.blocking_minted_total')                 AS blocking_minted_total,
+    json_extract(s.content, '$.blocking_survival_rate')                AS blocking_survival_rate,
+    json_extract(s.content, '$.blocking_registered')                   AS blocking_registered,
+    json_extract(s.content, '$.blocking_collapsed_dedup')              AS blocking_collapsed_dedup,
+    json_extract(s.content, '$.blocking_pre_accepted')                 AS blocking_pre_accepted,
+    json_extract(s.content, '$.blocking_pre_rejected')                 AS blocking_pre_rejected,
+    json_extract(s.content, '$.blocking_pre_deferred')                 AS blocking_pre_deferred,
+    json_extract(s.content, '$.blocking_downgraded')                   AS blocking_downgraded,
+    json_extract(s.content, '$.convergence_violations')                AS convergence_violations,
+    json_extract(s.content, '$.deferred_count')                        AS deferred_count,
+    json_extract(s.content, '$.synthesis_steps')                       AS synthesis_steps,
+    json_extract(s.content, '$.tokens_gpt_in')                         AS synthesis_tokens_gpt_in,
+    json_extract(s.content, '$.tokens_gpt_out')                        AS synthesis_tokens_gpt_out,
+    json_extract(s.content, '$.tokens_claude_in')                      AS synthesis_tokens_claude_in,
+    json_extract(s.content, '$.tokens_claude_out')                     AS synthesis_tokens_claude_out,
+    -- ── Derived: recall ──────────────────────────────────────────────────────
+    CASE
+      WHEN json_extract(s.content, '$.blocking_active_going_in') > 0
+      THEN ROUND(
+        json_extract(s.content, '$.blocking_resolved_count') * 1.0
+        / json_extract(s.content, '$.blocking_active_going_in'), 3)
+      ELSE NULL
+    END                                                                AS recall,
+    CASE
+      WHEN json_extract(s.content, '$.blocking_minted_total') > 0
+      THEN ROUND(
+        json_extract(s.content, '$.blocking_active_going_in') * 1.0
+        / json_extract(s.content, '$.blocking_minted_total'), 3)
+      ELSE NULL
+    END                                                                AS computed_survival_rate,
+    -- ── Derived: total tokens (cross-phase sums) ─────────────────────────────
+    COALESCE(json_extract(g.content, '$.tokens_gpt_in'),    0)
+    + COALESCE(json_extract(g.content, '$.tokens_gpt_out'),  0)
+    + COALESCE(json_extract(c.content, '$.tokens_gpt_in'),   0)
+    + COALESCE(json_extract(c.content, '$.tokens_gpt_out'),  0)
+    + COALESCE(json_extract(s.content, '$.tokens_gpt_in'),   0)
+    + COALESCE(json_extract(s.content, '$.tokens_gpt_out'),  0)                AS total_gpt_tokens,
+    COALESCE(json_extract(g.content, '$.tokens_claude_in'),  0)
+    + COALESCE(json_extract(g.content, '$.tokens_claude_out'),0)
+    + COALESCE(json_extract(c.content, '$.tokens_claude_in'), 0)
+    + COALESCE(json_extract(c.content, '$.tokens_claude_out'),0)
+    + COALESCE(json_extract(s.content, '$.tokens_claude_in'), 0)
+    + COALESCE(json_extract(s.content, '$.tokens_claude_out'),0)               AS total_claude_tokens
+  FROM proposals p
+  JOIN sessions ses ON ses.id = p.session_id
+  JOIN messages g ON g.proposal_id = p.id AND g.phase = 'context_request' AND g.role = 'host'
+  JOIN messages c ON c.proposal_id = p.id AND c.phase = 'critique'        AND c.role = 'host'
+  JOIN messages s ON s.proposal_id = p.id AND s.phase = 'synthesis'       AND s.role = 'host'
+  WHERE p.status = 'complete'
+  -- To filter by arm:        AND ses.arm = 'full'
+  -- To filter by task class: AND ses.task_class = 'bugfix'
+  -- To lock dataset:         AND p.created_at >= '2026-01-01' AND p.created_at < '2026-02-01'
+)
 SELECT
-  p.id                                                               AS proposal_id,
-  p.title,
-  p.rounds,
-  datetime(p.created_at)                                             AS created_at,
-  -- ── Experiment arm / stratification ────────────────────────────────────────
-  -- arm: set via --arm flag (e.g. "full", "single-model", "no-critique")
-  -- task_class: set via --task-class flag (e.g. "bugfix", "refactor", "design")
-  -- Both are stored on sessions AND colocated in the Phase 1a grounding message
-  -- to allow filtering without a sessions join.
-  ses.arm                                                            AS arm,
-  ses.task_class                                                     AS task_class,
-  -- ── Phase 1a grounding predictors ──────────────────────────────────────────
-  json_extract(g.content, '$.groundingStats.divergence_rate')        AS divergence_rate,
-  json_extract(g.content, '$.groundingStats.overlap_uncapped_count') AS overlap_uncapped_count,
-  json_extract(g.content, '$.groundingStats.overlap_rate')           AS overlap_rate,
-  json_extract(g.content, '$.groundingStats.cap_hit_rate_gpt')       AS cap_hit_rate_gpt,
-  json_extract(g.content, '$.groundingStats.cap_hit_rate_claude')    AS cap_hit_rate_claude,
-  json_extract(g.content, '$.groundingStats.union_count')            AS union_count,
-  json_extract(g.content, '$.groundingStats.overlap_capped_count')   AS overlap_capped_count,
-  json_extract(g.content, '$.groundingStats.gpt_capped')             AS gpt_capped,
-  json_extract(g.content, '$.groundingStats.claude_capped')          AS claude_capped,
-  -- Phase 1 draft tokens (includes Phase 1a file-request calls)
-  json_extract(g.content, '$.tokens_gpt_in')                         AS draft_tokens_gpt_in,
-  json_extract(g.content, '$.tokens_gpt_out')                        AS draft_tokens_gpt_out,
-  json_extract(g.content, '$.tokens_claude_in')                      AS draft_tokens_claude_in,
-  json_extract(g.content, '$.tokens_claude_out')                     AS draft_tokens_claude_out,
-  -- ── Phase 2 negotiation mediators ──────────────────────────────────────────
-  json_extract(c.content, '$.rounds_completed')                      AS rounds_completed,
-  json_extract(c.content, '$.converged_naturally')                   AS converged_naturally,
-  json_extract(c.content, '$.reason')                                AS convergence_reason,
-  json_extract(c.content, '$.blocking_minted')                       AS blocking_minted_phase2,
-  json_extract(c.content, '$.important_minted')                      AS important_minted,
-  json_extract(c.content, '$.minor_minted')                          AS minor_minted,
-  -- Phase 2 critique tokens
-  json_extract(c.content, '$.tokens_gpt_in')                         AS critique_tokens_gpt_in,
-  json_extract(c.content, '$.tokens_gpt_out')                        AS critique_tokens_gpt_out,
-  json_extract(c.content, '$.tokens_claude_in')                      AS critique_tokens_claude_in,
-  json_extract(c.content, '$.tokens_claude_out')                     AS critique_tokens_claude_out,
-  -- ── Phase 3 outcome ────────────────────────────────────────────────────────
-  json_extract(s.content, '$.blocking_active_going_in')              AS blocking_active_going_in,
-  json_extract(s.content, '$.blocking_resolved_count')               AS blocking_resolved_count,
-  json_extract(s.content, '$.blocking_unresolved_count')             AS blocking_unresolved_count,
-  json_extract(s.content, '$.blocking_minted_total')                 AS blocking_minted_total,
-  json_extract(s.content, '$.blocking_survival_rate')                AS blocking_survival_rate,
-  json_extract(s.content, '$.blocking_registered')                   AS blocking_registered,
-  json_extract(s.content, '$.blocking_collapsed_dedup')              AS blocking_collapsed_dedup,
-  json_extract(s.content, '$.blocking_pre_accepted')                 AS blocking_pre_accepted,
-  json_extract(s.content, '$.blocking_pre_rejected')                 AS blocking_pre_rejected,
-  json_extract(s.content, '$.blocking_pre_deferred')                 AS blocking_pre_deferred,
-  json_extract(s.content, '$.blocking_downgraded')                   AS blocking_downgraded,
-  json_extract(s.content, '$.convergence_violations')                AS convergence_violations,
-  json_extract(s.content, '$.deferred_count')                        AS deferred_count,
-  json_extract(s.content, '$.synthesis_steps')                       AS synthesis_steps,
-  -- Phase 3 synthesis tokens
-  json_extract(s.content, '$.tokens_gpt_in')                         AS synthesis_tokens_gpt_in,
-  json_extract(s.content, '$.tokens_gpt_out')                        AS synthesis_tokens_gpt_out,
-  json_extract(s.content, '$.tokens_claude_in')                      AS synthesis_tokens_claude_in,
-  json_extract(s.content, '$.tokens_claude_out')                     AS synthesis_tokens_claude_out,
-  -- ── Derived outcomes ───────────────────────────────────────────────────────
+  *,
+  -- recall_per_1k_tokens: primary Pareto axis — quality / cost
+  -- Compare arms: does full Crucible improve recall per dollar, or just add cost?
   CASE
-    WHEN json_extract(s.content, '$.blocking_active_going_in') > 0
+    WHEN recall IS NOT NULL AND (total_gpt_tokens + total_claude_tokens) > 0
     THEN ROUND(
-      json_extract(s.content, '$.blocking_resolved_count') * 1.0
-      / json_extract(s.content, '$.blocking_active_going_in'), 3)
+      recall / ((total_gpt_tokens + total_claude_tokens) / 1000.0), 6)
     ELSE NULL
-  END                                                                AS recall,
-  CASE
-    WHEN json_extract(s.content, '$.blocking_minted_total') > 0
-    THEN ROUND(
-      json_extract(s.content, '$.blocking_active_going_in') * 1.0
-      / json_extract(s.content, '$.blocking_minted_total'), 3)
-    ELSE NULL
-  END                                                                AS computed_survival_rate,
-  -- Total token cost proxy per run (all phases combined, both models)
-  -- Multiply by per-model token price to get dollar cost.
-  COALESCE(json_extract(g.content, '$.tokens_gpt_in'),    0)
-  + COALESCE(json_extract(g.content, '$.tokens_gpt_out'),  0)
-  + COALESCE(json_extract(c.content, '$.tokens_gpt_in'),   0)
-  + COALESCE(json_extract(c.content, '$.tokens_gpt_out'),  0)
-  + COALESCE(json_extract(s.content, '$.tokens_gpt_in'),   0)
-  + COALESCE(json_extract(s.content, '$.tokens_gpt_out'),  0)                AS total_gpt_tokens,
-  COALESCE(json_extract(g.content, '$.tokens_claude_in'),  0)
-  + COALESCE(json_extract(g.content, '$.tokens_claude_out'),0)
-  + COALESCE(json_extract(c.content, '$.tokens_claude_in'), 0)
-  + COALESCE(json_extract(c.content, '$.tokens_claude_out'),0)
-  + COALESCE(json_extract(s.content, '$.tokens_claude_in'), 0)
-  + COALESCE(json_extract(s.content, '$.tokens_claude_out'),0)               AS total_claude_tokens
-FROM proposals p
-JOIN sessions ses ON ses.id = p.session_id
--- One grounding message per proposal (Phase 1a fires once)
-JOIN messages g ON g.proposal_id = p.id
-               AND g.phase = 'context_request'
-               AND g.role  = 'host'
--- One critique-stats message per proposal (emitted at end of Phase 2 loop)
-JOIN messages c ON c.proposal_id = p.id
-               AND c.phase = 'critique'
-               AND c.role  = 'host'
--- One synthesis-outcome message per proposal (emitted at end of Phase 3)
-JOIN messages s ON s.proposal_id = p.id
-               AND s.phase = 'synthesis'
-               AND s.role  = 'host'
-WHERE p.status = 'complete'
--- To filter by arm: WHERE ses.arm = 'full'
--- To filter by task class: WHERE ses.task_class = 'bugfix'
--- To lock dataset: AND p.created_at >= '2026-01-01' AND p.created_at < '2026-02-01'
-ORDER BY p.created_at DESC;
+  END                                                                  AS recall_per_1k_tokens
+FROM run_data
+ORDER BY created_at DESC;
 
 
 -- ─── Q2: Hypothesis 1 — does divergence predict recall? ──────────────────────
