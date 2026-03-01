@@ -216,7 +216,8 @@ const yellow = s => `${c.yellow}${s}${c.reset}`;
 const blue   = s => `${c.blue}${s}${c.reset}`;
 const mag    = s => `${c.magenta}${s}${c.reset}`;
 const red    = s => `${c.red}${s}${c.reset}`;
-const hr     = (ch="─", w=72) => dim(ch.repeat(w));
+const hr       = (ch="─", w=72) => dim(ch.repeat(w));
+const round2   = n => Math.round(n * 100) / 100;   // two-decimal precision for rates
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 function box(lines) {
@@ -1252,9 +1253,35 @@ async function runContextRequestStep(taskContext) {
   console.log(dim(`  Phase 1a — GPT: ${fmt(gptRequests.length, gptOk, gptFail, gptCapped)}  ·  Claude: ${fmt(claudeRequests.length, claudeOk, claudeFail, claudeCapped)}`));
   console.log("");
 
-  // Persist packs for reproducibility audit — gitRev pins the exact content
+  // ── Grounding stats — persisted as structured fields for post-hoc analysis ──
+  //
+  // overlap_rate    = |intersection(resolved paths)| / |union(resolved paths)|
+  //                   1.0 = identical grounding  0.0 = completely disjoint
+  // divergence_rate = 1 − overlap_rate  (high = healthy adversarial independence)
+  // cap_hit_rate_*  = capped / resolved (proxy for "context horizon" pressure)
+  //
+  // These are queryable after N runs without re-parsing the raw packs.
+  const gptPaths    = new Set(gptPack.files.filter(f => f.status === "ok").map(f => f.path));
+  const claudePaths = new Set(claudePack.files.filter(f => f.status === "ok").map(f => f.path));
+  const intersect   = [...gptPaths].filter(p => claudePaths.has(p)).length;
+  const union       = new Set([...gptPaths, ...claudePaths]).size;
+  const overlapRate    = union === 0 ? null : round2(intersect / union);
+  const divergenceRate = overlapRate === null ? null : round2(1 - overlapRate);
+
+  const groundingStats = {
+    gpt_requested:    gptRequests.length,    gpt_resolved:    gptOk,    gpt_failed:    gptFail,    gpt_capped:    gptCapped,
+    claude_requested: claudeRequests.length, claude_resolved: claudeOk, claude_failed: claudeFail, claude_capped: claudeCapped,
+    overlap_count:  intersect,
+    union_count:    union,
+    overlap_rate:   overlapRate,
+    divergence_rate: divergenceRate,
+    cap_hit_rate_gpt:    gptOk    ? round2(gptCapped    / gptOk)    : null,
+    cap_hit_rate_claude: claudeOk ? round2(claudeCapped / claudeOk) : null,
+  };
+
+  // Persist packs + stats — gitRev pins the exact content; stats enable trend queries
   DB.logMessage(state.proposalId, "host",
-    JSON.stringify({ gitRev, gptPack, claudePack }),
+    JSON.stringify({ gitRev, groundingStats, gptPack, claudePack }),
     { phase: PHASE_CONTEXT_REQUEST }
   );
 
