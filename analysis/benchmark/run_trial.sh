@@ -233,16 +233,27 @@ for pair in "${shuffled[@]}"; do
   RUN_ATTEMPT_ID="${RUN_ID}_n$(printf '%03d' "${n}")"
 
   # Register attempt as 'started'.  FK enforced: run_id must exist in runs.
-  # Failure here means the bookkeeping layer is compromised — abort the trial
-  # rather than executing runs whose provenance cannot be recorded.
-  if ! sqlite3 "$DB" "PRAGMA foreign_keys = ON;
+  # BEGIN IMMEDIATE acquires the write lock upfront so "database is locked"
+  # surfaces at BEGIN rather than mid-write, making it distinguishable from a
+  # FK violation.  Failure here aborts the trial — no untracked proposals.
+  _attempt_err="$(sqlite3 "$DB" "PRAGMA foreign_keys = ON;
+BEGIN IMMEDIATE;
 INSERT OR REPLACE INTO run_attempts
   (run_attempt_id, run_id, n, task_id, arm, status)
-  VALUES ('${RUN_ATTEMPT_ID}', '${RUN_ID}', ${n}, '${task_id}', '${arm}', 'started');" >&2; then
+  VALUES ('${RUN_ATTEMPT_ID}', '${RUN_ID}', ${n}, '${task_id}', '${arm}', 'started');
+COMMIT;" 2>&1)"
+  if [[ $? -ne 0 ]]; then
     echo "ABORT: run_attempts INSERT failed at run ${n}/${total}" >&2
     echo "  run_attempt_id : ${RUN_ATTEMPT_ID}" >&2
     echo "  run_id         : ${RUN_ID}" >&2
-    echo "  Likely cause: runs row missing (FK violation) or DB locked." >&2
+    echo "  sqlite3        : ${_attempt_err}" >&2
+    if [[ "${_attempt_err}" == *"FOREIGN KEY constraint failed"* ]]; then
+      echo "  Cause          : FK violation — runs row missing for run_id=${RUN_ID}" >&2
+    elif [[ "${_attempt_err}" == *"database is locked"* ]]; then
+      echo "  Cause          : DB locked — another writer holds ${DB}" >&2
+    else
+      echo "  Cause          : unknown — see sqlite3 output above" >&2
+    fi
     exit 1
   fi
 
