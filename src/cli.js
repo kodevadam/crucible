@@ -1221,7 +1221,7 @@ async function runContextRequestStep(taskContext) {
     for (const f of gptPack.files) {
       const ok     = f.status === "ok";
       const mark   = ok ? green("✓") : red("✗");
-      const detail = ok ? dim(` (${f.chars} chars)`) : dim(` — ${f.status}: ${f.detail}`);
+      const detail = ok ? dim(` (${f.chars} chars${f.capped ? ", capped" : ""})`) : dim(` — ${f.status}: ${f.detail}`);
       console.log(`    ${mark} ${f.path}${detail}`);
     }
   }
@@ -1234,7 +1234,7 @@ async function runContextRequestStep(taskContext) {
     for (const f of claudePack.files) {
       const ok     = f.status === "ok";
       const mark   = ok ? green("✓") : red("✗");
-      const detail = ok ? dim(` (${f.chars} chars)`) : dim(` — ${f.status}: ${f.detail}`);
+      const detail = ok ? dim(` (${f.chars} chars${f.capped ? ", capped" : ""})`) : dim(` — ${f.status}: ${f.detail}`);
       console.log(`    ${mark} ${f.path}${detail}`);
     }
   }
@@ -1243,9 +1243,13 @@ async function runContextRequestStep(taskContext) {
   const claudeOk = claudePack.files.filter(f => f.status === "ok").length;
   const gptFail    = gptPack.files.length    - gptOk;
   const claudeFail = claudePack.files.length - claudeOk;
-  const fmt = (req, ok, fail) =>
-    `${req} requested, ${ok} resolved` + (fail ? `, ${fail} failed` : "");
-  console.log(dim(`  Phase 1a — GPT: ${fmt(gptRequests.length, gptOk, gptFail)}  ·  Claude: ${fmt(claudeRequests.length, claudeOk, claudeFail)}`));
+  const gptCapped    = gptPack.files.filter(f => f.capped).length;
+  const claudeCapped = claudePack.files.filter(f => f.capped).length;
+  const fmt = (req, ok, fail, capped) =>
+    `${req} requested, ${ok} resolved` +
+    (fail   ? `, ${fail} failed`           : "") +
+    (capped ? `, cap_hits=${capped}/${ok}` : "");
+  console.log(dim(`  Phase 1a — GPT: ${fmt(gptRequests.length, gptOk, gptFail, gptCapped)}  ·  Claude: ${fmt(claudeRequests.length, claudeOk, claudeFail, claudeCapped)}`));
   console.log("");
 
   // Persist packs for reproducibility audit — gitRev pins the exact content

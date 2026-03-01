@@ -560,7 +560,7 @@ const HIDDEN_FILE_ALLOWLIST = new Set([
  *   { gitRev, files: Array<ContextPackFile> }
  *
  * ContextPackFile shape:
- *   On success:  { path, reason, status: "ok",              sha256, content, chars }
+ *   On success:  { path, reason, status: "ok",              sha256, content, chars, capped }
  *   On failure:  { path, reason, status: <error status>,    detail: string }
  *
  * Error statuses (machine-queryable):
@@ -610,7 +610,8 @@ export function resolveContextPack(repoPath, requests, gitRev) {
 
     const content = raw.slice(0, CONTEXT_PACK_MAX_CHARS);
     const sha256  = createHash("sha256").update(content).digest("hex").slice(0, 16);
-    files.push({ path, reason, status: "ok", sha256, content, chars: content.length });
+    const capped  = content.length === CONTEXT_PACK_MAX_CHARS;
+    files.push({ path, reason, status: "ok", sha256, content, chars: content.length, capped });
   }
 
   return { gitRev, files };
