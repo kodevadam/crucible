@@ -980,3 +980,338 @@ describe("computeSynthesisGaps", () => {
     assert.doesNotThrow(() => computeSynthesisGaps([id], store, {}));
   });
 });
+
+// ══ Adversarial invariant coverage ═══════════════════════════════════════════
+//
+// Six cases that would each break a specific validator if the implementation
+// regressed.  Minimal construction — each test exercises exactly one predicate.
+
+// ── A. Closed-ID guard: D3 precedence (double-check from spec review) ─────────
+// pending_transformation (model) + accepted (host) → effective = host accepted
+// → terminal via D3 → guard fires.  If guard naively used raw last record
+// instead of getEffectiveDisposition(), it would see pending_transformation
+// and incorrectly allow the derived_from link.
+
+describe("adversarial A — closed-ID guard respects D3 (host overrides pending_transformation)", () => {
+  test("host-accepted item with prior pending_transformation is terminal: guard fires", () => {
+    const itemId = mintCritiqueId("p1", "gpt", 1, "severity downgrade concern detail");
+
+    const itemStore = new Map([[itemId, {
+      id:           itemId,
+      display_id:   displayId(itemId),
+      round:        1,
+      severity:     "blocking",
+      derived_from: null,
+      root_ids:     [itemId],
+    }]]);
+
+    const t1 = "2024-01-01T00:00:00Z";
+    const t2 = "2024-01-02T00:00:00Z";
+    const dispositionStore = new Map([[itemId, [
+      // Round 1 — model proposes severity downgrade → pending_transformation
+      { decided_by: "gpt",  decision: "pending_transformation", proposed_at: t1, terminal_at: null },
+      // Round 2 — host resolves the ⚑ by accepting the concern at original severity
+      { decided_by: "host", decision: "accepted",               proposed_at: t2, terminal_at: t2  },
+    ]]]);
+
+    const result = processCritiqueRound({
+      proposalId:    "p1",
+      role:          "claude",
+      round:         3,
+      closedItems:   [],
+      rawItems: [{
+        severity:    "important",
+        title:       "Follow-up on downgraded concern",
+        detail:      "trying to re-derive from host-closed item",
+        derived_from: [itemId],
+      }],
+      itemStore,
+      dispositionStore,
+      insertItems:        () => {},
+      insertDispositions: () => {},
+    });
+
+    assert.ok(result.errors.length > 0, "expected hard error for host-accepted parent");
+    assert.ok(result.errors.some(e => e.includes("already resolved")));
+  });
+});
+
+// ── B. Closed-ID guard: ⚑ open item is NOT terminal → derived_from allowed ────
+// pending_transformation without any host/human override → not terminal.
+// Guard must NOT block; the concern is still live.
+
+describe("adversarial B — closed-ID guard: ⚑ open parent is NOT terminal (allowed)", () => {
+  test("item with pending_transformation and no override is not terminal: derived_from allowed", () => {
+    const itemId = mintCritiqueId("p1", "gpt", 1, "open flag concern open detail");
+
+    const itemStore = new Map([[itemId, {
+      id:           itemId,
+      display_id:   displayId(itemId),
+      round:        1,
+      severity:     "blocking",
+      derived_from: null,
+      root_ids:     [itemId],
+    }]]);
+
+    // Only model record: pending_transformation (⚑ open) — no host/human override
+    const dispositionStore = new Map([[itemId, [
+      { decided_by: "gpt", decision: "pending_transformation", proposed_at: "2024-01-01T00:00:00Z", terminal_at: null },
+    ]]]);
+
+    const result = processCritiqueRound({
+      proposalId:    "p1",
+      role:          "claude",
+      round:         2,
+      closedItems:   [],
+      rawItems: [{
+        severity:    "important",
+        title:       "Refinement of open concern",
+        detail:      "child of pending item",
+        derived_from: [itemId],
+      }],
+      itemStore,
+      dispositionStore,
+      insertItems:        () => {},
+      insertDispositions: () => {},
+    });
+
+    assert.equal(result.errors.length, 0, `unexpected errors: ${result.errors.join("; ")}`);
+    assert.equal(result.mintedItems[0].derived_from[0], itemId);
+  });
+});
+
+// ── C. Closed-ID guard: transitive termination via transformed+children ────────
+// transformed parent + both children accepted → parent is transitively terminal.
+// A model in round 3 must not be allowed to re-derive from the parent.
+
+describe("adversarial C — closed-ID guard: transformed parent transitively terminal", () => {
+  test("transformed parent with all children accepted: re-derive blocked", () => {
+    const parentId = mintCritiqueId("p1", "gpt", 1, "parent concern parent detail");
+    const child1Id = mintCritiqueId("p1", "gpt", 1, "child one detail one");
+    const child2Id = mintCritiqueId("p1", "gpt", 1, "child two detail two");
+
+    const itemStore = new Map([
+      [parentId, { id: parentId, display_id: displayId(parentId), round: 1,
+                   severity: "blocking", derived_from: null, root_ids: [parentId] }],
+      [child1Id, { id: child1Id, display_id: displayId(child1Id), round: 1,
+                   severity: "important", derived_from: [parentId], root_ids: [parentId] }],
+      [child2Id, { id: child2Id, display_id: displayId(child2Id), round: 1,
+                   severity: "important", derived_from: [parentId], root_ids: [parentId] }],
+    ]);
+
+    const now = "2024-01-01T00:00:00Z";
+    const dispositionStore = new Map([
+      [parentId, [{ decided_by: "gpt", decision: "transformed",   proposed_at: now, terminal_at: null }]],
+      [child1Id, [{ decided_by: "gpt", decision: "accepted",      proposed_at: now, terminal_at: now  }]],
+      [child2Id, [{ decided_by: "gpt", decision: "accepted",      proposed_at: now, terminal_at: now  }]],
+    ]);
+
+    // Round 3: another model tries to derive from the (now terminal) parent
+    const result = processCritiqueRound({
+      proposalId:    "p1",
+      role:          "claude",
+      round:         3,
+      closedItems:   [],
+      rawItems: [{
+        severity:    "important",
+        title:       "Re-derived from resolved parent",
+        detail:      "should be blocked",
+        derived_from: [parentId],
+      }],
+      itemStore,
+      dispositionStore,
+      insertItems:        () => {},
+      insertDispositions: () => {},
+    });
+
+    assert.ok(result.errors.length > 0, "expected hard error for terminal transformed parent");
+    assert.ok(result.errors.some(e => e.includes("already resolved")));
+  });
+
+  test("transformed parent with ONE child still active: re-derive NOT blocked", () => {
+    const parentId = mintCritiqueId("p1", "gpt", 1, "partially resolved parent detail");
+    const child1Id = mintCritiqueId("p1", "gpt", 1, "resolved child resolved detail");
+    const child2Id = mintCritiqueId("p1", "gpt", 1, "unresolved child unresolved detail");
+
+    const itemStore = new Map([
+      [parentId, { id: parentId, display_id: displayId(parentId), round: 1,
+                   severity: "blocking", derived_from: null, root_ids: [parentId] }],
+      [child1Id, { id: child1Id, display_id: displayId(child1Id), round: 1,
+                   severity: "important", derived_from: [parentId], root_ids: [parentId] }],
+      [child2Id, { id: child2Id, display_id: displayId(child2Id), round: 1,
+                   severity: "important", derived_from: [parentId], root_ids: [parentId] }],
+    ]);
+
+    const now = "2024-01-01T00:00:00Z";
+    const dispositionStore = new Map([
+      [parentId, [{ decided_by: "gpt", decision: "transformed",  proposed_at: now, terminal_at: null }]],
+      [child1Id, [{ decided_by: "gpt", decision: "accepted",     proposed_at: now, terminal_at: now  }]],
+      // child2 has NO disposition → not terminal → parent is not terminal
+    ]);
+
+    const result = processCritiqueRound({
+      proposalId:    "p1",
+      role:          "claude",
+      round:         3,
+      closedItems:   [],
+      rawItems: [{
+        severity:    "important",
+        title:       "Further refinement of active parent",
+        detail:      "parent still has active child",
+        derived_from: [parentId],
+      }],
+      itemStore,
+      dispositionStore,
+      insertItems:        () => {},
+      insertDispositions: () => {},
+    });
+
+    // Parent is NOT terminal (child2 unresolved), so derived_from is allowed
+    assert.equal(result.errors.length, 0, `unexpected errors: ${result.errors.join("; ")}`);
+  });
+});
+
+// ── D. validateDag: multi-hop cycle (≥ 4 nodes) ───────────────────────────────
+// A→B→C→D→A.  DFS must detect regardless of traversal start order.
+// Also: verify that a disconnected valid subgraph alongside the cycle doesn't
+// prevent detection.
+
+describe("adversarial D — validateDag: multi-hop cycles and mixed graphs", () => {
+  test("4-node cycle (A→B→C→D→A) is detected", () => {
+    const store = new Map([
+      ["A", { derived_from: ["B"] }],
+      ["B", { derived_from: ["C"] }],
+      ["C", { derived_from: ["D"] }],
+      ["D", { derived_from: ["A"] }],
+    ]);
+    const result = validateDag(store);
+    assert.equal(result.valid, false);
+    assert.ok(Array.isArray(result.cycle));
+    // All cycle nodes must be in the reported cycle
+    const cycleSet = new Set(result.cycle);
+    assert.ok(["A","B","C","D"].some(n => cycleSet.has(n)));
+  });
+
+  test("valid subgraph alongside a cycle: cycle still detected", () => {
+    const store = new Map([
+      // Valid chain
+      ["root",  { derived_from: null }],
+      ["child", { derived_from: ["root"] }],
+      // Separate 3-cycle
+      ["x", { derived_from: ["z"] }],
+      ["y", { derived_from: ["x"] }],
+      ["z", { derived_from: ["y"] }],
+    ]);
+    const result = validateDag(store);
+    assert.equal(result.valid, false);
+  });
+
+  test("long linear chain (10 nodes) is valid", () => {
+    const store = new Map();
+    for (let i = 0; i < 10; i++) {
+      store.set(`n${i}`, { derived_from: i === 0 ? null : [`n${i - 1}`] });
+    }
+    assert.deepEqual(validateDag(store), { valid: true });
+  });
+});
+
+// ── E. computeSynthesisGaps: each blocking item independently required ─────────
+// Two active blocking items with different titles.
+// Synthesis addresses only one.
+// The other must still appear in the gap list.
+
+describe("adversarial E — computeSynthesisGaps: items checked independently", () => {
+  test("two active blocking items: addressing one leaves the other as a gap", () => {
+    const id1 = mintCritiqueId("p1", "gpt", 1, "sql injection vulnerability independent");
+    const id2 = mintCritiqueId("p1", "gpt", 1, "missing authentication header independent");
+
+    const store = new Map([
+      [id1, { id: id1, display_id: displayId(id1), severity: "blocking",
+              title: "sql injection vulnerability", round: 1 }],
+      [id2, { id: id2, display_id: displayId(id2), severity: "blocking",
+              title: "missing authentication header", round: 1 }],
+    ]);
+
+    const plan = {
+      // Only addresses id1
+      accepted_suggestions: ["sql injection vulnerability — parameterized queries added (severity: blocking)"],
+      rejected_suggestions: [],
+    };
+
+    const gaps = computeSynthesisGaps([id1, id2], store, plan);
+    assert.equal(gaps.length, 1);
+    assert.equal(gaps[0].id, id2);
+  });
+
+  test("two active blocking items: addressing both yields no gaps", () => {
+    const id1 = mintCritiqueId("p1", "gpt", 1, "auth missing both addressed test");
+    const id2 = mintCritiqueId("p1", "gpt", 1, "no rate limiting both addressed test");
+
+    const store = new Map([
+      [id1, { id: id1, display_id: displayId(id1), severity: "blocking",
+              title: "auth missing", round: 1 }],
+      [id2, { id: id2, display_id: displayId(id2), severity: "blocking",
+              title: "no rate limiting", round: 1 }],
+    ]);
+
+    const plan = {
+      accepted_suggestions: [
+        "auth missing — oauth added (severity: blocking)",
+        "no rate limiting — added token bucket (severity: blocking)",
+      ],
+      rejected_suggestions: [],
+    };
+
+    const gaps = computeSynthesisGaps([id1, id2], store, plan);
+    assert.deepEqual(gaps, []);
+  });
+});
+
+// ── F. computeSynthesisGaps: display_id match is case-insensitive ─────────────
+// Synthesis model may uppercase the display_id.  Matching must still succeed.
+
+describe("adversarial F — computeSynthesisGaps: display_id case insensitive", () => {
+  test("uppercase display_id in synthesis accepted_suggestions is resolved", () => {
+    const id  = mintCritiqueId("p1", "gpt", 1, "case insensitive display id test");
+    const did = displayId(id);   // e.g. "blk_a1b2c3d4"
+
+    const store = new Map([[id, {
+      id,
+      display_id: did,
+      severity:   "blocking",
+      title:      "some blocking issue",
+      round:      1,
+    }]]);
+
+    // Synthesis uses uppercase display_id
+    const plan = {
+      accepted_suggestions: [`[${did.toUpperCase()}] issue resolved — added safeguard`],
+      rejected_suggestions: [],
+    };
+
+    const gaps = computeSynthesisGaps([id], store, plan);
+    assert.deepEqual(gaps, []);
+  });
+
+  test("mixed-case display_id in rejected_suggestions is resolved", () => {
+    const id  = mintCritiqueId("p1", "gpt", 1, "mixed case rejected display id test");
+    const did = displayId(id);
+    const mixedCase = did.slice(0, 6).toUpperCase() + did.slice(6);
+
+    const store = new Map([[id, {
+      id,
+      display_id: did,
+      severity:   "blocking",
+      title:      "rejected blocking concern",
+      round:      1,
+    }]]);
+
+    const plan = {
+      accepted_suggestions: [],
+      rejected_suggestions: [`${mixedCase} — out of scope for this phase`],
+    };
+
+    const gaps = computeSynthesisGaps([id], store, plan);
+    assert.deepEqual(gaps, []);
+  });
+});
