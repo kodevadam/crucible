@@ -202,6 +202,7 @@ const state = {
   claudeModel:  null,
   arm:          null,       // experimental arm label (--arm flag); null = unlabelled run
   taskClass:    null,       // task classification (--task-class flag); e.g. bugfix/refactor/design
+  batch:        false,      // --batch: suppress interactive prompts for automated benchmark runs
   currentPhase: null,       // set at the start of each phase; read by askGPT/askClaude
   phaseTokens:  {},         // { [phase]: { gpt_in, gpt_out, claude_in, claude_out } }
 };
@@ -273,6 +274,7 @@ async function ask(prompt, { defaultVal } = {}) {
 }
 
 async function confirm(msg, defaultYes = false) {
+  if (state.batch) return false;   // batch mode: always decline interactive confirms
   const hint = defaultYes ? "[Y/n]" : "[y/N]";
   const ans  = (await ask(`${msg} ${dim(hint)}`)).toLowerCase();
   return defaultYes ? ans !== "n" : ans === "y";
@@ -3154,10 +3156,15 @@ function cmdHelp() {
 // ── Entry ─────────────────────────────────────────────────────────────────────
 
 const [,, cmd, ...rest] = process.argv;
-// Parse --arm <label> and --task-class <label> flags; remaining args become the task string.
+// Parse flags; remaining positional args become the task string.
+//   --arm <label>        experimental arm (e.g. "full", "no-critique")
+//   --task-class <label> task category for stratification (e.g. "bugfix", "refactor")
+//   --batch              suppress interactive prompts for automated benchmark runs
 const _flags = {}, _positional = [];
 for (let i = 0; i < rest.length; i++) {
-  if (rest[i].startsWith("--") && i + 1 < rest.length && !rest[i + 1].startsWith("--")) {
+  if (rest[i] === "--batch") {
+    _flags.batch = true;
+  } else if (rest[i].startsWith("--") && i + 1 < rest.length && !rest[i + 1].startsWith("--")) {
     _flags[rest[i].slice(2)] = rest[i + 1]; i++;
   } else if (!rest[i].startsWith("--")) {
     _positional.push(rest[i]);
@@ -3166,6 +3173,7 @@ for (let i = 0; i < rest.length; i++) {
 const arg = _positional.join(" ");
 state.arm       = _flags["arm"]        || null;
 state.taskClass = _flags["task-class"] || null;
+state.batch     = _flags.batch         || false;
 
 async function main() {
 switch (cmd) {
@@ -3187,16 +3195,22 @@ switch (cmd) {
     });
     state.proposalId = DB.createProposal(state.sessionId, arg.slice(0,60), null);
     // Phase 0 — Clarification: Claude asks focused questions, user answers
-    const claudeMsgsClarify = [{ role:"user", content:`You are opening a technical planning session. Ask 3–5 focused clarifying questions about the task. Number them. Do not start planning yet.\n\nTask: ${arg}` }];
-    process.stdout.write(dim("  Claude thinking..."));
-    const qs = await askClaude(claudeMsgsClarify);
-    process.stdout.write("\r                    \r");
-    console.log(""); console.log(bold(blue("  Claude:"))); console.log("");
-    qs.split("\n").forEach(l => console.log(`    ${l}`)); console.log("");
-    DB.logMessage(state.proposalId, "claude", qs, { phase: PHASE_CLARIFY });
-    const answers = await ask("  Your answers:\n  ›");
-    DB.logMessage(state.proposalId, "user", answers, { phase: PHASE_CLARIFY });
-    let context = `Task: ${arg}\n\nClarifications: ${answers}`;
+    // Skipped in --batch mode (benchmark harness runs headless; task prompt is self-contained).
+    let context;
+    if (state.batch) {
+      context = `Task: ${arg}`;
+    } else {
+      const claudeMsgsClarify = [{ role:"user", content:`You are opening a technical planning session. Ask 3–5 focused clarifying questions about the task. Number them. Do not start planning yet.\n\nTask: ${arg}` }];
+      process.stdout.write(dim("  Claude thinking..."));
+      const qs = await askClaude(claudeMsgsClarify);
+      process.stdout.write("\r                    \r");
+      console.log(""); console.log(bold(blue("  Claude:"))); console.log("");
+      qs.split("\n").forEach(l => console.log(`    ${l}`)); console.log("");
+      DB.logMessage(state.proposalId, "claude", qs, { phase: PHASE_CLARIFY });
+      const answers = await ask("  Your answers:\n  ›");
+      DB.logMessage(state.proposalId, "user", answers, { phase: PHASE_CLARIFY });
+      context = `Task: ${arg}\n\nClarifications: ${answers}`;
+    }
     // Phases 1–3: structured Draft → Critique → Synthesis pipeline
     while (true) {
       const draftResult    = await runDraftPhase(context);
