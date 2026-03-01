@@ -1,38 +1,129 @@
-# Crucible Git Crawler Module — Implementation Specification
+# git-crawler — Implementation Specification
 
-**Version:** 1.1.0
-**Status:** Ready for implementation (refined per cross-model review)
-**Target:** `src/crawl.js` + `src/crawl-safety.js` + DB migration in `src/db.js`
+**Version:** 2.0.0
+**Status:** Ready for implementation (standalone repo extraction)
+**Repository:** `git-crawler` (independent package)
+**Target:** `src/crawl.js` + `src/crawl-safety.js` + `src/db.js` + `bin/git-crawler`
+
+> **Architecture change (v2.0.0):** This module is now a **standalone
+> repository and package** — not a sub-module of Crucible. It has its own
+> CLI entry point, its own database, and zero hard dependencies on Crucible
+> or Vivian internals. Integration with either project is supported via a
+> clean adapter interface (see §10).
 
 ---
 
 ## Table of Contents
 
-1. [CLI UX](#1-cli-ux)
-2. [Deterministic Ranking](#2-deterministic-ranking)
-3. [Repository Inspection](#3-repository-inspection)
-4. [JSON Schemas](#4-json-schemas)
-5. [Plan Safety Validation](#5-plan-safety-validation)
-6. [LLM Phase Wiring](#6-llm-phase-wiring)
-7. [DB Design](#7-db-design)
-8. [Export Layout](#8-export-layout)
-9. [Tests](#9-tests)
+1. [Project Structure](#1-project-structure)
+2. [CLI UX](#2-cli-ux)
+3. [Deterministic Ranking](#3-deterministic-ranking)
+4. [Repository Inspection](#4-repository-inspection)
+5. [JSON Schemas](#5-json-schemas)
+6. [Plan Safety Validation](#6-plan-safety-validation)
+7. [LLM Phase Wiring](#7-llm-phase-wiring)
+8. [DB Design](#8-db-design)
+9. [Export Layout](#9-export-layout)
+10. [Integration Interface](#10-integration-interface)
+11. [Tests](#11-tests)
 
 ---
 
-## 1. CLI UX
+## 1. Project Structure
 
-### 1.1 Entry Point
+### 1.1 Repository Layout
 
 ```
-crucible crawl [subcommand] [flags]
+git-crawler/
+├── bin/
+│   └── git-crawler              ← CLI entry point (hashbang runner)
+├── src/
+│   ├── crawl.js                 ← Main pipeline: phases 0–4
+│   ├── crawl-ranking.js         ← Deterministic scoring (pure functions)
+│   ├── crawl-safety.js          ← Plan safety validation (pure functions)
+│   ├── crawl-schemas.js         ← Zod schemas for all artifacts
+│   ├── db.js                    ← Standalone SQLite (better-sqlite3)
+│   ├── cli.js                   ← CLI argument parsing and command router
+│   ├── github.js                ← gh CLI wrapper (ghCapture, search, tarball)
+│   ├── providers.js             ← LLM client factory (OpenAI, Anthropic)
+│   ├── models.js                ← Model selection helpers
+│   ├── safety.js                ← Shared safety helpers (safeEnv, shortHash, path validation)
+│   └── integration.js           ← Adapter interface for Crucible/Vivian (§10)
+├── test/
+│   ├── crawl.test.js
+│   ├── ranking.test.js
+│   ├── safety.test.js
+│   └── fixtures/
+│       └── crawl/               ← Mock repos and API responses
+├── package.json
+├── README.md
+└── LICENSE
 ```
 
-Registered in `cli.js` command router alongside existing commands (`session`,
-`plan`, `debate`, `git`, etc.). The `crawl` command delegates to
+### 1.2 Package Identity
+
+```json
+{
+  "name": "git-crawler",
+  "version": "2.0.0",
+  "type": "module",
+  "bin": { "git-crawler": "./bin/git-crawler" },
+  "exports": {
+    ".": "./src/crawl.js",
+    "./schemas": "./src/crawl-schemas.js",
+    "./safety": "./src/crawl-safety.js",
+    "./ranking": "./src/crawl-ranking.js",
+    "./integration": "./src/integration.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "zod": "^3.23.0"
+  },
+  "peerDependencies": {
+    "openai": ">=4.0.0",
+    "@anthropic-ai/sdk": ">=0.20.0"
+  }
+}
+```
+
+**Key decisions:**
+- **Named exports** allow Crucible/Vivian to import specific modules without
+  pulling the entire package (e.g., `import { validatePlanSafety } from 'git-crawler/safety'`).
+- **LLM SDKs are peer dependencies** — the consuming project (or the user's
+  environment) provides them. This avoids version conflicts when git-crawler
+  is embedded in Crucible or Vivian.
+- **No hard dependency on Crucible.** Every helper that the old spec sourced
+  from Crucible (`safeEnv`, `shortHash`, `UNTRUSTED_REPO_BANNER`, etc.) is
+  re-implemented or inlined in this repo. They are intentionally kept
+  compatible so Crucible can swap in its own versions via the adapter (§10).
+
+### 1.3 Standalone vs. Embedded Operation
+
+git-crawler operates in two modes:
+
+| Mode | How it's invoked | DB location | LLM config |
+|---|---|---|---|
+| **Standalone** | `git-crawler <subcommand>` | `~/.local/share/git-crawler/crawler.db` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env vars |
+| **Embedded** | `import { runCrawlSession } from 'git-crawler'` | Caller provides DB path or connection via adapter | Caller provides LLM clients via adapter |
+
+In embedded mode, the consuming project passes an **adapter object** (§10)
+that overrides defaults for DB, LLM clients, logging, and interactive prompts.
+In standalone mode, git-crawler uses its own defaults.
+
+---
+
+## 2. CLI UX
+
+### 2.1 Entry Point
+
+```
+git-crawler [subcommand] [flags]
+```
+
+The `bin/git-crawler` entry point parses arguments and delegates to
 `runCrawlSession()` exported from `src/crawl.js`.
 
-### 1.2 Subcommands
+### 2.2 Subcommands
 
 | Subcommand | Description |
 |---|---|
@@ -43,7 +134,7 @@ Registered in `cli.js` command router alongside existing commands (`session`,
 | `export <owner/repo>` | Full pipeline (Phase 0–4), write artifacts to disk |
 | `history` | List past crawl sessions from DB |
 
-### 1.3 Flags
+### 2.3 Flags
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
@@ -51,43 +142,48 @@ Registered in `cli.js` command router alongside existing commands (`session`,
 | `--ref <ref>` | string | latest release or default branch | Git ref to inspect (tag, branch, commit) |
 | `--auto-select` | boolean | false | Auto-pick top-ranked result (skip interactive choice) |
 | `--non-interactive` | boolean | false | No prompts; fail if input needed. Implies `--auto-select` |
-| `--output-dir <dir>` | string | `~/.local/share/crucible/exports/<session-id>/` | Export directory |
+| `--output-dir <dir>` | string | `~/.local/share/git-crawler/exports/<session-id>/` | Export directory |
+| `--db-path <path>` | string | `~/.local/share/git-crawler/crawler.db` | SQLite database path |
 | `--format` | `json`\|`pretty` | `pretty` (tty) / `json` (pipe) | Output format |
 | `--max-results <n>` | int | 10 | Max search results to display (cap: 30) |
 | `--max-debate-rounds <n>` | int | 2 | Override debate round limit (cap: 4) |
 | `--dry-run` | boolean | false | Run through phases but skip DB writes and export |
 
-### 1.4 Interactive Menu
+### 2.4 Interactive Menu
 
-When invoked as `crucible crawl` without subcommand and stdin is a TTY:
+When invoked as `git-crawler` without subcommand and stdin is a TTY:
 
 ```
-═══ Crucible Git Crawler ══════════════════════
+═══ git-crawler ═══════════════════════════════
 1) Search repository
 2) Inspect repository
 3) Generate build plan
-4) Export plan (Vivian-compatible)
+4) Export plan
 5) View crawl history
 0) Exit
 ···············································
 ```
 
-Menu uses existing `ask()`, `confirm()`, `crucibleSay()` readline helpers
-from `cli.js`. Each option maps to the corresponding phase pipeline.
+Menu uses `ask()`, `confirm()`, `say()` readline helpers from
+`src/cli.js`. Each option maps to the corresponding phase pipeline.
 
-### 1.5 stdout / stderr Contract
+> **Embedding note:** When git-crawler is used as a library (§10), the host
+> project can override these helpers via the adapter to use its own UI
+> (e.g., Crucible's `crucibleSay()`).
+
+### 2.5 stdout / stderr Contract
 
 | Stream | Content |
 |---|---|
 | **stdout** | Schema-validated JSON artifacts only. In `--format pretty`, human-readable summaries. Never mixed. |
-| **stderr** | Progress messages, warnings, debug info. Prefixed with `[crawl]`. |
+| **stderr** | Progress messages, warnings, debug info. Prefixed with `[git-crawler]`. |
 
 **Invariant:** When `--format json` or stdout is not a TTY, stdout contains
 exactly one JSON document per subcommand (or newline-delimited JSON for
 `search` with multiple results). stderr receives all status messages. This
-allows `crucible crawl search ripgrep --format json | jq .` to work.
+allows `git-crawler search ripgrep --format json | jq .` to work.
 
-### 1.6 Exit Codes
+### 2.6 Exit Codes
 
 | Code | Meaning |
 |---|---|
@@ -97,13 +193,7 @@ allows `crucible crawl search ripgrep --format json | jq .` to work.
 | 3 | Schema validation failure (internal bug — output failed schema check) |
 | 4 | Rate limit exhausted after retries |
 
-> **Exit code alignment note:** Existing Crucible uses only exit code 1 for
-> all errors (confirmed by audit of `src/cli.js`). Codes 2, 3, 4 are
-> unused and reserved here for the crawl module. If future Crucible modules
-> adopt structured exit codes, these should be promoted to a shared
-> constant file. For now, they are crawl-specific and do not conflict.
-
-### 1.7 Network Surface Constraint
+### 2.7 Network Surface Constraint
 
 **All network access in the crawl module is restricted to exactly two
 mechanisms. There are no exceptions.**
@@ -118,7 +208,7 @@ mechanisms. There are no exceptions.**
 - No `curl`, `wget`, or any shell HTTP tool.
 - No direct GitHub REST/GraphQL calls bypassing `gh`.
 - No DNS lookups, socket connections, or any network I/O outside the two mechanisms above.
-- LLM API calls (OpenAI, Anthropic) go through `getOpenAI()` / `getAnthropic()` from `providers.js` — these are the only additional network touchpoints, and they are existing infrastructure, not new code.
+- LLM API calls (OpenAI, Anthropic) go through `getOpenAI()` / `getAnthropic()` from `src/providers.js` (or overridden via adapter — see §10). These are the only additional network touchpoints.
 
 **Rationale:** The `gh` CLI handles authentication, rate limiting, and
 pagination. Routing all GitHub access through it keeps the security surface
@@ -126,9 +216,9 @@ minimal and auditable.
 
 ---
 
-## 2. Deterministic Ranking
+## 3. Deterministic Ranking
 
-### 2.1 Scoring Formula
+### 3.1 Scoring Formula
 
 All scores are computed locally from GitHub API metadata. **No LLM
 involvement in ranking.**
@@ -146,7 +236,7 @@ score = (
 )
 ```
 
-#### 2.1.1 Component Definitions
+#### 3.1.1 Component Definitions
 
 | Component | Value | Computation |
 |---|---|---|
@@ -158,7 +248,7 @@ score = (
 | `has_releases_score` | 0 or 1 | 1 if repo has at least one release (from API response or separate check) |
 | `build_files_score` | 0 or 1 | 1 if repo description or topics mention a known build system, OR if the repo's language matches a supported build system |
 
-#### 2.1.2 Penalties
+#### 3.1.2 Penalties
 
 | Condition | Penalty |
 |---|---|
@@ -167,12 +257,12 @@ score = (
 | Archived repo | -0.15 |
 | Fork (not source) | -0.10 |
 
-#### 2.1.3 Normalization
+#### 3.1.3 Normalization
 
 Final score is clamped to `[0.0, 1.0]`: `Math.max(0, Math.min(1, rawScore))`.
 Scores are rounded to 4 decimal places for display and storage.
 
-#### 2.1.4 Tie-Breaking
+#### 3.1.4 Tie-Breaking
 
 When two repos have identical scores (after rounding to 4 decimal places),
 tie-break in this order:
@@ -181,7 +271,7 @@ tie-break in this order:
 2. More recent `pushed_at` wins.
 3. Lexicographic sort on `full_name` (ascending) — deterministic and stable.
 
-#### 2.1.5 Pagination Strategy
+#### 3.1.5 Pagination Strategy
 
 GitHub Search API returns max 30 results per page via `gh search repos`.
 
@@ -194,7 +284,7 @@ GitHub Search API returns max 30 results per page via `gh search repos`.
 The only non-deterministic input is `Date.now()` for recency checks; pin it
 at function entry and pass it through.
 
-#### 2.1.6 Rate-Limit Handling
+#### 3.1.6 Rate-Limit Handling
 
 GitHub API rate limits are handled by the `gh` CLI, which returns non-zero on
 429/403 responses.
@@ -206,7 +296,7 @@ GitHub API rate limits are handled by the `gh` CLI, which returns non-zero on
   4. Set `rate_limited: true` in the search artifact.
 - Max retry attempts for rate-limit: 1.
 
-#### 2.1.7 Search Result Caching
+#### 3.1.7 Search Result Caching
 
 - Cache key: `sha256(query + max_results + page)` truncated to 12 hex chars.
 - Cache location: `crawl_cache` DB table.
@@ -217,9 +307,9 @@ GitHub API rate limits are handled by the `gh` CLI, which returns non-zero on
 
 ---
 
-## 3. Repository Inspection
+## 4. Repository Inspection
 
-### 3.1 Fetch Strategy (Decision Tree)
+### 4.1 Fetch Strategy (Decision Tree)
 
 ```
 Has release tarball AND --ref not set?
@@ -232,12 +322,12 @@ Has release tarball AND --ref not set?
 
 **Tarball fetch:**
 ```
-gh api repos/{owner}/{repo}/tarball/{tag} > /tmp/crucible-crawl-{session_id}/{repo}-{tag}.tar.gz
+gh api repos/{owner}/{repo}/tarball/{tag} > /tmp/git-crawler-{session_id}/{repo}-{tag}.tar.gz
 ```
 
 **Shallow clone:**
 ```
-git clone --depth 1 --branch {ref} --single-branch https://github.com/{owner}/{repo}.git /tmp/crucible-crawl-{session_id}/{repo}
+git clone --depth 1 --branch {ref} --single-branch https://github.com/{owner}/{repo}.git /tmp/git-crawler-{session_id}/{repo}
 ```
 
 All fetched content goes into a temporary directory under the system temp dir,
@@ -246,12 +336,12 @@ namespaced by session ID. This directory is cleaned up at session end.
 **Invariant:** Submodules are **never** fetched. Pass `--recurse-submodules=no`
 (default for shallow clone, but be explicit).
 
-### 3.2 Sampling Caps
+### 4.2 Sampling Caps
 
 | Resource | Cap | Rationale |
 |---|---|---|
-| Total files examined | 200 | Matches existing `MAX_SNAPSHOT_FILES` in repo.js |
-| Bytes per file | 200,000 (≈200 KB) | Matches existing `MAX_FILE_BYTES` |
+| Total files examined | 200 | Reasonable upper bound for build plan generation |
+| Bytes per file | 200,000 (≈200 KB) | Prevents single large files from dominating |
 | Total sampled bytes | 2,000,000 (≈2 MB) | Prevents pathological repos from consuming memory |
 | Max directory depth | 4 levels | Prevents deep traversal in monorepos |
 | Max files listed in tree | 500 | Tree is for orientation, not exhaustive listing |
@@ -274,7 +364,7 @@ means:
 This is a hard invariant — tests must verify that the sampling function
 itself enforces caps, independent of how its output is consumed.
 
-### 3.3 Safe File Allowlist
+### 4.3 Safe File Allowlist
 
 Only files matching these patterns are read. All others are skipped.
 
@@ -323,7 +413,7 @@ node_modules/, .git/, dist/, build/, target/, vendor/, __pycache__/,
 *.lock (except Cargo.lock, package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock, Pipfile.lock)
 ```
 
-### 3.4 Build System Detection
+### 4.4 Build System Detection
 
 Detection is purely heuristic — check for presence of known files at repo root
 and one level deep. No execution. **No LLM involvement in build detection.**
@@ -355,7 +445,7 @@ If multiple build systems are detected (e.g., `Makefile` + `Cargo.toml`),
 return the one with highest confidence. If tied, prefer the more specific
 system (Cargo over Make).
 
-### 3.5 Monorepo Handling
+### 4.5 Monorepo Handling
 
 A repo is considered a **monorepo** if:
 - It contains 2+ directories at root that each contain their own build file
@@ -375,13 +465,13 @@ When a monorepo is detected:
 
 ---
 
-## 4. JSON Schemas
+## 5. JSON Schemas
 
-All schemas use [Zod](https://zod.dev/) for runtime validation, matching the
-existing `zod` dependency in `package.json`. Each schema is defined in
-`src/crawl-schemas.js`.
+All schemas use [Zod](https://zod.dev/) for runtime validation. Each schema
+is defined in `src/crawl-schemas.js` and exported for use by consuming
+projects.
 
-### 4.1 `viv-git-search.v1`
+### 5.1 `viv-git-search.v1`
 
 ```javascript
 const VivGitSearchItem = z.object({
@@ -425,7 +515,7 @@ const VivGitSearchV1 = z.object({
 `result_count`, `rate_limited`, `cached`, `results`. Every item in `results`
 has all fields — no optional fields.
 
-### 4.2 `viv-git-inspect.v1` (Crawl Summary)
+### 5.2 `viv-git-inspect.v1` (Crawl Summary)
 
 ```javascript
 const VivGitInspectV1 = z.object({
@@ -476,9 +566,9 @@ following must also hold:
   string: `"Inspection data was truncated due to sampling caps. Plan may be incomplete."`
 - The `crawl_artifacts` DB row for this inspect artifact must have
   `sampling_truncated` visible in the stored JSON content.
-- stderr must log: `[crawl] Warning: sampling caps reached — {files_hit}/{bytes_hit} — results may be incomplete`
+- stderr must log: `[git-crawler] Warning: sampling caps reached — {files_hit}/{bytes_hit} — results may be incomplete`
 
-### 4.3 `viv-git-plan.v1`
+### 5.3 `viv-git-plan.v1`
 
 ```javascript
 const PlanStep = z.object({
@@ -526,7 +616,7 @@ const VivGitPlanV1 = z.object({
 **`prompt_hash`:** `shortHash(all_prompt_templates + token_budgets)` — changes
 when prompts or budgets change.
 
-### 4.4 `viv-git-recipe.v1`
+### 5.4 `viv-git-recipe.v1`
 
 ```javascript
 const VivGitRecipeV1 = z.object({
@@ -565,13 +655,13 @@ const VivGitRecipeV1 = z.object({
 
 ---
 
-## 5. Plan Safety Validation
+## 6. Plan Safety Validation
 
 Safety validation runs **after** plan synthesis (Phase 3) and **before** export
 (Phase 4). Every step's `cmd` field is validated. Implemented in
 `src/crawl-safety.js`.
 
-### 5.1 Command Template Allowlists
+### 6.1 Command Template Allowlists
 
 Each detected build system has a set of allowed command **prefixes**. A
 command must start with one of these prefixes to pass.
@@ -638,7 +728,7 @@ const COMMAND_ALLOWLISTS = {
 };
 ```
 
-### 5.2 Prohibited Tokens / Operators
+### 6.2 Prohibited Tokens / Operators
 
 Any command containing any of these tokens is **rejected unconditionally**,
 regardless of build system:
@@ -675,14 +765,14 @@ const PROHIBITED_TOKENS = [
 ];
 ```
 
-### 5.3 Workspace Path Enforcement
+### 6.3 Workspace Path Enforcement
 
 Every `cwd` field in a plan step must pass:
 
 1. Must be a relative path (not absolute).
 2. Must not contain `..` segments.
 3. When resolved against the workspace root, must remain inside the workspace.
-4. Uses existing `validateStagingPath(workspaceRoot, cwd)` from `safety.js`.
+4. Uses `validateStagingPath(workspaceRoot, cwd)` from `src/safety.js`.
 
 Additionally, any path literal appearing in a `cmd` string must:
 - Not be absolute (reject if starts with `/` except for explicitly allowed
@@ -690,11 +780,11 @@ Additionally, any path literal appearing in a `cmd` string must:
   prohibited tokens list).
 - Not contain `..`.
 
-### 5.4 Reject vs. Warn Rules
+### 6.4 Reject vs. Warn Rules
 
 **REJECT (plan is invalid, exit code 2):**
 
-- Command contains any prohibited token from §5.2.
+- Command contains any prohibited token from §6.2.
 - Command does not match any allowlisted prefix for the detected build system.
 - `cwd` fails path validation.
 - Any absolute path in `cmd`.
@@ -708,7 +798,7 @@ Additionally, any path literal appearing in a `cmd` string must:
 - Plan has more than 10 steps (suspiciously complex).
 - Any step has a `cmd` longer than 500 characters.
 
-### 5.5 Validation Function Signature
+### 6.5 Validation Function Signature
 
 ```javascript
 /**
@@ -725,9 +815,9 @@ and workspace path.
 
 ---
 
-## 6. LLM Phase Wiring
+## 7. LLM Phase Wiring
 
-### 6.1 Phase Overview
+### 7.1 Phase Overview
 
 | Phase | Name | LLM? | Who | Token Budget | Saves to DB |
 |---|---|---|---|---|---|
@@ -739,16 +829,13 @@ and workspace path.
 
 > **BINDING OWNERSHIP DECISION (do not reinterpret):**
 > GPT owns drafting, revision, and synthesis. Claude owns critique and
-> approval. This is intentional — GPT generates, Claude validates. This
-> mirrors the existing Crucible debate pattern in `cli.js` where GPT and
-> Claude have distinct roles. Implementations MUST NOT reassign synthesis
-> to Claude or critique to GPT. If the broader Crucible direction changes
-> ownership in the future, that is a separate spec revision, not an
-> implementation decision.
+> approval. This is intentional — GPT generates, Claude validates.
+> Implementations MUST NOT reassign synthesis to Claude or critique to GPT.
+> This is a spec-level decision, not an implementation choice.
 
-### 6.2 Phase 2 — Plan Draft and Debate
+### 7.2 Phase 2 — Plan Draft and Debate
 
-#### 6.2.1 Draft (GPT)
+#### 7.2.1 Draft (GPT)
 
 **System prompt:**
 ```
@@ -794,9 +881,9 @@ Output ONLY valid JSON. No markdown fences, no preamble.
 ```
 
 **Token budget:** 2000
-**Model:** GPT (selected via `selectBestGPTModel`)
+**Model:** GPT (selected via `selectBestGPTModel` from `src/models.js`, overridable via adapter)
 
-#### 6.2.2 Critique (Claude)
+#### 7.2.2 Critique (Claude)
 
 **System prompt:**
 ```
@@ -842,9 +929,9 @@ Output ONLY valid JSON. No markdown fences, no preamble.
 ```
 
 **Token budget:** 2000
-**Model:** Claude (selected via `selectBestClaudeModel`)
+**Model:** Claude (selected via `selectBestClaudeModel` from `src/models.js`, overridable via adapter)
 
-#### 6.2.3 Revision (GPT)
+#### 7.2.3 Revision (GPT)
 
 Only runs if `critique.approved === false`.
 
@@ -871,7 +958,7 @@ Output ONLY valid JSON. No markdown fences, no preamble.
 
 **Token budget:** 2000
 
-#### 6.2.4 Debate Bounds
+#### 7.2.4 Debate Bounds
 
 - **Max rounds:** 2 (configurable via `--max-debate-rounds`, hard cap: 4).
 - **Round definition:** One draft/revision from GPT + one critique from Claude = 1 round.
@@ -901,7 +988,7 @@ set on the API call itself, not communicated as a prompt instruction. The
 / `getAnthropic().messages.create()`. The LLM cannot exceed it regardless
 of what the prompt says.
 
-### 6.3 Phase 3 — Synthesis (GPT)
+### 7.3 Phase 3 — Synthesis (GPT)
 
 **User prompt template:**
 ```
@@ -944,16 +1031,16 @@ Output ONLY valid JSON. No markdown fences, no preamble.
 **Model:** GPT
 
 After GPT produces the synthesis:
-1. Parse with `parsePlanJson()` (existing helper).
+1. Parse with `parsePlanJson()`.
 2. Compute and inject `plan_hash` from the `steps` array.
 3. Run `validatePlanSafety()` — set `safety_validated` and `safety_violations`.
 4. Validate against `VivGitPlanV1` Zod schema.
 5. If schema validation fails, log error and exit with code 3.
 
-### 6.4 UNTRUSTED_REPO_BANNER Application Points
+### 7.4 UNTRUSTED_REPO_BANNER Application Points
 
-The `UNTRUSTED_REPO_BANNER` (imported from `repo.js`) is prepended to **every
-LLM prompt that includes repo-derived content**:
+The `UNTRUSTED_REPO_BANNER` (defined in `src/safety.js`) is prepended to
+**every LLM prompt that includes repo-derived content**:
 
 - Phase 2 Draft prompt (contains README, build files)
 - Phase 2 Critique prompt (contains plan derived from repo content)
@@ -965,9 +1052,7 @@ It is **NOT** applied to:
 - Phase 1 (no LLM)
 - Phase 4 (no LLM)
 
-### 6.5 Context Compression Between Phases
-
-Following the existing pattern in `cli.js` (phase summaries):
+### 7.5 Context Compression Between Phases
 
 - After Phase 2 completes, produce a **debate summary** (max 1000 chars):
   list of accepted/rejected suggestions, unresolved issues. Store as
@@ -977,7 +1062,7 @@ Following the existing pattern in `cli.js` (phase summaries):
 - Raw transcripts are stored in the `messages` table for audit but never
   forwarded to subsequent phases.
 
-### 6.6 Ownership Summary
+### 7.6 Ownership Summary
 
 | Action | Owner |
 |---|---|
@@ -991,18 +1076,27 @@ Following the existing pattern in `cli.js` (phase summaries):
 
 ---
 
-## 7. DB Design
+## 8. DB Design
 
-### 7.1 New Tables
+### 8.1 Database Location
 
-Add to `src/db.js` using the existing `CREATE TABLE IF NOT EXISTS` pattern.
+In standalone mode, the database lives at `~/.local/share/git-crawler/crawler.db`
+(overridable via `--db-path`). In embedded mode, the host project provides a
+DB path or an open `better-sqlite3` connection via the adapter (§10).
+
+The database is **self-contained** — it does not reference or depend on
+Crucible's `sessions`, `proposals`, or `messages` tables.
+
+### 8.2 Tables
+
+Defined in `src/db.js` using idempotent `CREATE TABLE IF NOT EXISTS`.
 
 #### `crawl_sessions`
 
 ```sql
 CREATE TABLE IF NOT EXISTS crawl_sessions (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id      INTEGER REFERENCES sessions(id),   -- links to parent session if run inside one
+  external_ref    TEXT,                               -- opaque string for host integration (e.g., Crucible session ID)
   started_at      TEXT    NOT NULL DEFAULT (datetime('now')),
   ended_at        TEXT,
   query           TEXT,
@@ -1050,39 +1144,54 @@ CREATE TABLE IF NOT EXISTS crawl_cache (
 );
 ```
 
-### 7.2 Reuse of Existing Tables
+#### `crawl_messages`
 
-- **`sessions`** — A crawl may optionally link to a parent session (if run
-  from within `crucible session`). The `crawl_sessions.session_id` FK is
-  nullable for standalone crawl invocations.
-- **`messages`** — Debate transcripts are logged here, using
-  `proposal_id = NULL` and a new crawl-specific approach: we log with
-  a synthetic proposal linked to the crawl session. Specifically: create a
-  proposal with title `"crawl:{owner/repo}"` and link messages to it.
-  This reuses the existing message logging without schema changes.
+Debate transcripts are stored in a dedicated table (not shared with any
+host project's message tables):
 
-### 7.3 Migrations
+```sql
+CREATE TABLE IF NOT EXISTS crawl_messages (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  crawl_session_id  INTEGER NOT NULL REFERENCES crawl_sessions(id),
+  created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+  phase             TEXT    NOT NULL,  -- 'draft', 'critique', 'revision', 'synthesis'
+  role              TEXT    NOT NULL,  -- 'system', 'user', 'assistant'
+  model             TEXT,              -- model ID used
+  content           TEXT    NOT NULL,
+  token_count       INTEGER
+);
 
-Following the existing idempotent migration pattern:
+CREATE INDEX IF NOT EXISTS idx_crawl_messages_session ON crawl_messages(crawl_session_id);
+```
+
+### 8.3 Migrations
+
+Following an idempotent migration pattern:
 
 ```javascript
-// In db.js, after existing migrations
-for (const ddl of [
-  `CREATE TABLE IF NOT EXISTS crawl_sessions (...)`,
-  `CREATE TABLE IF NOT EXISTS crawl_artifacts (...)`,
-  `CREATE TABLE IF NOT EXISTS crawl_cache (...)`,
-  `CREATE INDEX IF NOT EXISTS idx_crawl_sessions_repo ON crawl_sessions(selected_repo)`,
-  `CREATE INDEX IF NOT EXISTS idx_crawl_sessions_status ON crawl_sessions(status)`,
-  `CREATE INDEX IF NOT EXISTS idx_crawl_artifacts_session ON crawl_artifacts(crawl_session_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_crawl_artifacts_type ON crawl_artifacts(artifact_type)`,
-]) {
-  try { db.exec(ddl); } catch (e) {
-    if (!e.message.includes("already exists")) throw e;
+// In src/db.js — runs on first open
+export function initDb(dbPath) {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+
+  for (const ddl of [
+    `CREATE TABLE IF NOT EXISTS crawl_sessions (...)`,
+    `CREATE TABLE IF NOT EXISTS crawl_artifacts (...)`,
+    `CREATE TABLE IF NOT EXISTS crawl_cache (...)`,
+    `CREATE TABLE IF NOT EXISTS crawl_messages (...)`,
+    `CREATE INDEX IF NOT EXISTS idx_crawl_sessions_repo ON crawl_sessions(selected_repo)`,
+    `CREATE INDEX IF NOT EXISTS idx_crawl_sessions_status ON crawl_sessions(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_crawl_artifacts_session ON crawl_artifacts(crawl_session_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_crawl_artifacts_type ON crawl_artifacts(artifact_type)`,
+    `CREATE INDEX IF NOT EXISTS idx_crawl_messages_session ON crawl_messages(crawl_session_id)`,
+  ]) {
+    db.exec(ddl);
   }
+  return db;
 }
 ```
 
-### 7.4 Prepared Statements (additions to `stmts`)
+### 8.4 Prepared Statements
 
 ```javascript
 // crawl_sessions
@@ -1103,23 +1212,23 @@ setCacheEntry:          db.prepare(`INSERT OR REPLACE INTO crawl_cache (cache_ke
 pruneCacheExpired:      db.prepare(`DELETE FROM crawl_cache WHERE expires_at <= datetime('now')`),
 ```
 
-### 7.5 Stored Hashes
+### 8.5 Stored Hashes
 
 | Hash | Stored In | Computation |
 |---|---|---|
 | `plan_hash` | `crawl_sessions.plan_hash`, `viv-git-plan.v1.plan_hash` | `shortHash(JSON.stringify(plan.steps))` |
-| `prompt_hash` | `crawl_sessions.prompt_hash`, `viv-git-plan.v1.prompt_hash` | `shortHash(all_crawl_prompt_templates + token_budget_string)` — same pattern as existing `computePromptHash()` in cli.js |
+| `prompt_hash` | `crawl_sessions.prompt_hash`, `viv-git-plan.v1.prompt_hash` | `shortHash(all_crawl_prompt_templates + token_budget_string)` |
 | `content_hash` | `crawl_artifacts.content_hash` | `shortHash(artifact_json_string)` |
 | `cache_key` | `crawl_cache.cache_key` | `shortHash(query + max_results + page_num)` |
 
 ---
 
-## 8. Export Layout
+## 9. Export Layout
 
-### 8.1 Directory Structure
+### 9.1 Directory Structure
 
 ```
-~/.local/share/crucible/exports/<crawl-session-id>/
+~/.local/share/git-crawler/exports/<crawl-session-id>/
 ├── manifest.json
 ├── search.json          ← viv-git-search.v1
 ├── inspect.json         ← viv-git-inspect.v1
@@ -1130,7 +1239,7 @@ pruneCacheExpired:      db.prepare(`DELETE FROM crawl_cache WHERE expires_at <= 
     └── config-snapshot.json     ← runtime config at time of crawl
 ```
 
-### 8.2 Filename Convention
+### 9.2 Filename Convention
 
 - All filenames are lowercase, hyphenated, no spaces.
 - Session ID is the integer `crawl_sessions.id`.
@@ -1138,12 +1247,12 @@ pruneCacheExpired:      db.prepare(`DELETE FROM crawl_cache WHERE expires_at <= 
 - Files are written atomically: write to `<name>.tmp`, then `renameSync` to
   final name.
 
-### 8.3 `manifest.json`
+### 9.3 `manifest.json`
 
 ```json
 {
   "schema": "viv-crawl-manifest.v1",
-  "crucible_version": "1.1.0",
+  "git_crawler_version": "2.0.0",
   "created_at": "2026-02-28T12:00:00Z",
   "crawl_session_id": 42,
   "repo": "owner/repo",
@@ -1169,9 +1278,9 @@ pruneCacheExpired:      db.prepare(`DELETE FROM crawl_cache WHERE expires_at <= 
 }
 ```
 
-### 8.4 Workspace Path Enforcement for Exports
+### 9.4 Workspace Path Enforcement for Exports
 
-- Default export dir: `~/.local/share/crucible/exports/<id>/`
+- Default export dir: `~/.local/share/git-crawler/exports/<id>/`
 - Custom `--output-dir`: validated with `resolve()` to ensure it is:
   1. An absolute path or resolvable to one.
   2. Not a system directory (reject if starts with `/usr`, `/etc`, `/var`,
@@ -1181,7 +1290,7 @@ pruneCacheExpired:      db.prepare(`DELETE FROM crawl_cache WHERE expires_at <= 
   used for cloning (§3.1) is the only other write location, and it is cleaned
   up.
 
-### 8.5 Reproducibility Notes
+### 9.5 Reproducibility Notes
 
 The `manifest.json` includes everything needed to understand how the plan
 was produced:
@@ -1196,14 +1305,160 @@ To reproduce: same models + same prompts + same repo state → same plan
 
 ---
 
-## 9. Tests
+## 10. Integration Interface
 
-All tests use Node.js built-in `node:test` and `node:assert/strict`, matching
-existing test patterns. New test file: `test/crawl.test.js`.
+This section defines how git-crawler can be embedded in Crucible, Vivian, or
+any other host project. The integration surface is a single **adapter object**
+passed to `runCrawlSession()`.
 
-### 9.1 Unit Tests
+### 10.1 Adapter Contract
 
-#### 9.1.1 Scoring / Ranking
+```javascript
+/**
+ * @typedef {object} CrawlerAdapter
+ *
+ * Every field is optional. When omitted, git-crawler uses its own defaults.
+ * This is the only coupling surface between git-crawler and a host project.
+ */
+
+/**
+ * @property {import('better-sqlite3').Database} [db]
+ *   Pre-opened SQLite connection. When provided, git-crawler uses this
+ *   instead of opening its own database. The host is responsible for
+ *   calling initCrawlerTables(db) first to ensure the schema exists.
+ *
+ * @property {string} [externalRef]
+ *   Opaque identifier stored in crawl_sessions.external_ref. Crucible
+ *   passes its session ID here; Vivian might pass a job ID.
+ *
+ * @property {object} [llm]
+ * @property {Function} [llm.getOpenAI]   - () => OpenAI client instance
+ * @property {Function} [llm.getAnthropic] - () => Anthropic client instance
+ * @property {Function} [llm.selectGPTModel]    - () => string (model ID)
+ * @property {Function} [llm.selectClaudeModel] - () => string (model ID)
+ *
+ * @property {object} [ui]
+ * @property {Function} [ui.ask]     - (prompt: string) => Promise<string>
+ * @property {Function} [ui.confirm] - (prompt: string) => Promise<boolean>
+ * @property {Function} [ui.say]     - (msg: string) => void
+ *   Interactive prompt overrides. Crucible passes its own readline
+ *   helpers; Vivian might pass no-op stubs for headless operation.
+ *
+ * @property {object} [paths]
+ * @property {string} [paths.exportDir]  - Override default export directory
+ * @property {string} [paths.dbPath]     - Override default DB path
+ * @property {string} [paths.tempDir]    - Override default temp directory for clones
+ *
+ * @property {Function} [log]
+ *   (level: 'info'|'warn'|'error', msg: string) => void
+ *   Logging override. Defaults to stderr with [git-crawler] prefix.
+ *
+ * @property {Function} [onArtifact]
+ *   (type: string, artifact: object) => void
+ *   Callback fired when each artifact (search, inspect, plan, recipe) is
+ *   produced. Allows the host to process artifacts in real-time without
+ *   waiting for the full pipeline to finish. Crucible could use this to
+ *   store artifacts in its own DB tables alongside the crawler's.
+ */
+```
+
+### 10.2 Programmatic Entry Point
+
+```javascript
+import { runCrawlSession } from 'git-crawler';
+
+// Standalone (all defaults)
+const result = await runCrawlSession({ subcommand: 'export', repo: 'BurntSushi/ripgrep' });
+
+// Embedded in Crucible
+const result = await runCrawlSession({
+  subcommand: 'export',
+  repo: 'BurntSushi/ripgrep',
+  adapter: {
+    db: crucibleDb,
+    externalRef: `crucible-session:${sessionId}`,
+    llm: {
+      getOpenAI:  () => getOpenAI(),
+      getAnthropic: () => getAnthropic(),
+      selectGPTModel: selectBestGPTModel,
+      selectClaudeModel: selectBestClaudeModel,
+    },
+    ui: { ask, confirm, say: crucibleSay },
+    log: (level, msg) => process.stderr.write(`[crawl] ${msg}\n`),
+    onArtifact: (type, artifact) => {
+      // Store in Crucible's own tables if desired
+    },
+  },
+});
+```
+
+### 10.3 Schema Initialization for Embedded Use
+
+When a host provides its own DB connection, it must call `initCrawlerTables()`
+first:
+
+```javascript
+import { initCrawlerTables } from 'git-crawler';
+
+// Add crawler tables to an existing database
+initCrawlerTables(existingDb);
+```
+
+This runs the same idempotent DDL from §8 against the provided connection.
+The crawler tables use the `crawl_` prefix to avoid collisions with host
+tables.
+
+### 10.4 Import Map for Selective Use
+
+Host projects can import individual modules without pulling in the full
+pipeline:
+
+```javascript
+// Just the schemas (for validating artifacts produced elsewhere)
+import { VivGitPlanV1, VivGitSearchV1 } from 'git-crawler/schemas';
+
+// Just the safety validator (for checking plans from other sources)
+import { validatePlanSafety } from 'git-crawler/safety';
+
+// Just the ranking engine (for custom search UIs)
+import { scoreRepo, rankResults } from 'git-crawler/ranking';
+```
+
+### 10.5 Design Principles
+
+1. **Zero hard imports from host.** git-crawler never `import`s from
+   `crucible/*` or `vivian/*`. All host-specific behavior flows through
+   the adapter.
+
+2. **Sensible standalone defaults.** Every adapter field has a default.
+   Running `git-crawler export ripgrep` with no adapter works out of
+   the box (given API keys in env vars).
+
+3. **Adapter is optional and incremental.** A host can override just one
+   field (e.g., `db`) and let everything else use defaults.
+
+4. **Artifact schemas are the contract.** The JSON schemas (§5) are the
+   primary integration surface. A host that consumes `viv-git-plan.v1`
+   JSON files doesn't need to embed git-crawler at all — it can shell
+   out to the CLI and read the export directory.
+
+5. **Two integration tiers:**
+
+   | Tier | How | Coupling |
+   |---|---|---|
+   | **File-based** | Run `git-crawler export <repo>`, read JSON files from export dir | Zero — just filesystem and JSON schemas |
+   | **Library** | `import { runCrawlSession } from 'git-crawler'` with adapter | Adapter interface only |
+
+---
+
+## 11. Tests
+
+All tests use Node.js built-in `node:test` and `node:assert/strict`. Tests
+are split across multiple files for clarity.
+
+### 11.1 Unit Tests
+
+#### 11.1.1 Scoring / Ranking (`test/ranking.test.js`)
 
 ```
 describe("deterministic ranking")
@@ -1223,7 +1478,7 @@ describe("deterministic ranking")
   test("same input data always produces same ordering (determinism)")
 ```
 
-#### 9.1.2 Build System Detection
+#### 11.1.2 Build System Detection
 
 ```
 describe("build system detection")
@@ -1241,7 +1496,7 @@ describe("build system detection")
   test("no build files → unknown with confidence 0.0")
 ```
 
-#### 9.1.3 Sampling Cap Enforcement
+#### 11.1.3 Sampling Cap Enforcement
 
 ```
 describe("sampling cap enforcement")
@@ -1253,7 +1508,7 @@ describe("sampling cap enforcement")
   test("returned content byte count is within 2MB bound")
 ```
 
-#### 9.1.4 Monorepo Detection
+#### 11.1.4 Monorepo Detection
 
 ```
 describe("monorepo detection")
@@ -1263,7 +1518,7 @@ describe("monorepo detection")
   test("single build file at root → monorepo: false")
 ```
 
-### 9.2 Safety Rule Tests
+### 11.2 Safety Rule Tests (`test/safety.test.js`)
 
 ```
 describe("plan safety validation")
@@ -1292,7 +1547,7 @@ describe("plan safety validation")
   test("pure function: no side effects")
 ```
 
-### 9.3 Schema Validation Tests
+### 11.3 Schema Validation Tests
 
 ```
 describe("schema validation")
@@ -1311,7 +1566,7 @@ describe("schema validation")
   test("manifest schema validates correctly")
 ```
 
-### 9.4 Contract Tests (Mocked GitHub API)
+### 11.4 Contract Tests (Mocked GitHub API) (`test/crawl.test.js`)
 
 These tests mock the `gh` CLI responses to test the full pipeline without
 network access.
@@ -1329,7 +1584,20 @@ describe("crawl pipeline (mocked)")
   test("export → manifest lists all artifacts with correct hashes")
 ```
 
-### 9.5 Mocked Repository Fixtures
+### 11.5 Adapter / Integration Tests (`test/integration.test.js`)
+
+```
+describe("adapter integration")
+  test("standalone mode: uses default DB path and creates it")
+  test("embedded mode: uses provided DB connection")
+  test("embedded mode: uses provided LLM clients")
+  test("embedded mode: onArtifact callback fires for each phase")
+  test("embedded mode: external_ref stored in crawl_sessions")
+  test("initCrawlerTables is idempotent on existing DB")
+  test("adapter with partial overrides: missing fields use defaults")
+```
+
+### 11.6 Mocked Repository Fixtures
 
 Create test fixtures in `test/fixtures/crawl/`:
 
@@ -1364,55 +1632,66 @@ test/fixtures/crawl/
     └── search-rate-limited.json
 ```
 
-### 9.6 Test Runner Integration
-
-Add to `package.json`:
+### 11.7 Test Runner
 
 ```json
 "scripts": {
   "test": "node --test test/*.test.js",
-  "test:crawl": "node --test test/crawl.test.js"
+  "test:ranking": "node --test test/ranking.test.js",
+  "test:safety": "node --test test/safety.test.js",
+  "test:crawl": "node --test test/crawl.test.js",
+  "test:integration": "node --test test/integration.test.js"
 }
 ```
 
 ---
 
-## Appendix Z: Mandatory Infrastructure Reuse
+## Appendix Z: Internal Helpers (Self-Contained)
 
-The following existing helpers MUST be imported and used. Reimplementing
-any of them is a bug.
+git-crawler ships its own copies of all helpers. These are intentionally
+**compatible** with Crucible's equivalents so the adapter can swap them in,
+but they have no import dependency on Crucible.
 
-| Helper | Source | Used For |
+| Helper | Location in git-crawler | Crucible equivalent (if embedding) |
 |---|---|---|
-| `safeEnv()` | `src/safety.js` | Environment for all `spawnSync` calls |
-| `ghCapture(args)` pattern | `src/github.js` | All `gh` CLI calls (copy the pattern, or extract + export) |
-| `shortHash(str)` | `src/safety.js` | All hash computations (plan_hash, prompt_hash, content_hash, cache_key) |
-| `UNTRUSTED_REPO_BANNER` | `src/repo.js` | Prepended to every LLM prompt with repo-derived content |
-| `selectBestGPTModel()` | `src/models.js` | GPT model selection for Phase 2–3 |
-| `selectBestClaudeModel()` | `src/models.js` | Claude model selection for Phase 2 critique |
-| `getOpenAI()` | `src/providers.js` | OpenAI API client |
-| `getAnthropic()` | `src/providers.js` | Anthropic API client |
-| `ask()`, `confirm()`, `crucibleSay()` | `src/cli.js` | Interactive prompts (must be passed in or extracted) |
-| DB migration pattern | `src/db.js` | `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER TABLE` |
+| `safeEnv()` | `src/safety.js` | `src/safety.js:safeEnv` |
+| `ghCapture(args)` | `src/github.js` | `src/github.js:ghCapture` |
+| `shortHash(str)` | `src/safety.js` | `src/safety.js:shortHash` |
+| `UNTRUSTED_REPO_BANNER` | `src/safety.js` | `src/repo.js:UNTRUSTED_REPO_BANNER` |
+| `selectBestGPTModel()` | `src/models.js` | `src/models.js:selectBestGPTModel` |
+| `selectBestClaudeModel()` | `src/models.js` | `src/models.js:selectBestClaudeModel` |
+| `getOpenAI()` | `src/providers.js` | `src/providers.js:getOpenAI` |
+| `getAnthropic()` | `src/providers.js` | `src/providers.js:getAnthropic` |
+| `ask()`, `confirm()`, `say()` | `src/cli.js` | `src/cli.js:ask`, `confirm`, `crucibleSay` |
+| `initDb()` / migration DDL | `src/db.js` | `src/db.js` (shared DB) |
 
-If `ghCapture` is not currently exported from `github.js`, the
-implementation should export it (or extract a shared utility) rather than
-writing a new HTTP/gh wrapper.
+When embedding via the adapter (§10), the host can override any of these.
+When running standalone, git-crawler uses its own implementations.
 
 ---
 
 ## Appendix A: File Map
 
-| File | Purpose | New/Modified |
-|---|---|---|
-| `src/crawl.js` | Main crawl module: pipeline, LLM wiring, export | **New** |
-| `src/crawl-safety.js` | Plan safety validation (pure functions) | **New** |
-| `src/crawl-schemas.js` | Zod schemas for all crawl artifacts | **New** |
-| `src/crawl-ranking.js` | Deterministic scoring and ranking (pure functions) | **New** |
-| `src/db.js` | Add crawl tables, migrations, prepared statements | **Modified** |
-| `src/cli.js` | Register `crawl` command in router | **Modified** |
-| `test/crawl.test.js` | All crawl tests | **New** |
-| `test/fixtures/crawl/` | Mock repos and API responses | **New** |
+| File | Purpose |
+|---|---|
+| `bin/git-crawler` | CLI entry point (hashbang) |
+| `src/crawl.js` | Main pipeline: phases 0–4, `runCrawlSession()` export |
+| `src/crawl-safety.js` | Plan safety validation (pure functions) |
+| `src/crawl-schemas.js` | Zod schemas for all artifacts |
+| `src/crawl-ranking.js` | Deterministic scoring and ranking (pure functions) |
+| `src/cli.js` | CLI argument parsing and interactive menu |
+| `src/db.js` | SQLite database init, migrations, prepared statements |
+| `src/github.js` | `gh` CLI wrapper (`ghCapture`, search, tarball) |
+| `src/providers.js` | LLM client factory (OpenAI, Anthropic) |
+| `src/models.js` | Model selection helpers |
+| `src/safety.js` | Shared safety helpers (`safeEnv`, `shortHash`, `UNTRUSTED_REPO_BANNER`, path validation) |
+| `src/integration.js` | Adapter interface and default factory |
+| `test/crawl.test.js` | Pipeline contract tests |
+| `test/ranking.test.js` | Scoring / ranking unit tests |
+| `test/safety.test.js` | Safety validation unit tests |
+| `test/integration.test.js` | Adapter / embedding tests |
+| `test/fixtures/crawl/` | Mock repos and API responses |
+| `package.json` | Package identity, exports, dependencies |
 
 ## Appendix B: Invariant Checklist
 
@@ -1440,8 +1719,10 @@ These invariants must hold at all times. Each should have at least one test.
       bytes ≤ 2MB, depth ≤ 4.
 - [ ] **No LLM in ranking:** Search scoring is pure arithmetic.
 - [ ] **Network confined:** Only `gh` CLI and `git clone --depth 1`. No
-      `fetch()`, `axios`, `curl`, or direct HTTP. LLM calls via existing
-      `providers.js` only.
+      `fetch()`, `axios`, `curl`, or direct HTTP. LLM calls via
+      `src/providers.js` (or adapter override) only.
+- [ ] **No host coupling:** No `import` from `crucible/*` or `vivian/*`.
+      All host integration flows through the adapter (§10).
 
 ## Appendix C: Out-of-Scope Prohibition
 
@@ -1449,7 +1730,7 @@ The following features are **explicitly out of scope**. If the implementer
 encounters a situation that seems to require one of these, it is a sign
 that the approach is wrong — not that the scope should expand.
 
-- **No installation logic.** Crucible plans builds; it does not execute them.
+- **No installation logic.** git-crawler plans builds; it does not execute them.
 - **No auto-toolchain resolution.** The plan lists required tools; it does not install them.
 - **No repair or retry logic.** If a plan fails safety validation, it fails. No auto-fix loop.
 - **No binary release auto-download.** Tarballs are fetched for *inspection*, not for distribution.
@@ -1467,13 +1748,18 @@ checklist, then to the section text, then ask — do not invent.
 
 Implement in this order for incremental testability:
 
-1. `src/crawl-schemas.js` — schemas first, test with fixtures
-2. `src/crawl-ranking.js` — scoring, test with canned data
-3. `src/crawl-safety.js` — validation, test with plan fixtures
-4. `src/db.js` migration — add tables
-5. `src/crawl.js` Phase 0 (search) — wire ranking + cache + DB
-6. `src/crawl.js` Phase 1 (inspect) — wire clone/tarball + detection
-7. `src/crawl.js` Phase 2-3 (debate + synthesis) — wire LLM
-8. `src/crawl.js` Phase 4 (export) — wire file output
-9. `src/cli.js` — register command
-10. `test/crawl.test.js` — full contract tests
+1. `package.json` + repo skeleton — project identity, deps, exports map
+2. `src/safety.js` — `safeEnv`, `shortHash`, `UNTRUSTED_REPO_BANNER`, path validation
+3. `src/crawl-schemas.js` — Zod schemas, test with fixtures
+4. `src/crawl-ranking.js` — scoring, test with canned data
+5. `src/crawl-safety.js` — plan validation, test with plan fixtures
+6. `src/db.js` — `initDb`, migrations, prepared statements
+7. `src/github.js` — `ghCapture` wrapper
+8. `src/providers.js` + `src/models.js` — LLM client factory, model selection
+9. `src/integration.js` — adapter interface, default factory
+10. `src/crawl.js` Phase 0 (search) — wire ranking + cache + DB
+11. `src/crawl.js` Phase 1 (inspect) — wire clone/tarball + detection
+12. `src/crawl.js` Phase 2–3 (debate + synthesis) — wire LLM
+13. `src/crawl.js` Phase 4 (export) — wire file output
+14. `src/cli.js` + `bin/git-crawler` — CLI entry point and command router
+15. `test/` — full test suite (ranking, safety, crawl pipeline, integration)
