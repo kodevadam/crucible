@@ -11,6 +11,7 @@
 #   --db     PATH    crucible SQLite database    (default: ~/.crucible/crucible.db)
 #   --seed   N       shuf seed for reproducible ordering (default: $RANDOM)
 #   --dry-run        print planned runs without executing
+#   --print-run-plan print shuffled run order + proposal window, then exit
 #
 # Dependencies: jq, sqlite3, crucible (in PATH)
 #
@@ -34,15 +35,17 @@ ARMS="full no-critique"
 OUT="${SCRIPT_DIR}/trial_$(date +%Y%m%d_%H%M%S).csv"
 SEED="${RANDOM}"
 DRY_RUN=false
+PRINT_RUN_PLAN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tasks)   TASKS_JSON="$2"; shift 2 ;;
-    --arms)    ARMS="$2";       shift 2 ;;
-    --out)     OUT="$2";        shift 2 ;;
-    --db)      DB="$2";         shift 2 ;;
-    --seed)    SEED="$2";       shift 2 ;;
-    --dry-run) DRY_RUN=true;    shift   ;;
+    --tasks)          TASKS_JSON="$2"; shift 2 ;;
+    --arms)           ARMS="$2";       shift 2 ;;
+    --out)            OUT="$2";        shift 2 ;;
+    --db)             DB="$2";         shift 2 ;;
+    --seed)           SEED="$2";       shift 2 ;;
+    --dry-run)        DRY_RUN=true;    shift   ;;
+    --print-run-plan) PRINT_RUN_PLAN=true; shift ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -69,6 +72,31 @@ done
 mapfile -t shuffled < <(printf '%s\n' "${pairs[@]}" | shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:"${SEED}" -nosalt /dev/zero 2>/dev/null))
 
 total="${#shuffled[@]}"
+
+# ── --print-run-plan: show metadata and exit ───────────────────────────────────
+if [[ "$PRINT_RUN_PLAN" == "true" ]]; then
+  max_id="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo '?')"
+  echo "Run plan"
+  echo "  seed      : ${SEED}"
+  echo "  tasks     : ${TASKS_JSON}"
+  echo "  arms      : ${ARMS}"
+  echo "  total runs: ${total}"
+  echo "  output    : ${OUT}"
+  echo "  db        : ${DB}"
+  echo "  proposal window: next id will be > ${max_id}  (expected range: $((max_id + 1))–$((max_id + total)))"
+  echo ""
+  echo "  #   task_id              arm"
+  echo "  ─────────────────────────────────────────"
+  n=0
+  for pair in "${shuffled[@]}"; do
+    n=$((n + 1))
+    tid="${pair%%:::*}"
+    arm="${pair##*:::}"
+    tc="$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .class' "$TASKS_JSON")"
+    printf "  %-3d %-20s %-16s (%s)\n" "$n" "$tid" "$arm" "$tc"
+  done
+  exit 0
+fi
 
 # ── CSV header ─────────────────────────────────────────────────────────────────
 echo "task_id,arm,task_class,recall,recall_per_1k_tokens,total_gpt_tokens,total_claude_tokens,blocking_survival_rate,converged_naturally,rounds_completed,partition_residual,proposal_id" \
