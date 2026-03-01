@@ -1,0 +1,9 @@
+{
+  "name": "gauntlet-fixture",
+  "description": "Intentionally broken fixture for the crucible end-to-end gauntlet test.",
+  "type": "module",
+  "scripts": {
+    "test":      "node --test test/formatter.test.js",
+    "typecheck": "node --check src/formatter.js"
+  }
+}
