@@ -76,14 +76,20 @@ total="${#shuffled[@]}"
 # ── --print-run-plan: show metadata and exit ───────────────────────────────────
 if [[ "$PRINT_RUN_PLAN" == "true" ]]; then
   max_id="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo '?')"
+  win_lo=$((max_id + 1))
+  win_hi=$((max_id + total))
+  git_rev="$(git -C "${SCRIPT_DIR}" rev-parse HEAD 2>/dev/null || echo 'not-a-git-repo')"
+  tasks_hash="$(sha256sum "${TASKS_JSON}" 2>/dev/null | cut -c1-16 || md5 -q "${TASKS_JSON}" 2>/dev/null | cut -c1-16 || echo '?')"
   echo "Run plan"
-  echo "  seed      : ${SEED}"
-  echo "  tasks     : ${TASKS_JSON}"
-  echo "  arms      : ${ARMS}"
-  echo "  total runs: ${total}"
-  echo "  output    : ${OUT}"
-  echo "  db        : ${DB}"
-  echo "  proposal window: next id will be > ${max_id}  (expected range: $((max_id + 1))–$((max_id + total)))"
+  echo "  seed        : ${SEED}"
+  echo "  git_rev     : ${git_rev}"
+  echo "  tasks       : ${TASKS_JSON}"
+  echo "  tasks_hash  : ${tasks_hash}  (sha256 prefix — detects task edits since this plan was printed)"
+  echo "  arms        : ${ARMS}"
+  echo "  total runs  : ${total}"
+  echo "  output      : ${OUT}"
+  echo "  db          : ${DB}"
+  echo "  planned window: ${win_lo}–${win_hi}  (proposals with id > ${max_id})"
   echo ""
   echo "  #   task_id              arm"
   echo "  ─────────────────────────────────────────"
@@ -95,6 +101,15 @@ if [[ "$PRINT_RUN_PLAN" == "true" ]]; then
     tc="$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .class' "$TASKS_JSON")"
     printf "  %-3d %-20s %-16s (%s)\n" "$n" "$tid" "$arm" "$tc"
   done
+  echo ""
+  echo "  Verify completion after run (copy-paste into sqlite3):"
+  echo ""
+  echo "    SELECT id, status FROM proposals"
+  echo "    WHERE id BETWEEN ${win_lo} AND ${win_hi} ORDER BY id;"
+  echo ""
+  echo "    SELECT COUNT(*) AS rows, SUM(status='complete') AS complete,"
+  echo "           MIN(id) AS observed_lo, MAX(id) AS observed_hi"
+  echo "    FROM proposals WHERE id BETWEEN ${win_lo} AND ${win_hi};"
   exit 0
 fi
 
@@ -106,6 +121,11 @@ echo "Trial: ${total} runs  |  arms: ${ARMS}  |  seed: ${SEED}  |  out: ${OUT}" 
 echo "" >&2
 
 # ── Run loop ───────────────────────────────────────────────────────────────────
+# Snapshot proposal id ceiling before any run — used in failure breadcrumbs.
+max_id_start="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo 0)"
+win_lo=$((max_id_start + 1))
+win_hi=$((max_id_start + total))
+
 n=0
 failed=0
 for pair in "${shuffled[@]}"; do
@@ -203,7 +223,8 @@ FROM rd;
 " 2>/dev/null)"
 
   if [[ -z "$metrics" ]]; then
-    echo "  WARN: no completed proposal found after run" >&2
+    last_pid="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), "?") FROM proposals' 2>/dev/null || echo '?')"
+    echo "  FAILED: no completed proposal found (run ${n}/${total}, proposal_id=${last_pid}, planned window ${win_lo}–${win_hi})" >&2
     echo "${task_id},${arm},${task_class},no_proposal,no_proposal,0,0,null,null,null,null,null" >> "$OUT"
     failed=$((failed + 1))
   else
@@ -219,7 +240,16 @@ FROM rd;
 done
 
 # ── Summary ────────────────────────────────────────────────────────────────────
+observed="$(sqlite3 -separator ' ' "$DB" \
+  "SELECT COUNT(*), SUM(status='complete'), COALESCE(MIN(id),'—'), COALESCE(MAX(id),'—')
+   FROM proposals WHERE id BETWEEN ${win_lo} AND ${win_hi};" 2>/dev/null || echo "? ? ? ?")"
+read -r obs_rows obs_complete obs_lo obs_hi <<< "$observed"
+
 echo "Done: ${total} runs, ${failed} failed  →  ${OUT}" >&2
+echo "" >&2
+echo "  planned window : ${win_lo}–${win_hi} (${total} rows expected)" >&2
+echo "  observed window: ${obs_lo}–${obs_hi} (${obs_rows} rows, ${obs_complete} complete)" >&2
 if [[ "$failed" -gt 0 ]]; then
-  echo "Check failed rows (no_proposal) — crucible may have exited before synthesis." >&2
+  echo "" >&2
+  echo "  Check failed rows (no_proposal) — crucible may have exited before synthesis." >&2
 fi
