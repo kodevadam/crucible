@@ -259,6 +259,12 @@ export function validateStagingPath(repoRoot, proposedPath) {
     throw new Error(`Path traversal rejected: ${proposedPath}`);
   }
 
+  // Reject .git directory access — no legitimate caller should target git internals
+  const norm = normalised.replace(/\\/g, "/");
+  if (norm === ".git" || norm.startsWith(".git/") || norm.includes("/.git/")) {
+    throw new Error(`.git path rejected: ${proposedPath}`);
+  }
+
   // Boundary check: resolved path must be strictly inside repoRoot
   const resolvedRoot = resolve(repoRoot);
   const resolvedPath = resolve(repoRoot, normalised);

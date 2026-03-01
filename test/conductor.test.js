@@ -16,7 +16,8 @@ import { mkdtempSync, writeFileSync, rmSync }             from "fs";
 import { join }                                           from "path";
 import { tmpdir }                                         from "os";
 import { evaluateDelta, buildIterationContext,
-         dispatchRepairTool, REPAIR_TOOLS }              from "../src/conductor.js";
+         dispatchRepairTool, REPAIR_TOOLS,
+         RUN_COMMAND_MAX_OUTPUT }                        from "../src/conductor.js";
 
 // ── evaluateDelta: iteration 1 ───────────────────────────────────────────────
 
@@ -333,6 +334,46 @@ test("dispatchRepairTool: run_command rejects traversal target", () => {
   try {
     const result = dispatchRepairTool("run_command", { kind: "git_diff", target: "../../etc" }, wt);
     assert.ok(result.startsWith("[target path rejected:"), `got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: run_command rejects .git/ target", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    const result = dispatchRepairTool("run_command", { kind: "git_diff", target: ".git/config" }, wt);
+    assert.ok(result.startsWith("[target path rejected:"), `got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── Case 5: output cap ────────────────────────────────────────────────────────
+//
+// Write a tiny Node script that floods stdout, then verify the returned string
+// is bounded by RUN_COMMAND_MAX_OUTPUT (plus a short prefix for "exit N\n" and
+// the "[output truncated]" suffix — both small constants).
+
+test("dispatchRepairTool: run_command caps output at RUN_COMMAND_MAX_OUTPUT chars", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    // Script writes well over the cap; the dispatcher must truncate.
+    writeFileSync(join(wt, "flood.js"),
+      `process.stdout.write("x".repeat(${RUN_COMMAND_MAX_OUTPUT * 3}));\n`, "utf8");
+
+    const result = dispatchRepairTool(
+      "run_command", { kind: "test" }, wt,
+      { testCmd: "node flood.js" }
+    );
+
+    // Must contain exit code line (always present)
+    assert.ok(result.startsWith("exit "), `no exit line: ${result.slice(0, 40)}`);
+    // Must contain the truncation marker
+    assert.ok(result.includes("[output truncated]"), "expected truncation marker");
+    // Total length must not far exceed the cap
+    assert.ok(result.length < RUN_COMMAND_MAX_OUTPUT + 200,
+      `response too long: ${result.length} chars`);
   } finally {
     rmSync(wt, { recursive: true, force: true });
   }

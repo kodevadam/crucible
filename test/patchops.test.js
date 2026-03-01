@@ -222,3 +222,78 @@ test("applyPatchOpsToWorktree: writes only to files inside worktree path", () =>
     try { rmSync(sentinel); } catch {}
   }
 });
+
+// ── 11. Adversarial op combinations ──────────────────────────────────────────
+//
+// These cover the six cases from the post-ship robustness audit:
+//   1. create then delete_file same path → file absent (net no-op)
+//   2. delete_file then replace same path → throws (file gone, readFileSync fails)
+//   3. create in deeply nested new directory
+//   4. run_command target path attacks → see conductor.test.js (case 4)
+//   5. output cap → see conductor.test.js (case 5)
+//   6. signature stability → see testloop.test.js
+
+test("adversarial: create then delete_file same path leaves file absent", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-adv-"));
+  try {
+    applyPatchOpsToWorktree(wt, [
+      { op: "create",      path: "transient.js", content: "// temp\n" },
+      { op: "delete_file", path: "transient.js" },
+    ]);
+    let exists = true;
+    try { readFileSync(join(wt, "transient.js")); } catch { exists = false; }
+    assert.equal(exists, false, "file should be absent after create+delete_file");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("adversarial: delete_file then replace same path throws predictably", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-adv-"));
+  try {
+    writeFileSync(join(wt, "target.js"), "const x = 1;\n", "utf8");
+    assert.throws(
+      () => applyPatchOpsToWorktree(wt, [
+        { op: "delete_file", path: "target.js" },
+        { op: "replace",     path: "target.js", old: "const x = 1", new: "const x = 2" },
+      ]),
+      // ENOENT from readFileSync — the error is not silently swallowed
+      err => err.code === "ENOENT" || err.message.includes("no such file"),
+      "expected ENOENT when patching a deleted file"
+    );
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("adversarial: create in deeply nested new directory", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-adv-"));
+  try {
+    applyPatchOpsToWorktree(wt, [
+      { op: "create", path: "a/b/c/d/deep.js", content: "export {};\n" },
+    ]);
+    assert.equal(readFileSync(join(wt, "a/b/c/d/deep.js"), "utf8"), "export {};\n");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("adversarial: parsePatchOps rejects create with .. in path", () => {
+  const ops = [{ op: "create", path: "../../outside.js", content: "bad" }];
+  try {
+    parsePatchOps(JSON.stringify(ops));
+    assert.fail("expected throw");
+  } catch (e) {
+    assert.equal(e.code, "patch_schema_invalid");
+  }
+});
+
+test("adversarial: parsePatchOps rejects delete_file with .git path", () => {
+  const ops = [{ op: "delete_file", path: ".git/config" }];
+  try {
+    parsePatchOps(JSON.stringify(ops));
+    assert.fail("expected throw");
+  } catch (e) {
+    assert.equal(e.code, "patch_schema_invalid");
+  }
+});
