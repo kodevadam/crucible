@@ -18,8 +18,8 @@
 
 import { randomBytes }                             from "crypto";
 import { spawnSync }                               from "child_process";
-import { readFileSync, writeFileSync, unlinkSync } from "fs";
-import { join, normalize, isAbsolute }             from "path";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
+import { join, normalize, isAbsolute, dirname }               from "path";
 import { tmpdir }                                  from "os";
 import { safeEnv }                                 from "./safety.js";
 
@@ -122,13 +122,26 @@ export function parsePatchOps(jsonString) {
       throw err;
     }
 
-    if (!["replace", "insert_after", "delete"].includes(op.op)) {
+    if (!["replace", "insert_after", "delete", "create", "delete_file"].includes(op.op)) {
       const err = new Error(`Op[${i}] has unknown op type: "${op.op}"`);
       err.code = "patch_schema_invalid";
       throw err;
     }
 
     validateOpPath(op.path, i);
+
+    if (op.op === "create") {
+      if (typeof op.content !== "string") {
+        const err = new Error(`Op[${i}] ("create") missing required string "content" field`);
+        err.code = "patch_schema_invalid";
+        throw err;
+      }
+      continue; // no occurrence or old/anchor fields for file-system ops
+    }
+
+    if (op.op === "delete_file") {
+      continue; // path already validated; no other required fields
+    }
 
     if ((op.op === "replace" || op.op === "delete") && typeof op.old !== "string") {
       const err = new Error(`Op[${i}] ("${op.op}") missing required string "old" field`);
@@ -258,8 +271,21 @@ export function applyPatchOpsToContent(content, ops) {
  * @param {Array}  ops          - Validated ops (may span multiple files)
  */
 export function applyPatchOpsToWorktree(worktreePath, ops) {
+  // File-system ops (create/delete_file) are applied first in declaration order.
+  // Content ops (replace/insert_after/delete) are then applied grouped by file.
+  for (const op of ops) {
+    if (op.op === "create") {
+      const absPath = join(worktreePath, op.path);
+      mkdirSync(dirname(absPath), { recursive: true });
+      writeFileSync(absPath, op.content, "utf8");
+    } else if (op.op === "delete_file") {
+      unlinkSync(join(worktreePath, op.path));
+    }
+  }
+
   const byFile = new Map();
   for (const op of ops) {
+    if (op.op === "create" || op.op === "delete_file") continue;
     if (!byFile.has(op.path)) byFile.set(op.path, []);
     byFile.get(op.path).push(op);
   }

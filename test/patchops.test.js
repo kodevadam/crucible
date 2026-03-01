@@ -133,7 +133,74 @@ test("parsePatchOps: .git path in op throws patch_schema_invalid", () => {
   }
 });
 
-// ── 9. applyPatchOpsToWorktree: only writes inside worktree ──────────────────
+// ── 9. create op ─────────────────────────────────────────────────────────────
+
+test("parsePatchOps: accepts create op with path and content", () => {
+  const ops = [{ op: "create", path: "src/new.js", content: "export const x = 1;\n" }];
+  const parsed = parsePatchOps(JSON.stringify(ops));
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].op, "create");
+  assert.equal(parsed[0].content, "export const x = 1;\n");
+});
+
+test("parsePatchOps: create without content throws patch_schema_invalid", () => {
+  const ops = [{ op: "create", path: "src/new.js" }];
+  try {
+    parsePatchOps(JSON.stringify(ops));
+    assert.fail("expected to throw");
+  } catch (e) {
+    assert.equal(e.code, "patch_schema_invalid");
+  }
+});
+
+test("parsePatchOps: accepts delete_file op with path only", () => {
+  const ops = [{ op: "delete_file", path: "src/old.js" }];
+  const parsed = parsePatchOps(JSON.stringify(ops));
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].op, "delete_file");
+});
+
+test("applyPatchOpsToWorktree: create op writes new file", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-wt-test-"));
+  try {
+    applyPatchOpsToWorktree(wt, [
+      { op: "create", path: "lib/helper.js", content: "module.exports = {};\n" },
+    ]);
+    assert.equal(readFileSync(join(wt, "lib/helper.js"), "utf8"), "module.exports = {};\n");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("applyPatchOpsToWorktree: delete_file op removes file", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-wt-test-"));
+  try {
+    writeFileSync(join(wt, "old.js"), "// obsolete\n", "utf8");
+    applyPatchOpsToWorktree(wt, [
+      { op: "delete_file", path: "old.js" },
+    ]);
+    let exists = true;
+    try { readFileSync(join(wt, "old.js")); } catch { exists = false; }
+    assert.equal(exists, false, "file should have been deleted");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("applyPatchOpsToWorktree: create then content op on same file", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-wt-test-"));
+  try {
+    applyPatchOpsToWorktree(wt, [
+      { op: "create",  path: "new.js", content: "const a = 1;\n" },
+      { op: "replace", path: "new.js", old: "const a = 1", new: "const a = 2" },
+    ]);
+    assert.equal(readFileSync(join(wt, "new.js"), "utf8"), "const a = 2;\n");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── 10. applyPatchOpsToWorktree: only writes inside worktree ─────────────────
 
 test("applyPatchOpsToWorktree: writes only to files inside worktree path", () => {
   const wt       = mkdtempSync(join(tmpdir(), "crucible-wt-test-"));

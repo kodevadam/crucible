@@ -264,10 +264,11 @@ test("dispatchRepairTool: returns error string for unknown tool (does not throw)
 
 // ── REPAIR_TOOLS: contract shape ──────────────────────────────────────────────
 
-test("REPAIR_TOOLS: has read_file, search_content, submit_ops entries", () => {
+test("REPAIR_TOOLS: has read_file, search_content, run_command, submit_ops entries", () => {
   const names = REPAIR_TOOLS.map(t => t.name);
   assert.ok(names.includes("read_file"),      "missing read_file");
   assert.ok(names.includes("search_content"), "missing search_content");
+  assert.ok(names.includes("run_command"),    "missing run_command");
   assert.ok(names.includes("submit_ops"),     "missing submit_ops");
 });
 
@@ -291,4 +292,48 @@ test("REPAIR_TOOLS: read_file requires path but not start_line/end_line", () => 
   assert.ok(readFile.input_schema.required.includes("path"));
   assert.ok(!readFile.input_schema.required.includes("start_line"), "start_line should be optional");
   assert.ok(!readFile.input_schema.required.includes("end_line"),   "end_line should be optional");
+});
+
+test("REPAIR_TOOLS: run_command requires kind, has enum of allowed kinds, target is optional", () => {
+  const runCmd = REPAIR_TOOLS.find(t => t.name === "run_command");
+  assert.ok(runCmd, "run_command tool must exist");
+  assert.ok(runCmd.input_schema.required.includes("kind"));
+  assert.ok(!runCmd.input_schema.required.includes("target"), "target should be optional");
+  const kinds = runCmd.input_schema.properties.kind.enum;
+  for (const k of ["test", "build", "lint", "typecheck", "git_diff"]) {
+    assert.ok(kinds.includes(k), `missing kind: ${k}`);
+  }
+});
+
+// ── dispatchRepairTool: run_command ───────────────────────────────────────────
+
+test("dispatchRepairTool: run_command git_diff returns exit code line", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    // git_diff in a non-git dir will fail, but we just verify the response shape
+    const result = dispatchRepairTool("run_command", { kind: "git_diff" }, wt);
+    assert.ok(result.startsWith("exit "), `response should start with 'exit ', got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: run_command rejects unknown kind", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    const result = dispatchRepairTool("run_command", { kind: "rm_rf" }, wt);
+    assert.ok(result.startsWith("[unknown command kind:"), `got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: run_command rejects traversal target", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    const result = dispatchRepairTool("run_command", { kind: "git_diff", target: "../../etc" }, wt);
+    assert.ok(result.startsWith("[target path rejected:"), `got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
 });
