@@ -15,7 +15,8 @@ import assert                                             from "node:assert/stri
 import { mkdtempSync, writeFileSync, rmSync }             from "fs";
 import { join }                                           from "path";
 import { tmpdir }                                         from "os";
-import { evaluateDelta, buildIterationContext }           from "../src/conductor.js";
+import { evaluateDelta, buildIterationContext,
+         dispatchRepairTool, REPAIR_TOOLS }              from "../src/conductor.js";
 
 // ── evaluateDelta: iteration 1 ───────────────────────────────────────────────
 
@@ -175,4 +176,119 @@ test("buildIterationContext: skips non-modify files in fileContents", () => {
   } finally {
     rmSync(wt, { recursive: true, force: true });
   }
+});
+
+test("buildIterationContext: new fields (enrichedFailure, anchorError, wtPath) default to null/present", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-cond-test-"));
+  try {
+    const ctx = buildIterationContext({
+      plan: "p", affectedFiles: [], wtPath: wt,
+      repoUnderstanding: null, failureExcerpt: null,
+      previousOps: null, iteration: 1, headSha: "abc",
+    });
+    assert.equal(ctx.enrichedFailure, null);
+    assert.equal(ctx.anchorError,     null);
+    assert.equal(ctx.wtPath,          wt, "wtPath should be passed through for tool dispatch");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── dispatchRepairTool: path security ─────────────────────────────────────────
+
+test("dispatchRepairTool: reads a valid file inside the worktree", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    writeFileSync(join(wt, "hello.js"), "const x = 1;\n", "utf8");
+    const result = dispatchRepairTool("read_file", { path: "hello.js" }, wt);
+    assert.equal(result, "const x = 1;\n");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: read_file with line range", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    writeFileSync(join(wt, "multi.js"), "line1\nline2\nline3\nline4\n", "utf8");
+    const result = dispatchRepairTool("read_file", { path: "multi.js", start_line: 2, end_line: 3 }, wt);
+    assert.ok(result.includes("line2"), `got: ${result}`);
+    assert.ok(result.includes("line3"), `got: ${result}`);
+    assert.ok(!result.includes("line1"), `should not include line1, got: ${result}`);
+    assert.ok(!result.includes("line4"), `should not include line4, got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: rejects path traversal attempts", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    const TRAVERSAL_PATHS = [
+      "../../etc/passwd",
+      "../../../root/.ssh/id_rsa",
+      "/etc/passwd",
+      "a/../../b/../../secret",
+    ];
+    for (const p of TRAVERSAL_PATHS) {
+      const result = dispatchRepairTool("read_file", { path: p }, wt);
+      assert.ok(
+        result.startsWith("[path rejected:"),
+        `traversal path "${p}" should be rejected, got: ${result}`
+      );
+    }
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: returns error string for missing file (does not throw)", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    const result = dispatchRepairTool("read_file", { path: "nonexistent.js" }, wt);
+    assert.ok(result.startsWith("[file not found:"), `got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("dispatchRepairTool: returns error string for unknown tool (does not throw)", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-dispatch-"));
+  try {
+    const result = dispatchRepairTool("explode_repo", {}, wt);
+    assert.ok(result.startsWith("[unknown tool:"), `got: ${result}`);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── REPAIR_TOOLS: contract shape ──────────────────────────────────────────────
+
+test("REPAIR_TOOLS: has read_file, search_content, submit_ops entries", () => {
+  const names = REPAIR_TOOLS.map(t => t.name);
+  assert.ok(names.includes("read_file"),      "missing read_file");
+  assert.ok(names.includes("search_content"), "missing search_content");
+  assert.ok(names.includes("submit_ops"),     "missing submit_ops");
+});
+
+test("REPAIR_TOOLS: each tool has name, description, and input_schema", () => {
+  for (const tool of REPAIR_TOOLS) {
+    assert.ok(typeof tool.name        === "string", `${tool.name}: missing name`);
+    assert.ok(typeof tool.description === "string", `${tool.name}: missing description`);
+    assert.ok(tool.input_schema && tool.input_schema.type === "object",
+      `${tool.name}: missing input_schema`);
+  }
+});
+
+test("REPAIR_TOOLS: submit_ops requires ops array", () => {
+  const submitOps = REPAIR_TOOLS.find(t => t.name === "submit_ops");
+  assert.ok(submitOps.input_schema.required.includes("ops"));
+  assert.equal(submitOps.input_schema.properties.ops.type, "array");
+});
+
+test("REPAIR_TOOLS: read_file requires path but not start_line/end_line", () => {
+  const readFile = REPAIR_TOOLS.find(t => t.name === "read_file");
+  assert.ok(readFile.input_schema.required.includes("path"));
+  assert.ok(!readFile.input_schema.required.includes("start_line"), "start_line should be optional");
+  assert.ok(!readFile.input_schema.required.includes("end_line"),   "end_line should be optional");
 });

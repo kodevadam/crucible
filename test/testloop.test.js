@@ -14,6 +14,9 @@ import {
   runTestIteration,
   compareIterations,
   extractFailureExcerpt,
+  extractFailureSignatures,
+  extractStackRefs,
+  enrichFailureContext,
   checkNetworkIsolation,
 } from "../src/testloop.js";
 
@@ -170,4 +173,183 @@ test("checkNetworkIsolation: always returns without throwing", () => {
     assert.ok(typeof result.available === "boolean");
     assert.ok(result.method === "netns" || result.method === "none");
   });
+});
+
+// ── 10. runTestIteration: failureSignatures in result ────────────────────────
+
+test("runTestIteration: failureSignatures present and empty on exit 0", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-tl-"));
+  try {
+    writeFileSync(join(wt, "ok.js"), `process.exit(0);`, "utf8");
+    const result = await runTestIteration(wt, "node ok.js");
+    assert.ok(Array.isArray(result.failureSignatures), "failureSignatures should be an array");
+    assert.equal(result.failureSignatures.length, 0, "no signatures on success");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("runTestIteration: failureSignatures non-empty on failure", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-tl-"));
+  try {
+    writeFileSync(join(wt, "fail.js"),
+      `console.error("AssertionError: expected 1 to equal 2"); process.exit(1);`, "utf8");
+    const result = await runTestIteration(wt, "node fail.js");
+    assert.ok(result.failureSignatures.length > 0, "should have at least one signature");
+    assert.ok(
+      result.failureSignatures.some(s => s.startsWith("AssertionError::")),
+      `expected AssertionError:: signature, got: ${result.failureSignatures}`
+    );
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+// ── 11. extractFailureSignatures ─────────────────────────────────────────────
+
+test("extractFailureSignatures: extracts AssertionError signature", () => {
+  const sigs = extractFailureSignatures(
+    "AssertionError: expected 1 to equal 2\n    at test.js:5:10",
+    ""
+  );
+  assert.ok(sigs.length > 0, "should produce at least one signature");
+  assert.ok(sigs.some(s => s.startsWith("AssertionError::")));
+});
+
+test("extractFailureSignatures: extracts Jest bullet marker", () => {
+  const sigs = extractFailureSignatures(
+    "● MyComponent › renders correctly",
+    ""
+  );
+  assert.ok(sigs.some(s => s.startsWith("jest::")), `got: ${sigs}`);
+});
+
+test("extractFailureSignatures: extracts TAP not-ok line", () => {
+  const sigs = extractFailureSignatures(
+    "not ok 3 - should equal expected value",
+    ""
+  );
+  assert.ok(sigs.some(s => s.startsWith("tap::")), `got: ${sigs}`);
+});
+
+test("extractFailureSignatures: normalises hex addresses (same logical error → same sig)", () => {
+  const run1 = extractFailureSignatures("Error: segfault at 0xdeadbeef", "");
+  const run2 = extractFailureSignatures("Error: segfault at 0xcafebabe", "");
+  assert.deepEqual(run1, run2, "hex addresses should be normalised away");
+});
+
+test("extractFailureSignatures: empty input → empty array", () => {
+  assert.deepEqual(extractFailureSignatures("", ""), []);
+  assert.deepEqual(extractFailureSignatures(null, null), []);
+});
+
+// ── 12. compareIterations: signature-aware progress detection ────────────────
+
+test("compareIterations: same count, different signatures → improved (peeling the onion)", () => {
+  const prev = { failureCount: 3, failureSignatures: ["AssertionError::A", "TypeError::B", "Error::C"] };
+  const curr = { failureCount: 3, failureSignatures: ["AssertionError::A", "TypeError::X", "RangeError::Y"] };
+  assert.equal(compareIterations(prev, curr), "improved");
+});
+
+test("compareIterations: same count, identical signatures → same (truly stuck)", () => {
+  const sigs = ["AssertionError::expected 1 to equal 2", "TypeError::cannot read"];
+  const prev = { failureCount: 2, failureSignatures: [...sigs] };
+  const curr = { failureCount: 2, failureSignatures: [...sigs] };
+  assert.equal(compareIterations(prev, curr), "same");
+});
+
+test("compareIterations: same count, no signatures → same (no data, conservative)", () => {
+  assert.equal(compareIterations({ failureCount: 3 }, { failureCount: 3 }), "same");
+});
+
+// ── 13. extractStackRefs ─────────────────────────────────────────────────────
+
+test("extractStackRefs: parses standard Node.js stack frame", () => {
+  const text = [
+    "AssertionError: expected 1 to equal 2",
+    "    at Object.<anonymous> (/home/user/project/test/parser.test.js:15:5)",
+    "    at Module._compile (node:internal/modules/cjs/loader:1376:14)",
+  ].join("\n");
+
+  const refs = extractStackRefs(text);
+  assert.ok(refs.length > 0, "should extract at least one ref");
+  assert.ok(refs[0].rawPath.includes("parser.test.js"), `got: ${refs[0].rawPath}`);
+  assert.equal(refs[0].line, 15);
+});
+
+test("extractStackRefs: skips node: internals and node_modules", () => {
+  const text = [
+    "    at node:internal/process/task_queues:140:5",
+    "    at /home/user/project/node_modules/jest-runner/build/runTest.js:350:5",
+    "    at Object.<anonymous> (/home/user/project/src/real.js:42:1)",
+  ].join("\n");
+
+  const refs = extractStackRefs(text);
+  assert.equal(refs.length, 1, `should only get userland ref, got: ${JSON.stringify(refs)}`);
+  assert.ok(refs[0].rawPath.includes("real.js"));
+});
+
+test("extractStackRefs: empty input → empty array", () => {
+  assert.deepEqual(extractStackRefs(""), []);
+  assert.deepEqual(extractStackRefs(null), []);
+});
+
+// ── 14. enrichFailureContext ──────────────────────────────────────────────────
+
+test("enrichFailureContext: reads failing file from worktree", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-tl-enrich-"));
+  try {
+    // Create a source file in the mock worktree
+    writeFileSync(join(wt, "parser.js"), [
+      "function parse(input) {",
+      "  if (!input) throw new Error('null input');",
+      "  return JSON.parse(input);",
+      "}",
+      "module.exports = parse;",
+    ].join("\n"), "utf8");
+
+    // Simulate a test result with a stack trace pointing to our file
+    const result = {
+      exitCode: 1,
+      stdout: "",
+      stderr: [
+        "AssertionError: expected null got string",
+        `    at Object.<anonymous> (${wt}/parser.js:2:5)`,
+        "    at node:internal/process/task_queues:140:5",
+      ].join("\n"),
+      excerpt: "AssertionError: expected null got string",
+    };
+
+    const enriched = enrichFailureContext(result, wt);
+    assert.equal(enriched.excerpt, result.excerpt);
+    assert.ok(Array.isArray(enriched.refs));
+    assert.ok(enriched.refs.length > 0, "should find the file reference");
+    assert.ok(enriched.refs[0].path.includes("parser.js"), `got path: ${enriched.refs[0].path}`);
+    assert.ok(typeof enriched.refs[0].snippet === "string");
+    assert.ok(enriched.refs[0].snippet.includes("null input"), "snippet should contain surrounding code");
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("enrichFailureContext: returns empty refs when wtPath is null", () => {
+  const result = { exitCode: 1, stdout: "", stderr: "Error", excerpt: "Error" };
+  const enriched = enrichFailureContext(result, null);
+  assert.deepEqual(enriched.refs, []);
+});
+
+test("enrichFailureContext: returns empty refs when stack has no readable files", () => {
+  const wt = mkdtempSync(join(tmpdir(), "crucible-tl-enrich-"));
+  try {
+    const result = {
+      exitCode: 1,
+      stdout:   "    at Object.<anonymous> (/nonexistent/path/file.js:1:1)",
+      stderr:   "",
+      excerpt:  "error",
+    };
+    const enriched = enrichFailureContext(result, wt);
+    assert.deepEqual(enriched.refs, []);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+  }
 });
