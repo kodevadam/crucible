@@ -232,11 +232,19 @@ for pair in "${shuffled[@]}"; do
   # Surrogate key: '{RUN_ID}_n{NNN}' — append '_a{K}' if retry logic is ever added
   RUN_ATTEMPT_ID="${RUN_ID}_n$(printf '%03d' "${n}")"
 
-  # Register attempt as 'started' — distinguishable from 'never inserted' if we crash
-  sqlite3 "$DB" "INSERT OR REPLACE INTO run_attempts
-    (run_attempt_id, run_id, n, task_id, arm, status)
-    VALUES ('${RUN_ATTEMPT_ID}', '${RUN_ID}', ${n}, '${task_id}', '${arm}', 'started');" \
-    2>/dev/null || true
+  # Register attempt as 'started'.  FK enforced: run_id must exist in runs.
+  # Failure here means the bookkeeping layer is compromised — abort the trial
+  # rather than executing runs whose provenance cannot be recorded.
+  if ! sqlite3 "$DB" "PRAGMA foreign_keys = ON;
+INSERT OR REPLACE INTO run_attempts
+  (run_attempt_id, run_id, n, task_id, arm, status)
+  VALUES ('${RUN_ATTEMPT_ID}', '${RUN_ID}', ${n}, '${task_id}', '${arm}', 'started');" >&2; then
+    echo "ABORT: run_attempts INSERT failed at run ${n}/${total}" >&2
+    echo "  run_attempt_id : ${RUN_ATTEMPT_ID}" >&2
+    echo "  run_id         : ${RUN_ID}" >&2
+    echo "  Likely cause: runs row missing (FK violation) or DB locked." >&2
+    exit 1
+  fi
 
   # Execute — pipe /dev/null to handle any residual readline reads
   crucible plan "$prompt" --arm "$arm" --task-class "$task_class" --batch \
