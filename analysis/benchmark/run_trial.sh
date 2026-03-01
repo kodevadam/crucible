@@ -129,8 +129,12 @@ if [[ "$PRINT_RUN_PLAN" == "true" ]]; then
   echo "    WHERE id BETWEEN ${win_lo} AND ${win_hi}"
   echo "    GROUP BY task_id, arm ORDER BY task_id, arm;"
   echo ""
-  echo "    -- 4. By run_id (requires: ALTER TABLE proposals ADD COLUMN run_id TEXT)"
-  echo "    SELECT id, status FROM proposals WHERE run_id = '${RUN_ID}' ORDER BY id;"
+  echo "    -- 4. Full join: proposals ← run_attempts (run_attempt_id is the bridge)"
+  echo "    SELECT ra.n, ra.task_id, ra.arm, ra.run_attempt_id,"
+  echo "           p.id AS proposal_id, p.status AS proposal_status, ra.status AS attempt_status"
+  echo "    FROM run_attempts ra"
+  echo "    LEFT JOIN proposals p ON p.run_attempt_id = ra.run_attempt_id"
+  echo "    WHERE ra.run_id = '${RUN_ID}' ORDER BY ra.n;"
   echo ""
   echo "    -- 5. Trial registry header"
   echo "    SELECT run_id, started_at, finished_at, total_runs, failed_runs"
@@ -177,13 +181,14 @@ CREATE TABLE IF NOT EXISTS runs (
   failed_runs      INTEGER
 );
 CREATE TABLE IF NOT EXISTS run_attempts (
-  run_id      TEXT,
-  n           INTEGER,
-  task_id     TEXT,
-  arm         TEXT,
-  proposal_id INTEGER,
-  status      TEXT,
-  PRIMARY KEY (run_id, n)
+  run_attempt_id TEXT PRIMARY KEY,   -- '{RUN_ID}_n{NNN}'; append '_a{K}' for retries
+  run_id         TEXT NOT NULL,
+  n              INTEGER NOT NULL,
+  task_id        TEXT,
+  arm            TEXT,
+  proposal_id    INTEGER,
+  status         TEXT,
+  UNIQUE (run_id, n)
 );
 INSERT OR IGNORE INTO runs
   (run_id, started_at, git_rev, tasks_sha256_raw, seed, arms,
@@ -193,6 +198,10 @@ VALUES
    '${_arms_sql}', ${win_lo}, ${win_hi}, '${_inv_sql}', '${_tasks_sql}',
    '${_out_sql}', ${total});
 " 2>/dev/null || true
+
+# proposals is managed by crucible; add run_attempt_id as a side-channel column.
+# Fails silently if the column already exists — safe to run repeatedly.
+sqlite3 "$DB" "ALTER TABLE proposals ADD COLUMN run_attempt_id TEXT;" 2>/dev/null || true
 
 # ── Run loop ───────────────────────────────────────────────────────────────────
 n=0
@@ -217,9 +226,14 @@ for pair in "${shuffled[@]}"; do
   # Snapshot max proposal id before run so we can identify the new row exactly
   max_before="$(sqlite3 "$DB" 'SELECT COALESCE(MAX(id), 0) FROM proposals' 2>/dev/null || echo 0)"
 
+  # Surrogate key: '{RUN_ID}_n{NNN}' — append '_a{K}' if retry logic is ever added
+  RUN_ATTEMPT_ID="${RUN_ID}_n$(printf '%03d' "${n}")"
+
   # Register attempt as 'started' — distinguishable from 'never inserted' if we crash
-  sqlite3 "$DB" "INSERT OR REPLACE INTO run_attempts (run_id, n, task_id, arm, status)
-    VALUES ('${RUN_ID}', ${n}, '${task_id}', '${arm}', 'started');" 2>/dev/null || true
+  sqlite3 "$DB" "INSERT OR REPLACE INTO run_attempts
+    (run_attempt_id, run_id, n, task_id, arm, status)
+    VALUES ('${RUN_ATTEMPT_ID}', '${RUN_ID}', ${n}, '${task_id}', '${arm}', 'started');" \
+    2>/dev/null || true
 
   # Execute — pipe /dev/null to handle any residual readline reads
   crucible plan "$prompt" --arm "$arm" --task-class "$task_class" --batch \
@@ -301,13 +315,16 @@ FROM rd;
     echo "  FAILED: no completed proposal found (run ${n}/${total}, proposal_id=${last_pid}, planned window ${win_lo}–${win_hi})" >&2
     echo "${task_id},${arm},${task_class},no_proposal,no_proposal,0,0,null,null,null,null,null,${RUN_ID}" >> "$OUT"
     sqlite3 "$DB" "UPDATE run_attempts SET status='failed'
-      WHERE run_id='${RUN_ID}' AND n=${n};" 2>/dev/null || true
+      WHERE run_attempt_id='${RUN_ATTEMPT_ID}';" 2>/dev/null || true
     failed=$((failed + 1))
   else
     echo "$metrics" >> "$OUT"
     pid="$(echo "$metrics" | cut -d',' -f12)"
-    sqlite3 "$DB" "UPDATE run_attempts SET status='complete', proposal_id=${pid}
-      WHERE run_id='${RUN_ID}' AND n=${n};" 2>/dev/null || true
+    sqlite3 "$DB" "
+      UPDATE run_attempts SET status='complete', proposal_id=${pid}
+        WHERE run_attempt_id='${RUN_ATTEMPT_ID}';
+      UPDATE proposals SET run_attempt_id='${RUN_ATTEMPT_ID}'
+        WHERE id=${pid};" 2>/dev/null || true
     # Surface non-zero residual as a warning (conservation law violation)
     residual="$(echo "$metrics" | cut -d',' -f11)"
     if [[ "$residual" != "0" && "$residual" != "null" ]]; then
