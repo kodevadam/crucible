@@ -323,6 +323,23 @@ export function processCritiqueRound({
   // Track newly-minted IDs in parse order for same-response ordering validation
   const mintedThisResponse = new Map(); // id → parse-order index
 
+  // Pre-compute terminal status for all items already in canonical store.
+  // Used by the closed-ID re-activation guard (step 4a).
+  const existingTerminalCache = new Map();
+  {
+    const existingChildren = buildChildrenMap(itemStore);
+    function checkExistingTerminal(id) {
+      if (existingTerminalCache.has(id)) return existingTerminalCache.get(id);
+      const records  = dispositionStore.get(id) || [];
+      const eff      = getEffectiveDisposition(records);
+      const children = existingChildren.get(id) || [];
+      const result   = isTerminal(eff, children, checkExistingTerminal);
+      existingTerminalCache.set(id, result);
+      return result;
+    }
+    for (const id of itemStore.keys()) checkExistingTerminal(id);
+  }
+
   // ── Steps 1-6: mint all items first (no dispositions yet) ─────────────────
   for (let i = 0; i < rawItems.length; i++) {
     const raw = rawItems[i];
@@ -344,7 +361,18 @@ export function processCritiqueRound({
           errors.push(`Item "${dispId}": derived_from "${parentId.slice(0,12)}" not found in store or this response`);
           continue;
         }
-        // 4b. Same-response ordering: parent must appear earlier
+        // 4b. Closed-ID re-activation guard: reject derived_from on terminal items.
+        // If a concern re-emerges, mint a new root item (optionally linking via
+        // derived_from to preserve lineage context, but only if parent is active).
+        if (inCanonical && existingTerminalCache.get(parentId)) {
+          const eff = getEffectiveDisposition(dispositionStore.get(parentId) || []);
+          errors.push(
+            `Item "${dispId}": derived_from "${parentId.slice(0,12)}" is already resolved` +
+            ` (${eff?.decision || "terminal"}) — mint a new root item if the concern re-emerges`
+          );
+          continue;
+        }
+        // 4c. Same-response ordering: parent must appear earlier
         if (inResponse && !inCanonical) {
           const parentIdx = mintedThisResponse.get(parentId);
           if (parentIdx >= i) {
@@ -524,7 +552,7 @@ export function buildLineageCards({ proposalId, round, activeSet, itemStore, dis
     const lineageByRoot = [];
 
     for (const rootId of leaf.root_ids) {
-      const entries = buildRootSpine(leafId, rootId, itemStore, dispositions);
+      const entries = buildRootSpine(leafId, rootId, itemStore, dispositions, round);
       lineageByRoot.push({ root_id: rootId, entries });
     }
 
@@ -552,7 +580,7 @@ export function buildLineageCards({ proposalId, round, activeSet, itemStore, dis
  * @param {Map<string,object[]>} dispositions
  * @returns {object[]}  LineageEntry[]
  */
-function buildRootSpine(leafId, rootId, itemStore, dispositions) {
+function buildRootSpine(leafId, rootId, itemStore, dispositions, currentRound) {
   // Find the ancestor chain from root to leaf on this root_id's path
   const chain = traceChain(leafId, rootId, itemStore);
 
@@ -576,7 +604,7 @@ function buildRootSpine(leafId, rootId, itemStore, dispositions) {
     }
   }
 
-  return selectedIds.map(id => toLineageEntry(id, itemStore, dispositions));
+  return selectedIds.map(id => toLineageEntry(id, itemStore, dispositions, currentRound));
 }
 
 /**
@@ -651,23 +679,29 @@ function findDirectParent(leafId, rootId, itemStore) {
  * Amendment 2: if effective disposition is human/host, model records are
  * labeled superseded; effective record has superseded: false.
  */
-function toLineageEntry(id, itemStore, dispositions) {
+function toLineageEntry(id, itemStore, dispositions, currentRound) {
   const item    = itemStore.get(id);
   const records = dispositions.get(id) || [];
   const eff     = getEffectiveDisposition(records);
 
   const effIsHumanOrHost = eff && (eff.decided_by === "human" || eff.decided_by === "host");
 
+  // Stall-tracking audit signals (read-only; no enforcement)
+  const deferredCount = records.filter(r => r.decision === "deferred").length;
+  const roundsActive  = item ? Math.max(0, (currentRound ?? 0) - (item.round ?? 0)) : 0;
+
   // Build the entry for the effective disposition
   const entry = {
     id,
-    display_id: item?.display_id || id.slice(0, 12),
-    round:      item?.round ?? 0,
-    by:         item?.role || "host",
-    title:      item?.title || "",
-    decision:   eff?.decision ?? null,
-    rationale:  eff?.rationale ?? null,
-    superseded: false,
+    display_id:    item?.display_id || id.slice(0, 12),
+    round:         item?.round ?? 0,
+    by:            item?.role || "host",
+    title:         item?.title || "",
+    decision:      eff?.decision ?? null,
+    rationale:     eff?.rationale ?? null,
+    superseded:    false,
+    deferred_count: deferredCount,
+    rounds_active:  roundsActive,
   };
 
   // If there are model records that were superseded by human/host, attach them
@@ -687,6 +721,56 @@ function toLineageEntry(id, itemStore, dispositions) {
   }
 
   return entry;
+}
+
+// ── 10. Synthesis gap detection ────────────────────────────────────────────────
+
+/**
+ * Identify blocking active-set items not addressed in the synthesis plan.
+ * Replaces the fragile text-fingerprint approach in checkSynthesisConvergence.
+ *
+ * Matching order (first match wins):
+ *   1. display_id appears literally in accepted_suggestions or rejected_suggestions
+ *   2. Normalized title (first 50 chars) appears in those same fields
+ *
+ * Validators MUST call this against canonical stores, not compressed summaries.
+ *
+ * @param {string[]}            activeSet    item IDs
+ * @param {Map<string,object>}  itemStore
+ * @param {object|null}         synthesisPlan  parsed synthesis JSON
+ * @returns {Array<{id,display_id,title,severity,round}>}  unaddressed blocking items
+ */
+export function computeSynthesisGaps(activeSet, itemStore, synthesisPlan) {
+  const blockingActive = activeSet
+    .map(id => itemStore.get(id))
+    .filter(item => item && item.severity === "blocking");
+
+  if (!blockingActive.length) return [];
+
+  const addressedRaw  = [
+    ...(synthesisPlan?.accepted_suggestions || []),
+    ...(synthesisPlan?.rejected_suggestions || []),
+  ].join("\n").toLowerCase();
+  const addressedNorm = addressedRaw.replace(/[^a-z0-9\s]/g, "");
+
+  return blockingActive.filter(item => {
+    // 1. Exact display_id match — check raw text to preserve underscores in blk_XXXX
+    if (addressedRaw.includes(item.display_id.toLowerCase())) return false;
+    // 2. Normalized title match (first 50 meaningful chars)
+    const titleNorm = (item.title || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .trim()
+      .slice(0, 50);
+    if (titleNorm.length > 8 && addressedNorm.includes(titleNorm)) return false;
+    return true;
+  }).map(item => ({
+    id:         item.id,
+    display_id: item.display_id,
+    title:      item.title,
+    severity:   item.severity,
+    round:      item.round,
+  }));
 }
 
 // ── Utility: build childrenMap from itemStore ─────────────────────────────────

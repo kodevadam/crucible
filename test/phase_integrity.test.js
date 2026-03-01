@@ -14,6 +14,8 @@
  *   - Same text, different role => different IDs
  *   - Transform parent into children: all leaves must resolve
  *   - Closed ID reactivation => hard reject
+ *   - deferred_count / rounds_active in lineage entries
+ *   - computeSynthesisGaps uses canonical IDs, not fuzzy text
  */
 
 import { test, describe } from "node:test";
@@ -31,6 +33,7 @@ import {
   computePendingFlags,
   computeRootSeverity,
   computeSimilarityWarn,
+  computeSynthesisGaps,
   processCritiqueRound,
   buildLineageCards,
   buildChildrenMap,
@@ -665,5 +668,315 @@ describe("buildChildrenMap", () => {
     const map = buildChildrenMap(store);
     assert.ok(map.get("a").includes("leaf"));
     assert.ok(map.get("b").includes("leaf"));
+  });
+});
+
+// ── Closed ID re-activation guard ─────────────────────────────────────────────
+
+describe("processCritiqueRound — closed ID re-activation guard", () => {
+  const baseOpts = {
+    proposalId: "p1",
+    role:       "gpt",
+    round:      2,
+    closedItems: [],
+  };
+
+  test("derived_from pointing to accepted (terminal) item => hard error", () => {
+    const terminalId = mintCritiqueId("p1", "gpt", 1, "original concern original detail");
+
+    // Pre-populate itemStore with a terminal item
+    const itemStore = new Map([[terminalId, {
+      id:           terminalId,
+      display_id:   displayId(terminalId),
+      round:        1,
+      severity:     "blocking",
+      derived_from: null,
+      root_ids:     [terminalId],
+    }]]);
+
+    // Pre-populate dispositionStore: item is accepted (terminal)
+    const now = "2024-01-01T00:00:00Z";
+    const dispositionStore = new Map([[terminalId, [
+      { decided_by: "gpt", decision: "accepted", proposed_at: now, terminal_at: now },
+    ]]]);
+
+    const result = processCritiqueRound({
+      ...baseOpts,
+      rawItems: [{
+        severity:    "important",
+        title:       "Follow-up concern",
+        detail:      "more detail",
+        derived_from: [terminalId],
+      }],
+      itemStore,
+      dispositionStore,
+      insertItems:        () => {},
+      insertDispositions: () => {},
+    });
+
+    assert.ok(result.errors.length > 0);
+    assert.ok(result.errors.some(e => e.includes("already resolved")));
+    assert.ok(result.errors.some(e => e.includes("mint a new root item")));
+  });
+
+  test("derived_from pointing to active (non-terminal) item is allowed", () => {
+    const parentId = mintCritiqueId("p1", "gpt", 1, "active parent active detail");
+
+    // Pre-populate itemStore with a non-terminal item
+    const itemStore = new Map([[parentId, {
+      id:           parentId,
+      display_id:   displayId(parentId),
+      round:        1,
+      severity:     "blocking",
+      derived_from: null,
+      root_ids:     [parentId],
+    }]]);
+
+    // No disposition → not terminal
+    const dispositionStore = new Map();
+
+    const result = processCritiqueRound({
+      ...baseOpts,
+      rawItems: [{
+        severity:    "important",
+        title:       "Child of active parent",
+        detail:      "refined concern",
+        derived_from: [parentId],
+      }],
+      itemStore,
+      dispositionStore,
+      insertItems:        () => {},
+      insertDispositions: () => {},
+    });
+
+    assert.equal(result.errors.length, 0);
+    assert.equal(result.mintedItems[0].derived_from[0], parentId);
+  });
+
+  test("derived_from pointing to rejected (terminal) item => hard error", () => {
+    const rejectedId = mintCritiqueId("p1", "claude", 1, "rejected issue rejected detail");
+
+    const itemStore = new Map([[rejectedId, {
+      id:           rejectedId,
+      display_id:   displayId(rejectedId),
+      round:        1,
+      severity:     "important",
+      derived_from: null,
+      root_ids:     [rejectedId],
+    }]]);
+
+    const now = "2024-01-01T00:00:00Z";
+    const dispositionStore = new Map([[rejectedId, [
+      { decided_by: "claude", decision: "rejected", proposed_at: now, terminal_at: now },
+    ]]]);
+
+    const result = processCritiqueRound({
+      ...baseOpts,
+      role:    "gpt",
+      rawItems: [{
+        severity:    "blocking",
+        title:       "Re-raising rejected concern",
+        detail:      "but it was rejected",
+        derived_from: [rejectedId],
+      }],
+      itemStore,
+      dispositionStore,
+      insertItems:        () => {},
+      insertDispositions: () => {},
+    });
+
+    assert.ok(result.errors.length > 0);
+    assert.ok(result.errors.some(e => e.includes("already resolved") || e.includes("rejected")));
+  });
+});
+
+// ── Stall tracking: deferred_count / rounds_active ────────────────────────────
+
+describe("buildLineageCards — stall tracking fields", () => {
+  test("deferred_count reflects number of deferred decisions", () => {
+    const itemId = mintCritiqueId("p1", "gpt", 1, "stalled concern stalled detail");
+    const itemStore = new Map([[itemId, {
+      id:           itemId,
+      display_id:   displayId(itemId),
+      round:        1,
+      role:         "gpt",
+      severity:     "important",
+      root_severity: "important",
+      title:        "stalled concern",
+      derived_from: null,
+      root_ids:     [itemId],
+    }]]);
+
+    const now = "2024-01-01T00:00:00Z";
+    const dispositions = new Map([[itemId, [
+      { decided_by: "gpt", decision: "deferred",  rationale: "r1", proposed_at: now, terminal_at: null },
+      { decided_by: "gpt", decision: "deferred",  rationale: "r2", proposed_at: "2024-01-02T00:00:00Z", terminal_at: null },
+    ]]]);
+
+    const cards = buildLineageCards({
+      proposalId: "p1",
+      round:      3,
+      activeSet:  [itemId],
+      itemStore,
+      dispositions,
+    });
+
+    const entry = cards[0].lineage[0].entries[0];
+    assert.equal(entry.deferred_count, 2);
+  });
+
+  test("rounds_active = current_round - item.round", () => {
+    const itemId = mintCritiqueId("p1", "gpt", 1, "old concern old detail");
+    const itemStore = new Map([[itemId, {
+      id:           itemId,
+      display_id:   displayId(itemId),
+      round:        1,   // introduced round 1
+      role:         "gpt",
+      severity:     "blocking",
+      root_severity: "blocking",
+      title:        "old concern",
+      derived_from: null,
+      root_ids:     [itemId],
+    }]]);
+
+    const cards = buildLineageCards({
+      proposalId:   "p1",
+      round:        4,   // currently in round 4
+      activeSet:    [itemId],
+      itemStore,
+      dispositions: new Map(),
+    });
+
+    const entry = cards[0].lineage[0].entries[0];
+    assert.equal(entry.rounds_active, 3);  // 4 - 1
+  });
+
+  test("rounds_active is 0 for item introduced this round", () => {
+    const itemId = mintCritiqueId("p1", "gpt", 2, "fresh concern fresh detail");
+    const itemStore = new Map([[itemId, {
+      id:           itemId,
+      display_id:   displayId(itemId),
+      round:        2,
+      role:         "gpt",
+      severity:     "important",
+      root_severity: "important",
+      title:        "fresh concern",
+      derived_from: null,
+      root_ids:     [itemId],
+    }]]);
+
+    const cards = buildLineageCards({
+      proposalId:   "p1",
+      round:        2,
+      activeSet:    [itemId],
+      itemStore,
+      dispositions: new Map(),
+    });
+
+    const entry = cards[0].lineage[0].entries[0];
+    assert.equal(entry.rounds_active, 0);
+    assert.equal(entry.deferred_count, 0);
+  });
+});
+
+// ── computeSynthesisGaps ──────────────────────────────────────────────────────
+
+describe("computeSynthesisGaps", () => {
+  function makeStore(items) {
+    const m = new Map();
+    for (const [id, data] of Object.entries(items)) m.set(id, { id, ...data });
+    return m;
+  }
+
+  test("returns empty array when no blocking items in active set", () => {
+    const store = makeStore({ a: { severity: "important", title: "minor thing", display_id: "blk_0000" } });
+    const gaps  = computeSynthesisGaps(["a"], store, { accepted_suggestions: [] });
+    assert.deepEqual(gaps, []);
+  });
+
+  test("returns empty array when all blocking items addressed by display_id", () => {
+    const id    = mintCritiqueId("p1", "gpt", 1, "auth missing display match");
+    const store = new Map([[id, {
+      id,
+      display_id: displayId(id),
+      severity:   "blocking",
+      title:      "auth missing",
+      round:      1,
+    }]]);
+
+    const plan = {
+      accepted_suggestions: [`[${displayId(id)}] auth added — reason accepted`],
+      rejected_suggestions: [],
+    };
+
+    const gaps = computeSynthesisGaps([id], store, plan);
+    assert.deepEqual(gaps, []);
+  });
+
+  test("returns empty array when blocking item addressed by title match", () => {
+    const id    = mintCritiqueId("p1", "gpt", 1, "no retry logic title match");
+    const store = new Map([[id, {
+      id,
+      display_id: displayId(id),
+      severity:   "blocking",
+      title:      "no retry logic",
+      round:      1,
+    }]]);
+
+    const plan = {
+      accepted_suggestions: ["no retry logic — added exponential backoff (source: GPT, severity: blocking)"],
+      rejected_suggestions: [],
+    };
+
+    const gaps = computeSynthesisGaps([id], store, plan);
+    assert.deepEqual(gaps, []);
+  });
+
+  test("returns unaddressed blocking items", () => {
+    const id    = mintCritiqueId("p1", "gpt", 1, "sql injection unaddressed gap");
+    const store = new Map([[id, {
+      id,
+      display_id: displayId(id),
+      severity:   "blocking",
+      title:      "sql injection vulnerability",
+      round:      1,
+    }]]);
+
+    const plan = {
+      accepted_suggestions: ["some unrelated thing accepted"],
+      rejected_suggestions: [],
+    };
+
+    const gaps = computeSynthesisGaps([id], store, plan);
+    assert.equal(gaps.length, 1);
+    assert.equal(gaps[0].id, id);
+  });
+
+  test("non-blocking active items are not included in gaps", () => {
+    const id    = mintCritiqueId("p1", "gpt", 1, "minor style concern gap test");
+    const store = new Map([[id, {
+      id,
+      display_id: displayId(id),
+      severity:   "important",  // not blocking
+      title:      "minor style concern",
+      round:      1,
+    }]]);
+
+    const gaps = computeSynthesisGaps([id], store, { accepted_suggestions: [], rejected_suggestions: [] });
+    assert.deepEqual(gaps, []);
+  });
+
+  test("handles null/empty synthesis plan gracefully", () => {
+    const id    = mintCritiqueId("p1", "gpt", 1, "blocking issue null plan test");
+    const store = new Map([[id, {
+      id,
+      display_id: displayId(id),
+      severity:   "blocking",
+      title:      "blocking issue",
+      round:      1,
+    }]]);
+
+    assert.doesNotThrow(() => computeSynthesisGaps([id], store, null));
+    assert.doesNotThrow(() => computeSynthesisGaps([id], store, {}));
   });
 });

@@ -39,6 +39,7 @@ import {
   computeActiveSet,
   computeConvergenceState,
   computePendingFlags,
+  computeSynthesisGaps,
   buildLineageCards,
   buildChildrenMap,
 } from "./phase_integrity.js";
@@ -1604,10 +1605,14 @@ async function synthesise(gptMsgs) {
 /**
  * Validate that synthesis convergence criteria are met.
  * @param {object} plan - the synthesised plan JSON
- * @param {string[]} [blockingItems] - blocking critique items collected across all rounds
+ * @param {Array<string|object>} [blockingItems]
+ *   Legacy form: string[] — fuzzy text fingerprint (debate path).
+ *   Canonical form: object[] with {id, display_id, title, severity} — exact match
+ *   against canonical active set. Always prefer canonical form.
+ * @param {object} [canonical] - optional { activeSet, itemStore } for exact-ID checks
  * @returns {string[]} violations — empty array means converged
  */
-function checkSynthesisConvergence(plan, blockingItems = []) {
+function checkSynthesisConvergence(plan, blockingItems = [], canonical = null) {
   if (!plan) return ["Synthesis produced no valid JSON plan"];
   const violations = [];
 
@@ -1645,15 +1650,26 @@ function checkSynthesisConvergence(plan, blockingItems = []) {
     );
   }
 
-  // C5: Every blocking critique item must appear in accepted_suggestions or rejected_suggestions
-  if (blockingItems.length) {
+  // C5: Every blocking critique item must appear in accepted_suggestions or rejected_suggestions.
+  // Prefer canonical exact-ID resolution; fall back to legacy text fingerprint when
+  // canonical data is unavailable (e.g., the legacy `crucible debate` path).
+  if (canonical?.activeSet && canonical?.itemStore) {
+    // Canonical path — reads from itemStore, not from compressed summaries
+    const gaps = computeSynthesisGaps(canonical.activeSet, canonical.itemStore, plan);
+    if (gaps.length) {
+      violations.push(
+        `${gaps.length} BLOCKING active-set item(s) not addressed in accepted/rejected: ` +
+        gaps.map(g => `${g.display_id} "${g.title?.slice(0, 40)}"`).join("; ")
+      );
+    }
+  } else if (blockingItems.length && typeof blockingItems[0] === "string") {
+    // Legacy fallback — fuzzy text fingerprint (debate path only)
     const addressed = [
       ...(plan.accepted_suggestions || []),
       ...(plan.rejected_suggestions || []),
     ].join(" ").toLowerCase().replace(/[^a-z0-9\s]/g, "");
 
     const unaddressed = blockingItems.filter(item => {
-      // Use first 40 meaningful chars as a fingerprint
       const fp = item.slice(0, 60).toLowerCase().replace(/[^a-z0-9]/g, "");
       return fp.length > 8 && !addressed.replace(/\s/g, "").includes(fp.replace(/\s/g, ""));
     });
@@ -2051,7 +2067,24 @@ async function proposalFlow(initialProposal) {
       console.log("");
     }
 
-    const convergenceViolations = checkSynthesisConvergence(synthesisResult.finalPlan, critiqueResult.blockingItems || []);
+    // Load canonical active set for exact-ID convergence check.
+    // Validators read from canonical stores, never from compressed summaries.
+    let canonicalCtx = null;
+    try {
+      const csItemStore = DB.getCritiqueItemStore(state.proposalId);
+      const csDispStore = DB.getDispositionStore(state.proposalId, critiqueResult.round || 99);
+      const csChildren  = buildChildrenMap(csItemStore);
+      canonicalCtx = {
+        activeSet: computeActiveSet(csItemStore, csDispStore, csChildren),
+        itemStore: csItemStore,
+      };
+    } catch { /* non-fatal — falls back to legacy path */ }
+
+    const convergenceViolations = checkSynthesisConvergence(
+      synthesisResult.finalPlan,
+      critiqueResult.blockingItems || [],
+      canonicalCtx
+    );
     if (convergenceViolations.length) {
       console.log(hr("·"));
       console.log(bold(red(`\n  ⚠ Convergence issues (${convergenceViolations.length}):\n`)));
