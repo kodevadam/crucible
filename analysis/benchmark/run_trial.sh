@@ -155,15 +155,17 @@ echo "  invocation: $0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}" >&2
 echo "" >&2
 
 # ── Trial registry ──────────────────────────────────────────────────────────────
-# Escape single quotes for SQL embedding (paths or arms could theoretically
-# contain them; invocation especially might from quoted flag values).
-_invocation="$0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}"
-_inv_sql="${_invocation//\'/\'\'}"
-_arms_sql="${ARMS//\'/\'\'}"
-_tasks_sql="${TASKS_JSON//\'/\'\'}"
-_out_sql="${OUT//\'/\'\'}"
+if [[ "$DRY_RUN" != "true" ]]; then
+  # Escape single quotes for SQL embedding (paths or arms could theoretically
+  # contain them; invocation especially might from quoted flag values).
+  _invocation="$0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}"
+  _inv_sql="${_invocation//\'/\'\'}"
+  _arms_sql="${ARMS//\'/\'\'}"
+  _tasks_sql="${TASKS_JSON//\'/\'\'}"
+  _out_sql="${OUT//\'/\'\'}"
 
-sqlite3 "$DB" "
+  sqlite3 "$DB" "
+PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS runs (
   run_id           TEXT PRIMARY KEY,
   started_at       TEXT,
@@ -182,7 +184,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE TABLE IF NOT EXISTS run_attempts (
   run_attempt_id TEXT PRIMARY KEY,   -- '{RUN_ID}_n{NNN}'; append '_a{K}' for retries
-  run_id         TEXT NOT NULL,
+  run_id         TEXT NOT NULL REFERENCES runs(run_id),
   n              INTEGER NOT NULL,
   task_id        TEXT,
   arm            TEXT,
@@ -199,9 +201,10 @@ VALUES
    '${_out_sql}', ${total});
 " 2>/dev/null || true
 
-# proposals is managed by crucible; add run_attempt_id as a side-channel column.
-# Fails silently if the column already exists — safe to run repeatedly.
-sqlite3 "$DB" "ALTER TABLE proposals ADD COLUMN run_attempt_id TEXT;" 2>/dev/null || true
+  # proposals is managed by crucible; add run_attempt_id as a side-channel column.
+  # Fails silently if the column already exists — safe to run repeatedly.
+  sqlite3 "$DB" "ALTER TABLE proposals ADD COLUMN run_attempt_id TEXT;" 2>/dev/null || true
+fi
 
 # ── Run loop ───────────────────────────────────────────────────────────────────
 n=0
@@ -336,8 +339,10 @@ FROM rd;
 done
 
 # ── Summary ────────────────────────────────────────────────────────────────────
-sqlite3 "$DB" "UPDATE runs SET finished_at=datetime('now'), failed_runs=${failed}
-  WHERE run_id='${RUN_ID}';" 2>/dev/null || true
+if [[ "$DRY_RUN" != "true" ]]; then
+  sqlite3 "$DB" "UPDATE runs SET finished_at=datetime('now'), failed_runs=${failed}
+    WHERE run_id='${RUN_ID}';" 2>/dev/null || true
+fi
 
 observed="$(sqlite3 -separator ' ' "$DB" \
   "SELECT COUNT(*), SUM(status='complete'), COALESCE(MIN(id),'—'), COALESCE(MAX(id),'—')
